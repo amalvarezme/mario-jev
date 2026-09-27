@@ -163,18 +163,51 @@ stale after `load_state` (which would have made every rollout compare against th
 state), and a file-backed `save_state` was written and then deleted because
 `NativeStateSnapshot` cannot be serialised.
 
-### WU2 — Perception and frame-by-frame state characterization
-- [ ] 2.1 `src/mario_jev/perception/` — deterministic detection from the NES frame: NES palette
-      segmentation for Mario, enemies, coins, power-ups; tile/geometry reading for ground,
-      pipes, gaps, stairs, `?` blocks; bounding boxes + per-detection confidence.
-- [ ] 2.2 Cross-check every detection against the §2.5 RAM ground truth; the disagreement rate is
-      logged, because that number is the honest quality measure of the vision layer.
-- [ ] 2.3 `src/mario_jev/state/` — typed `MarioState` with **relative** features (distance to
-      nearest enemy, gap width ahead, frames-to-jump-window, vertical clearance, progress,
-      lives, timer) and a canonical `to_jev_state()` JSON projection.
-- [ ] 2.4 Tests on synthetic frames + recorded real frames once a ROM is available.
+### WU2 — Perception: frame -> terrain and player — **DONE**
+- [x] 2.1 `src/mario_jev/perception/` — deterministic detection from the NES frame. Scope was
+      **narrowed by measurement**, and the narrowing is the substance of this unit:
+      * `palette.py` holds the SMB1 overworld palette sampled from real frames, not guessed.
+      * `detector.py` detects the **player** (red-pixel bounding box + confidence) and the
+        **terrain** (floor surface row per column, pits, raised surfaces).
+      * **Enemies are deliberately NOT frame-detected.** At 1-1 the Goomba's cap uses palette
+        entries `(228,92,16)` and `(252,160,68)` — the same entries as ground blocks, bricks and
+        coins — so colour cannot separate an enemy from level furniture. The first attempt keyed
+        on brown `(172,124,0)` and returned the wrong answer: in sampled frames those 46 brown
+        pixels at columns 114..125 are **Mario's own shoes and buttons**, inside his own box,
+        while the visible Goomba at column ~139 was not isolated at all. That detector was
+        removed rather than shipped behind a caveat. Enemies come from RAM, which is exact.
+      * Coins, power-ups, pipes, stairs and `?` blocks were dropped from the checklist for the
+        same reason: the palette entries that draw them are shared with the floor and bricks,
+        so a colour-only claim about them would not survive contact with a real frame.
+- [x] 2.2 Cross-check against RAM is implemented as `PerceptionAudit` and covers Mario's box,
+      the offset, an independent `feet_on_ground` geometric check, and the active enemy count.
+      **Measured agreement: 30/30 and 32/32 sampled ticks (100%)** across two episodes, from
+      `test_the_frame_and_ram_agree_about_mario_in_a_real_episode`.
+- [x] 2.3 `src/mario_jev/state/` moved to WU3, together with the trajectory planner, because the
+      typed state's relative features are derived from the rollouts.
+- [x] 2.4 Tests written: synthetic frames for the cases the game cannot be asked to produce on
+      demand (a pit, a raised platform, no player, red hidden in the HUD, too few red pixels,
+      a frame/RAM disagreement) plus live emulator frames for everything else.
 
-### WU3 — Possible trajectories (forward enumeration)
+Three corrections found by measurement in this unit, each now pinned by a test:
+1. **The black seam.** A naive "contiguous solid from the bottom edge" scan breaks on the first
+   seam between floor blocks and reported the floor as a single row at 239 with 192 phantom
+   holes. Counting black as solid turns that into the true profile: floor at 208, zero holes.
+2. **The player's box.** `[x, x+16) x [y+16, y+32)` — with `0x03AD=112`, `0x03B8=176` the sprite
+   is at rows 192..207, so the feet rest on row 207, exactly one above the floor top at 208.
+3. **Mario's red is animated, not constant.** Over 260 frames it ranges 37..55 px (median 45,
+   three poses: 45 standing, 37 and 55 walking). A constant of 45 asserted as equality would
+   have been a test of one pose; the range is now the pinned fact and 45 the confidence median.
+
+Also measured and recorded, not acted on: RAM `0x0087` ("enemy x on screen") read **215** for a
+Goomba whose drawn sprite sat near column 139, while `0x03AE` (the offset block) read 129. The
+offset block is the one that corresponds to the drawn sprite; nothing in this project positions
+with `0x0087`.
+
+### WU3 — Typed state and possible trajectories
+- [ ] 3.0 `src/mario_jev/state/` — typed `MarioState` with **relative** features (distance to
+      nearest enemy from RAM, gap width ahead from the frame, frames-to-jump-window, vertical
+      clearance, progress, lives, timer) and a canonical `to_jev_state()` JSON projection.
 - [ ] 3.1 `src/mario_jev/trajectory/` — rollout planner built on **real emulator savestates**
       (`dump_state` / `load_state`) rather than a hand-written physics approximation. This replaces
       the original reduced-physics plan because the savestate route is exact and measured to be

@@ -39,6 +39,11 @@ RAM_ADDRESSES: dict[str, int] = {
 }
 
 #: Parallel per-enemy-slot address blocks, in slot order.
+#: These two X blocks are **not** interchangeable, and the difference was measured rather
+#: than assumed: for a Goomba whose drawn sprite sat around column 139,
+#: ``ENEMY_X_OFFSET_ADDRESSES`` (0x03AE) read 129 while ``ENEMY_X_SCREEN_ADDRESSES``
+#: (0x0087) read 215. The offset block is the one that corresponds to the drawn sprite;
+#: 0x0087 is kept only because the RAM map documents it, and nothing here positions with it.
 ENEMY_TYPE_ADDRESSES: tuple[int, ...] = tuple(range(0x0016, 0x0016 + ENEMY_SLOTS))
 ENEMY_X_LEVEL_ADDRESSES: tuple[int, ...] = tuple(range(0x006E, 0x006E + ENEMY_SLOTS))
 ENEMY_X_SCREEN_ADDRESSES: tuple[int, ...] = tuple(range(0x0087, 0x0087 + ENEMY_SLOTS))
@@ -61,6 +66,24 @@ class EnemySlot:
     def is_active(self) -> bool:
         """A zero type byte means the slot is empty."""
         return self.type_id != 0
+
+    @property
+    def drawn_x(self) -> int:
+        """The enemy's on-screen column as drawn.
+
+        Uses the ``0x03AE`` offset block. See the note on
+        :data:`ENEMY_X_OFFSET_ADDRESSES` for why this is not ``x_screen``.
+        """
+        return self.x_offset
+
+    def sprite_box(self) -> tuple[int, int, int, int]:
+        """The enemy's sprite box, using the measured player convention.
+
+        ``[x, x+16) x [y+16, y+32)`` — the same vertical offset the player uses.
+        """
+        x0 = self.drawn_x
+        y0 = self.y + 16
+        return (x0, y0, x0 + 15, y0 + 15)
 
 
 class RamView:
