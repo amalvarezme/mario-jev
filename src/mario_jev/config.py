@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping
 
-DEFAULT_ENDPOINT = "https://thejevai.com/v1/systemone"
+DEFAULT_ENDPOINT = "https://api.typesafe.ai/v1/systemone"
 DEFAULT_MODEL = "jev-latest"
 DEFAULT_PLAYJEV_MODEL = "OmniJev/PlayJev-0.8B"
 

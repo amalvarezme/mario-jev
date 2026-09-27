@@ -8,8 +8,8 @@ why each piece exists, what is measured, and where each piece is weak.
 ## 1. The constraint that shapes the whole design
 
 **Jev does not accept images.** Its published contract is explicit: `state` may be
-a string, a JSON object, or an array of strings, and "Image, audio, and video
-inputs are not supported yet".
+a string, a JSON object, or an array of text — the OpenAPI schema types that third
+case simply as `array` — and "Image, audio, and video inputs are not supported yet".
 
 The request was to use each frame's image to characterize the state. That is
 still exactly what happens — but the frame reaches Jev **indirectly**. A
@@ -77,19 +77,40 @@ emulator, never chooses its own authority, and cannot bypass the confidence gate
 
 ## 3. The Jev contract this system relies on
 
-`POST https://thejevai.com/v1/systemone`, `Authorization: Bearer <JEV_API_KEY>`.
+`POST https://api.typesafe.ai/v1/systemone`, `Authorization: Bearer <JEV_API_KEY>`,
+`Content-Type: application/json`. Every request carries all three of `model`,
+`questions`, and `state`; `state` is a string, an object, or an array, and images,
+audio, and video are not accepted (§1).
 
-Three question types, **all evaluated in parallel against the same state**, so one
-HTTP request resolves every judgment needed for a tick:
+`questions` is a JSON **object keyed by ids the application chooses** — not an
+array — and each value is a question discriminated by `type`, of the shape
+`{type, instructions, criteria}`. The free-text field is named `instructions`
+(a string, object, or array) and is optional. Three question types, **all
+evaluated in parallel against the same state**, so one HTTP request resolves every
+judgment needed for a tick:
 
-| Type | Use | Returns |
-|---|---|---|
-| `choice` | pick one action from the candidate set (≤255 options) | `choice`, `probabilities` (sum 1), `confidence` |
-| `score` | rate on an ordered rubric (2–10 levels) | probability-weighted `score`, `legend`, `probabilities`, `confidence` |
-| `noul` | yes/no judgment | `noul` (0..1 = P(yes)) |
+| Type | Use | `criteria` | Returns |
+|---|---|---|---|
+| `choice` | pick one action from the candidate set (≤255 options) | required: an object mapping each choice name to its description | `choice`, `probabilities` (keyed by choice name, sum 1), `confidence` |
+| `score` | rate on an ordered rubric | required: an **ordered array** of levels (the spec requires at least one; the published prose says 2–10) | probability-weighted `score`, `legend`, `probabilities`, `confidence` |
+| `noul` | yes/no judgment | optional: `{true, false}` | `noul` (0..1 = P(yes)) only — **a `noul` answer has no `confidence`** |
 
-Errors: 401 invalid key (hard failure, no retry), 422 validation (hard failure),
-429 rate limit and 529 overloaded (retry with exponential backoff).
+A `score` is averaged over the level probabilities, so it **may be fractional**
+(0.48 and 1.30 were both observed), and its `legend` maps the level index as a
+**string** (`"0"`…`"3"`) to the description that was sent; `probabilities` uses
+the same string keys. Because a `noul` answer carries no confidence, it cannot be
+gated by the same threshold as `choice` and `score` without asking an additional
+question. The response is `{model, answers, usage:{input_tokens, output_tokens}}`:
+`model` echoes the resolved version (`jev-latest` currently resolves to
+`jev-1.13.0`), and `usage.output_tokens` is currently free of charge.
+
+Errors: **401 or 403** for an invalid or missing key (hard failure, no retry — the
+published prose says 401, but the live API returns 403 with
+`error_type: authentication_error`), 422 validation (hard failure; the body names
+the offending field in `detail[].loc`), 429 rate limit and 529 overloaded (retry
+with exponential backoff). The API is fronted by Cloudflare, which rejects a
+request that lacks a realistic `User-Agent` with its own 403 (`error code: 1010`)
+before the request ever reaches Jev, so any client **must** send one.
 
 The credential is held in `Settings.jev_api_key` with `repr=False` and
 `compare=False`, so it cannot reach a log, a traceback, a journal line, or a
@@ -144,7 +165,8 @@ wall-clock **frame budget** and shortens the horizon to fit it, reducing toward
 
 ## 6. What Jev is asked each tick
 
-One request, four parallel questions over the same state:
+One request, four parallel questions over the same state, in a single `questions`
+object keyed by exactly these ids:
 
 | Question id | Type | Asks |
 |---|---|---|
@@ -174,8 +196,9 @@ Degradation ladder, in order:
    the low-confidence event with its full probability distribution.
 3. **Over budget, or 429/529 after retries, or no credential** → hold the last
    known-safe trajectory and record the degradation.
-4. **401/422** → hard failure; a wrong or invalid key is not something to route
-   around silently.
+4. **401, 403 or 422** → hard failure; a wrong or invalid key is not something to
+   route around silently. The published prose documents only 401, but the live API
+   answers an invalid key with 403 (§3).
 
 Measured headroom: the emulator steps at **261 fps** unpaced, so 60 fps has about
 4× headroom before pacing pressure appears. Whether the *Jev* round trip fits

@@ -31,6 +31,18 @@ def test_defaults_are_documented_values() -> None:
     assert settings.advisor_enabled is False
 
 
+def test_default_endpoint_is_the_verified_typesafe_host() -> None:
+    # Verified live 2026-09-27 against https://api.typesafe.ai/openapi.json
+    # (title "TypeSafe", version 0.2.0). The old host belongs to a different
+    # product and answers this account's key with
+    # 401 {"code":-1,"message":"Invalid API key."}. Pin the host literally so a
+    # regression is caught here instead of at runtime.
+    assert DEFAULT_ENDPOINT == "https://api.typesafe.ai/v1/systemone"
+    assert Settings.load(env={}).jev_endpoint == "https://api.typesafe.ai/v1/systemone"
+    assert "thejevai.com" not in DEFAULT_ENDPOINT
+    assert "thejevai.com" not in Settings.load(env={}).jev_endpoint
+
+
 def test_environment_overrides_every_setting_it_claims() -> None:
     settings = Settings.load(
         env={

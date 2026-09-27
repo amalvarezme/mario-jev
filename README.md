@@ -16,7 +16,8 @@ of every component.
 ## Prerequisites
 
 - Python 3.14 (the pinned `nes-py==9.0.1` wheel is `cp314`-`macosx_11_0_arm64`)
-- A Jev API key from <https://thejevai.com/settings/apikeys>
+- A Jev API key from TypeSafe AI. The product site is <https://typesafe.ai/>;
+  the API reference is <https://api.typesafe.ai/docs>
 
 The Super Mario Bros. ROM ships inside `gym-super-mario-bros`. This project does
 not download, copy, or redistribute it; see the legal note at the end of the
@@ -34,7 +35,7 @@ uv pip install --python .venv/bin/python -e ".[dev]"
 | Variable | Default | Meaning |
 |---|---|---|
 | `JEV_API_KEY` | *(unset)* | Jev credential. **Never write it to a file or commit it.** |
-| `JEV_ENDPOINT` | `https://thejevai.com/v1/systemone` | Jev evaluation endpoint |
+| `JEV_ENDPOINT` | `https://api.typesafe.ai/v1/systemone` | Jev evaluation endpoint |
 | `JEV_MODEL` | `jev-latest` | Jev model id |
 | `MARIO_STAGE` | `1-1` | world-stage to play |
 | `MARIO_DECISION_CADENCE` | `8` | emulator frames between two Jev consultations |
@@ -45,6 +46,25 @@ uv pip install --python .venv/bin/python -e ".[dev]"
 | `MARIO_MAX_TICKS` | *(uncapped)* | stop after this many decision ticks |
 | `MARIO_ADVISOR` | `false` | enable the optional PlayJev advisor |
 | `MARIO_ARTIFACTS_DIR` | `artifacts` | where evidence is written |
+
+## Credential
+
+The key is a secret and is never written to a file or a commit. On macOS it lives
+in the Keychain, and `scripts/jev-env.sh` is the bridge that hands it to a
+command:
+
+- Keychain entry: service `jev-api-key`, account `$USER`.
+- The bridge exports the value as `JEV_API_KEY`.
+- Usage: `scripts/jev-env.sh <command>`.
+
+```sh
+scripts/jev-env.sh .venv/bin/mario-jev doctor
+```
+
+Sourcing it (`source scripts/jev-env.sh`) exports `JEV_API_KEY` into the current
+shell instead of running a command. If `JEV_API_KEY` is already set, the bridge
+uses that value and never touches the Keychain, so CI and gateway-injected keys
+keep working.
 
 ## Run
 

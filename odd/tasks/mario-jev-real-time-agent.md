@@ -27,22 +27,21 @@ by this project: our code never downloads, copies, or redistributes it. That is 
 should weigh, and it is not something this plan can grant. The only remaining asset blocker is
 `JEV_API_KEY`, absent from the environment and from every shell rc file checked.
 
-### 1.1 Harness fallback (recorded, not silent)
+### 1.1 Harness fallback — RESOLVED
 
-Subagent delegation is **unavailable in this session**. Every launch path was tried: the
-`gentle-ai-worker` writer, then a read-only `gentle-ai-explore` probe, then the explicit
-`repository_root` route. All three failed with *"could not register launched worktree: Select an
-existing worktree in the same Git clone as this session"*, and `session_worktree_register`
-returned the same message. Cause: the Pi session was started when this directory was **not** a git
-repository, so the session holds no clone identity, and creating one afterwards does not
-retroactively give it one. The read-only probe failing identically proves this is not
-writer-worktree isolation.
+WU1 and WU2 were executed **inline**, with delegation recorded as unavailable: the Pi session had
+been started when this directory was **not** a git repository, so it held no clone identity.
+Every launch path failed — the `gentle-ai-worker` writer, a read-only `gentle-ai-explore` probe,
+the explicit `repository_root` route, and `session_worktree_register` — all with *"could not
+register launched worktree: Select an existing worktree in the same Git clone as this session"*.
+The read-only probe failing identically proved this was not writer-worktree isolation, and the
+parent therefore executed inline as the routing ladder's documented fallback.
 
-Consequence: the Mandatory Delegation Triggers still fire (4-file rule, multi-file write rule,
-verification rule, long-session rule), but the delegated runtime does not exist here. The parent
-therefore executes inline and records that as an explicit fallback, which is what the routing
-ladder prescribes when the package role is unusable. Restarting Pi inside this now-git directory
-should restore delegation for later work units.
+**Resolved.** Pi was restarted inside the now-git directory. A live `gentle-ai-explore` read-only
+probe re-ran and returned its result (task `mukbrs7d-1-hkhe`), so the delegated runtime exists
+after all. The Mandatory Delegation Triggers (4-file rule, multi-file write rule, verification
+rule, long-session rule) are enforceable from WU3 onward, and the remaining work units must be
+routed through them instead of defaulting to inline execution.
 
 ---
 
@@ -51,14 +50,37 @@ should restore delegation for later work units.
 1. **Jev does not accept images.** Official contract: `state` is `text`, a JSON `object`, or an
    `array` of texts — "Image, audio, and video inputs are not supported yet". The frame must be
    converted to structured state by our own code. This is why D1 needs a perception layer at all.
-2. **Jev endpoint**: `POST https://thejevai.com/v1/systemone`, `Authorization: Bearer <key>`.
-   Three question types, **all evaluated in parallel against one state**, so one HTTP request
-   resolves every judgment for a tick:
-   - `choice` (≤255 options) -> `choice`, `probabilities` (sum 1), `confidence`
-   - `score` (2–10 ordered levels) -> probability-weighted `score`, `legend`, `probabilities`, `confidence`
-   - `noul` -> `noul` (0..1 = P(yes)); optional `criteria.true` / `criteria.false`
-   Errors: 401 invalid key, 422 validation, 429 rate limit, 529 overloaded. Retry with backoff on 429/529.
-   Key must stay server-side, read from `JEV_API_KEY`.
+2. **Jev endpoint — corrected 2026-09-27 against the live API and its published OpenAPI spec.**
+   The endpoint is `POST https://api.typesafe.ai/v1/systemone`, `Authorization: Bearer <key>`,
+   `Content-Type: application/json`. `GET https://api.typesafe.ai/v1/models` lists the aliases the
+   key may use (`jev-latest`, `jev-preview`). **The endpoint recorded here before was
+   `https://thejevai.com/v1/systemone`: a different product, which rejects this key with
+   `401 Invalid API key`.** Evidence: the spec at `https://api.typesafe.ai/openapi.json` (title
+   `TypeSafe`, version `0.2.0`) and a live `200` for the real tick payload.
+   Contract, taken from the spec rather than from prose:
+   - The request requires all three of `model`, `questions` and `state` (`model` is required).
+   - `state` is a `string`, `object`, or `array`. Images, audio and video are not supported.
+   - `questions` is an **object keyed by ids the application chooses**, `minProperties: 1`; each
+     value is a `Question` discriminated on `type`. Each is `{type, instructions, criteria}`, and
+     **`instructions` is optional**, accepting a string, object, or array.
+   - `choice`: `criteria` required, an object mapping choice name -> description. Answer ->
+     `choice`, `confidence`, `probabilities` keyed by choice name.
+   - `score`: `criteria` required, an **ordered array**, spec `minItems: 1`. Answer -> `score`
+     (probability-weighted, **may be fractional**), `confidence`, `legend` (level index as a
+     string -> the description that was sent), `probabilities` keyed by the level string.
+   - `noul`: `criteria` optional, `{true, false}`. Answer -> `noul` (0..1 = P(yes)) and
+     **no `confidence` field at all**, so a noul judgment cannot pass the same confidence gate as
+     choice/score without a second question.
+   - Response: `{model, answers, usage:{input_tokens, output_tokens}}`. `model` echoes the
+     resolved version (`jev-latest` -> `jev-1.13.0`). `usage.output_tokens` is currently free.
+   - Errors: `422` carries `{"detail":[{loc, msg, type, input, ctx}]}` and names the offending
+     field. Unauthenticated access returns **`403`** with `error_type: authentication_error`,
+     while the published prose says `401`; treat **both 401 and 403 as hard authentication
+     failures**, and `429`/`529` as backoff.
+   - **Cloudflare sits in front of the API**: a request without a realistic `User-Agent` is
+     rejected with `403` and body `error code: 1010`, before it ever reaches Jev. The client must
+     always send one.
+   Key must stay server-side, supplied to the process as `JEV_API_KEY`.
 3. **PlayJev-0.8B** (`OmniJev/PlayJev-0.8B`, Apache 2.0, base `Qwen3_5ForConditionalGeneration`):
    sees the frame + the move list and returns a probability per move. `model.safetensors` is
    **2214.6 MB**. Honest caveat driving its advisor-only role: **0.32 vs teacher on Infinite Mario**
@@ -204,6 +226,26 @@ Goomba whose drawn sprite sat near column 139, while `0x03AE` (the offset block)
 offset block is the one that corresponds to the drawn sprite; nothing in this project positions
 with `0x0087`.
 
+### WU2.5 — Jev contract correction and credential bridge — **IN PROGRESS**
+Forced by WU4's dependency: the endpoint and the question shape recorded in §2.2 were wrong, so
+the client would have been written against an API that rejects this key.
+- [ ] 2.5.1 `src/mario_jev/config.py` — `DEFAULT_ENDPOINT` corrected to
+      `https://api.typesafe.ai/v1/systemone`. `DEFAULT_MODEL` (`jev-latest`) was already right.
+- [ ] 2.5.2 `README.md` and `docs/STRATEGY.md` §3/§6 — the endpoint, the `questions`-is-a-map
+      shape, `instructions`, the criteria shapes, the `noul`-has-no-confidence caveat, the
+      401/403/422/429/529 ladder, and the mandatory `User-Agent`.
+- [ ] 2.5.3 `scripts/jev-env.sh` — the credential bridge the user chose: read the key from the
+      macOS Keychain (`security find-generic-password -s jev-api-key -a "$USER" -w`), export it
+      as `JEV_API_KEY`, then `exec "$@"`. It never echoes the key, fails loudly when the entry is
+      absent, and leaves an already-set `JEV_API_KEY` untouched so CI and gateway keys still work.
+- [ ] 2.5.4 `tests/test_credentials.py` — the bridge is tested without touching the real
+      credential: shell syntax validity, the executable bit, absent-entry failure with no key
+      material on stderr, and pass-through when `JEV_API_KEY` is already set.
+- [ ] 2.5.5 `tests/test_config.py` — pin the corrected host literally, so a regression back to
+      `thejevai.com` fails a test instead of failing at runtime.
+
+Baseline before this unit: **71 tests passing** (`.venv/bin/python -m pytest`).
+
 ### WU3 — Typed state and possible trajectories
 - [ ] 3.0 `src/mario_jev/state/` — typed `MarioState` with **relative** features (distance to
       nearest enemy from RAM, gap width ahead from the frame, frames-to-jump-window, vertical
@@ -258,9 +300,9 @@ with `0x0087`.
 
 | Field | Value |
 |-------|-------|
-| Estimated changed lines | ~2800–3600 total (roughly half tests) across 6 work units |
+| Estimated changed lines | ~2800–3600 total (roughly half tests) across 6 work units, plus ~150 for WU2.5 |
 | 400-line budget risk | **High if delivered as one change** |
-| Chained PRs recommended | **Yes** — one PR per work unit (WU1…WU6) |
+| Chained PRs recommended | **Yes** — one PR per work unit (WU1, WU2, WU2.5, WU3…WU6) |
 | Delivery strategy | ask-on-risk; the work-unit commits are the review slices |
 | Decision needed before apply | No |
 
@@ -269,9 +311,11 @@ with `0x0087`.
 - WU1: `pyproject.toml`, `.gitignore`, `README.md`, `docs/**`, `src/mario_jev/__init__.py`,
   `src/mario_jev/config.py`, `src/mario_jev/emulator/**`, `tests/conftest.py`,
   `tests/test_config.py`, `tests/test_emulator.py`
-- WU2: `src/mario_jev/perception/**`, `src/mario_jev/state/**`, `tests/test_perception.py`,
-  `tests/test_state.py`
-- WU3: `src/mario_jev/trajectory/**`, `tests/test_trajectory.py`
+- WU2: `src/mario_jev/perception/**`, `tests/test_perception.py`
+- WU2.5: `src/mario_jev/config.py`, `README.md`, `docs/STRATEGY.md`, `scripts/jev-env.sh`,
+  `tests/test_credentials.py`, `tests/test_config.py`
+- WU3: `src/mario_jev/state/**`, `src/mario_jev/trajectory/**`, `tests/test_state.py`,
+  `tests/test_trajectory.py`
 - WU4: `src/mario_jev/jev/**`, `src/mario_jev/advisor/**`, `src/mario_jev/policy/**`,
   `tests/test_jev_client.py`, `tests/test_policy.py`, `tests/test_advisor.py`
 - WU5: `src/mario_jev/journal/**`, `src/mario_jev/dashboard/**`, `src/mario_jev/cli.py`,
@@ -285,7 +329,11 @@ None of these is `.`, the repo root, or an absolute path.
 - **ROM: resolved.** The ROM ships inside `gym-super-mario-bros`; see the D3 note in §1. Live
   emulation and the vision-vs-RAM error rate are therefore runnable without the user supplying a
   path. The copyright caveat in §1 stands and is the user's call.
-- **`JEV_API_KEY` not exported.** Every live Jev decision is gated on it. The key must never be
-  pasted into a prompt, a file, or a commit.
+- **`JEV_API_KEY` not exported, and the endpoint was wrong — both addressed in WU2.5.** The key
+  exists in the macOS Keychain (service `jev-api-key`) and is **verified valid** against
+  `https://api.typesafe.ai/v1/systemone`. `scripts/jev-env.sh` bridges Keychain -> environment
+  rather than putting Keychain code in the library, so the package stays portable and
+  `Settings.load()` keeps reading the environment only. The key must never be pasted into a
+  prompt, a file, or a commit.
 - PlayJev's 2.2 GB weight download is deferred until the core loop is green; the advisor is
   optional by design precisely so this cannot block the critical path.
