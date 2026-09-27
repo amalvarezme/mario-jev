@@ -262,23 +262,46 @@ the client would have been written against an API that rejects this key.
 
 Test count after this unit: **80 passing, 0 skipped** (baseline 71).
 
-### WU3 — Typed state and possible trajectories
-- [ ] 3.0 `src/mario_jev/state/` — typed `MarioState` with **relative** features (distance to
+### WU3 — Typed state and possible trajectories — **DONE**
+(state slice `b5ae236`; the trajectory slice is the commit that adds
+`src/mario_jev/trajectory/`. Suite 100 -> 133.)
+- [x] 3.0 `src/mario_jev/state/` — typed `MarioState` with **relative** features (distance to
       nearest enemy from RAM, gap width ahead from the frame, frames-to-jump-window, vertical
       clearance, progress, lives, timer) and a canonical `to_jev_state()` JSON projection.
-- [ ] 3.1 `src/mario_jev/trajectory/` — rollout planner built on **real emulator savestates**
+- [x] 3.1 `src/mario_jev/trajectory/` — rollout planner built on **real emulator savestates**
       (`dump_state` / `load_state`) rather than a hand-written physics approximation. This replaces
       the original reduced-physics plan because the savestate route is exact and measured to be
       affordable. The planner takes an explicit **frame budget** and shortens its horizon to fit
       it instead of assuming a fixed one.
-- [ ] 3.2 Candidate control set: the discrete NES action combinations from `SIMPLE_MOVEMENT`
+- [x] 3.2 Candidate control set: the discrete NES action combinations from `SIMPLE_MOVEMENT`
       (`NOOP`, `right`, `right+A`, `right+B`, `right+A+B`, `A`, `left`) with their rolled-out
       trajectories and terminal outcome (`lands_safe`, `hits_enemy`, `falls_in_gap`,
       `reaches_goal`, `no_progress`).
-- [ ] 3.3 Per-trajectory risk cost and the trajectory table that becomes the `choice` criteria
+- [x] 3.3 Per-trajectory risk cost and the trajectory table that becomes the `choice` criteria
       descriptions handed to Jev.
-- [ ] 3.4 Tests: synthetic scenes with a known correct answer (a pit that must be jumped, a
+- [x] 3.4 Tests: synthetic scenes with a known correct answer (a pit that must be jumped, a
       Goomba that must not be walked into).
+
+**As landed.** The 7-candidate sweep over real savestates breaks on
+`terminated`/`truncated`, reloads the snapshot before every candidate, and re-reads `info` after
+each load. The horizon comes from measured cost inside the budget, and `RolloutTable` reports
+`horizon`, `sweep_ms`, `elapsed_ms`, `base_ms`, `per_frame_ms`, `calibration_frames`, `passes` and
+`cost_source` (`calibrated` | `reused`) so WU5's journal can record the truth.
+
+Two honest limits, both measured, neither hidden:
+
+1. **The cost clock is unstable.** `per_frame_ms` ranged `0.64 .. 2.35 ms` inside a *single*
+   process, so the same budget produced horizons from 9 to 27. The warm start removes the
+   calibration pass from every call after the first — steady-state overhead fell from
+   ~52-176 ms to ~0.1 ms — but it does not stabilise the clock.
+2. **The cost model ratchets one way.** An overrun raises the remembered per-frame cost and an
+   underrun never lowers it, so a transient stall permanently shrinks the horizon for the life of
+   that planner instance: observed decaying `14 -> 13 -> 9` and staying there. Conservative, and a
+   known cost. Relaxing it slowly is a candidate for a later unit.
+
+**Requirement this creates for WU4:** the cadence loop MUST hold ONE `TrajectoryPlanner` instance
+across ticks. A caller that builds a fresh planner per tick gets no warm start at all and pays a
+calibration pass every time.
 
 #### WU3 contract — decided here, not open to the writer
 
