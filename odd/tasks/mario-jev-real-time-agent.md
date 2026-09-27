@@ -17,10 +17,32 @@ Repo: `/Users/andresalvarez/Documents/mario-jev` (greenfield, git initialized th
 | D2 | Emulation engine | Python: `gym-super-mario-bros 9.1.0` + `nes-py 9.0.1` | `jsnes 2.1.0` (Node); `stable-retro 1.0.1` |
 | D3 | Assets | User has a legal ROM and a Jev API key | — |
 
-D3 is **not yet materialized**: no `*.nes` exists anywhere on this machine (searched `$HOME` to
-depth 10, plus `~/Documents`, `~/Downloads`, `~/Desktop`, `~/ROMs`, RetroArch paths), and
-`JEV_API_KEY` is not exported in the session environment. The system is therefore built
-ROM-ready and key-ready; the live run is gated on the user supplying both.
+**D3 was overtaken by a discovery.** `gym-super-mario-bros 9.1.0` ships the ROM inside the package
+(`gym_super_mario_bros/_roms/super-mario-bros.nes`, 40 976 bytes, iNES magic `NES\x1a`, mapper 0,
+2 PRG / 1 CHR banks) and `SuperMarioBrosEnv` loads it through `smb1_rom_path()` with no external
+path. No other `*.nes` exists on this machine (searched `$HOME` to depth 10 plus `~/Documents`,
+`~/Downloads`, `~/Desktop`, `~/ROMs` and the RetroArch paths), so the bundled ROM is the one
+actually used. That ROM is Nintendo's copyrighted work redistributed by the package author, not
+by this project: our code never downloads, copies, or redistributes it. That is a fact the user
+should weigh, and it is not something this plan can grant. The only remaining asset blocker is
+`JEV_API_KEY`, absent from the environment and from every shell rc file checked.
+
+### 1.1 Harness fallback (recorded, not silent)
+
+Subagent delegation is **unavailable in this session**. Every launch path was tried: the
+`gentle-ai-worker` writer, then a read-only `gentle-ai-explore` probe, then the explicit
+`repository_root` route. All three failed with *"could not register launched worktree: Select an
+existing worktree in the same Git clone as this session"*, and `session_worktree_register`
+returned the same message. Cause: the Pi session was started when this directory was **not** a git
+repository, so the session holds no clone identity, and creating one afterwards does not
+retroactively give it one. The read-only probe failing identically proves this is not
+writer-worktree isolation.
+
+Consequence: the Mandatory Delegation Triggers still fire (4-file rule, multi-file write rule,
+verification rule, long-session rule), but the delegated runtime does not exist here. The parent
+therefore executes inline and records that as an explicit fallback, which is what the routing
+ladder prescribes when the package role is unusable. Restarting Pi inside this now-git directory
+should restore delegation for later work units.
 
 ---
 
@@ -51,9 +73,43 @@ ROM-ready and key-ready; the live run is gated on the user supplying both.
    `0x006E–0x0072` enemy x in level · `0x0087–0x008B` enemy x on screen ·
    `0x03AE–0x03B2` enemy x offset · `0x03B9–0x03BD` enemy y · `0x071A` current screen ·
    `0x071B` screen scroll · `0x071C` screen-edge x.
-   `gym-super-mario-bros` exposes `env.ram` and an `info` dict (coins, flag_get, life, score,
-   stage, status, time, x_pos, y_pos). Exact `info` keys must be read from the installed package,
-   not assumed — task 1.4 verifies them.
+   `gym-super-mario-bros` exposes `env.ram` and an `info` dict. Exact `info` keys must be read
+   from the installed package, not assumed; task 1.4 verifies them.
+6. **Emulator facts measured in this session** against the installed packages, not read from
+   documentation:
+   - Frame: `env.screen` / `env.observation()` -> `numpy (240, 256, 3)` `uint8`
+     (`SCREEN_HEIGHT=240`, `SCREEN_WIDTH=256`, `SCREEN_SHAPE_24_BIT=(240, 256, 3)`). `nes_py.nes_env`
+     also exposes `OBSERVATION_MODE_RGB_ARRAY_CONTIGUOUS` and `OBSERVATION_MODE_GRAYSCALE`, the
+     latter able to write into a reusable `output` array.
+   - RAM: `env.ram` -> `numpy (2048,)` `uint8`; `env.ram_values(specs, output)` reads configured
+     values into a reusable `uint32` array.
+   - `info` has **42 keys**, not the 26 `_get_info` builds: `_normalized_info()` and
+     `_reward_info()` merge in `clear`, `death`, `game`, `game_family`, `lives`, `progress`,
+     `progress_max`, `reward_components`, `reward_total_clipped`, `reward_total_unclipped`,
+     `rom_mode`, `single_stage`, `target_stage`, `target_world`, `task_id`, `timeout`,
+     `world_label`.
+   - Action sets: `SIMPLE_MOVEMENT` (7) `[NOOP, right, right+A, right+B, right+A+B, A, left]`;
+     `RIGHT_ONLY` (5); `COMPLEX_MOVEMENT` (12).
+   - **Savestates work**: `env.dump_state()` returns an opaque `NativeStateSnapshot` and
+     `env.load_state(snapshot)` restores it (a rollout left `x_pos` exactly where it started).
+     Measured throughput: **261 fps** straight stepping (unpaced, so 60 fps has ~4x headroom) and
+     **350 fps** for `load_state` + step rollout loops.
+   - RAM cross-check, and a corrected assumption: `info['x_pos']` is `0x006D * 0x100 + 0x0086`
+     (a 16-bit absolute position), **not** `0x03AD` as first assumed — both read 40 at the 1-1
+     start, which is exactly why the wrong mapping looked right. `info['y_pixel']` is exactly
+     `0x03B8`; `0x00CE` also read 176 at that moment, again by coincidence rather than identity.
+     `info['y_pos']`=79 is a *different* quantity from `y_pixel` and must not be conflated with it.
+   - A savestate is **not serialisable to disk**: `NativeStateSnapshot` exposes no `__bytes__`, no
+     `__reduce__`, and no buffer protocol, and `load_state` rejects anything that is not that exact
+     type. A file-backed savestate is therefore impossible, so the adapter deliberately has no
+     `save_state`; one was written and then deleted rather than left as dead code.
+   - `load_state` restores the emulator but leaves the gym wrapper's cached `info` stale, so the
+     adapter refreshes it from live RAM (`_get_info()` reads RAM at call time). Without that step
+     the rollout planner would compare every candidate against the wrong starting state.
+
+   Consequence for the cadence budget: at 350 fps a 7-candidate x 30-frame rollout costs ~0.6 s,
+   far above a 7.5 Hz tick. The planner must therefore take a **frame budget** and shorten its
+   horizon to fit, rather than assuming a fixed horizon.
 
 ## 3. Real-time strategy (the core design constraint)
 
@@ -80,19 +136,32 @@ Every tick records latency, so the real decision rate is **measured, not claimed
 Each work unit is one commit on the feature branch, tests alongside the behaviour, English
 artifacts, Conventional Commit message.
 
-### WU1 — Foundation, emulator boundary, strategy document
-- [ ] 1.1 `git init` on `main`, branch `feat/mario-jev-real-time-agent`; `.gitignore` for `.venv/`,
-      `__pycache__/`, `artifacts/`, `*.nes`, `.atl/`.
-- [ ] 1.2 `pyproject.toml` (uv/pip, Python 3.14, `gym-super-mario-bros==9.1.0`, `nes-py==9.0.1`,
-      `numpy`, `pillow`, `requests`, `pytest`) + `.venv` created with `uv`.
-- [ ] 1.3 `docs/STRATEGY.md` — the strategy deliverable: architecture, phase contract, risk model,
-      cadence policy, evaluation protocol, and the honest limits of each component.
-- [ ] 1.4 `src/mario_jev/emulator/` — adapter over `gym_super_mario_bros`:
-      reset/step, 256×240 RGB frame, RAM accessors for the addresses in §2.5, `info` dict,
-      deterministic stepping, and frame pacing. **Verify the real `info` keys and the real
-      `env.ram` shape against the installed package and pin them in a test.**
-- [ ] 1.5 `tests/` — pytest harness, config test, emulator test (ROM-gated: skip with a clear
-      reason when no ROM is present, never silently pass).
+### WU1 — Foundation, emulator boundary, strategy document — **DONE**
+- [x] 1.1 `.gitignore` extended (`.venv/`, `__pycache__/`, `*.py[cod]`, `.pytest_cache/`,
+      `.ruff_cache/`, `artifacts/`, `*.nes`) while keeping `.atl/`. Branch
+      `feat/mario-jev-real-time-agent` created off `main`.
+- [x] 1.2 `pyproject.toml` with pinned deps and pytest config (including the `rom`, `live_jev`,
+      `playjev`, `slow` markers) + `.venv` created with `uv`. Installed cleanly with no source
+      build: `gym-super-mario-bros 9.1.0`, `nes-py 9.0.1`, `numpy 2.5.3`, `pillow 12.3.0`,
+      `requests 2.34.2`, `gymnasium 1.3.0`, `pytest 9.1.1`.
+- [x] 1.3 `docs/STRATEGY.md` written: 11 sections covering the image constraint, the phase
+      contract, the Jev contract, frame characterization, savestate rollouts, the per-tick
+      question set, the real-time cadence and degradation ladder, the risk model, evidence, the
+      evaluation protocol, and per-component honest limits.
+- [x] 1.4 `src/mario_jev/emulator/` — `ram.py` (RAM map + `RamView`), `actions.py` (joypad bits
+      taken from `JoypadSpace._button_map`, `SIMPLE_MOVEMENT`/`RIGHT_ONLY`, `Action`), `env.py`
+      (`MarioEmulator`, `StepResult`, `FramePacer`, stage parsing). **Done as specified:** the real
+      `info` keys (42) and the real `env.ram` shape `(2048,)` were verified and pinned in tests,
+      as were the frame shape (240, 256, 3) and the corrected `x_pos` / `y_pixel` invariants.
+      `rom_path` was deliberately **not** implemented: `SuperMarioBrosEnv` has no external-ROM
+      parameter, so such an option could only ever be dead configuration.
+- [x] 1.5 `tests/` harness written: 49 tests, all passing, **0 skipped** — the emulator tests run
+      for real because the ROM is present. No ROM-gated skip was needed and none was faked.
+
+Two defects found and fixed inside this work unit, both recorded in §2.6: the cached `info` was
+stale after `load_state` (which would have made every rollout compare against the wrong starting
+state), and a file-backed `save_state` was written and then deleted because
+`NativeStateSnapshot` cannot be serialised.
 
 ### WU2 — Perception and frame-by-frame state characterization
 - [ ] 2.1 `src/mario_jev/perception/` — deterministic detection from the NES frame: NES palette
@@ -106,10 +175,13 @@ artifacts, Conventional Commit message.
 - [ ] 2.4 Tests on synthetic frames + recorded real frames once a ROM is available.
 
 ### WU3 — Possible trajectories (forward enumeration)
-- [ ] 3.1 `src/mario_jev/trajectory/` — reduced SMB1 physics model (gravity, walk/run speed,
-      jump arc, tile collision) and a short-horizon rollout from the perceived state.
-- [ ] 3.2 Candidate control set: the discrete NES action combinations (`NOOP`, `RIGHT`,
-      `RIGHT+JUMP`, `RIGHT+RUN`, `RIGHT+RUN+JUMP`, `LEFT`, `JUMP`, …) with their predicted
+- [ ] 3.1 `src/mario_jev/trajectory/` — rollout planner built on **real emulator savestates**
+      (`dump_state` / `load_state`) rather than a hand-written physics approximation. This replaces
+      the original reduced-physics plan because the savestate route is exact and measured to be
+      affordable. The planner takes an explicit **frame budget** and shortens its horizon to fit
+      it instead of assuming a fixed one.
+- [ ] 3.2 Candidate control set: the discrete NES action combinations from `SIMPLE_MOVEMENT`
+      (`NOOP`, `right`, `right+A`, `right+B`, `right+A+B`, `A`, `left`) with their rolled-out
       trajectories and terminal outcome (`lands_safe`, `hits_enemy`, `falls_in_gap`,
       `reaches_goal`, `no_progress`).
 - [ ] 3.3 Per-trajectory risk cost and the trajectory table that becomes the `choice` criteria
@@ -177,8 +249,9 @@ None of these is `.`, the repo root, or an absolute path.
 
 ## 7. Blockers and open items
 
-- **ROM absent** from this machine. Live emulation, real frame capture, and the vision-vs-RAM
-  error rate are all gated on the user supplying a legally owned ROM path.
+- **ROM: resolved.** The ROM ships inside `gym-super-mario-bros`; see the D3 note in §1. Live
+  emulation and the vision-vs-RAM error rate are therefore runnable without the user supplying a
+  path. The copyright caveat in §1 stands and is the user's call.
 - **`JEV_API_KEY` not exported.** Every live Jev decision is gated on it. The key must never be
   pasted into a prompt, a file, or a commit.
 - PlayJev's 2.2 GB weight download is deferred until the core loop is green; the advisor is

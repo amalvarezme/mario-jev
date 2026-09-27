@@ -1,2 +1,15 @@
 # Local Pi runtime state
 .atl/
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Run evidence produced by the agent
+artifacts/
+
+# ROMs are never redistributed through this repository
+*.nes

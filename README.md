@@ -1,0 +1,66 @@
+# mario-jev
+
+A real-time Super Mario Bros. (NES) agent whose decisions come from **Jev**, the
+System One typed-decision model from TypeSafe AI.
+
+The agent perceives each frame, turns it into typed state, rolls candidate actions
+out through the real emulator with savestates, and asks Jev one question set per
+tick. Jev returns a chosen action with probabilities and confidence; application
+code owns execution, the confidence gate, and the safety fallback.
+
+Read **[`docs/STRATEGY.md`](docs/STRATEGY.md)** for the full strategy: the phase
+contract, the Jev request/response contract, the real-time cadence and its
+degradation ladder, the risk model, the evaluation protocol, and the honest limits
+of every component.
+
+## Prerequisites
+
+- Python 3.14 (the pinned `nes-py==9.0.1` wheel is `cp314`-`macosx_11_0_arm64`)
+- A Jev API key from <https://thejevai.com/settings/apikeys>
+
+The Super Mario Bros. ROM ships inside `gym-super-mario-bros`. This project does
+not download, copy, or redistribute it; see the legal note at the end of the
+strategy document.
+
+## Install
+
+```sh
+uv venv --python 3.14 .venv
+uv pip install --python .venv/bin/python -e ".[dev]"
+```
+
+## Environment variables
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `JEV_API_KEY` | *(unset)* | Jev credential. **Never write it to a file or commit it.** |
+| `JEV_ENDPOINT` | `https://thejevai.com/v1/systemone` | Jev evaluation endpoint |
+| `JEV_MODEL` | `jev-latest` | Jev model id |
+| `MARIO_STAGE` | `1-1` | world-stage to play |
+| `MARIO_DECISION_CADENCE` | `8` | emulator frames between two Jev consultations |
+| `MARIO_CONFIDENCE_THRESHOLD` | `0.6` | below this, the deterministic fallback runs |
+| `MARIO_ROLLOUT_BUDGET_MS` | `120` | wall-clock budget for the rollout sweep |
+| `MARIO_REAL_TIME` | `true` | pace the emulator at real time |
+| `MARIO_TARGET_FPS` | `60` | pacing target |
+| `MARIO_MAX_TICKS` | *(uncapped)* | stop after this many decision ticks |
+| `MARIO_ADVISOR` | `false` | enable the optional PlayJev advisor |
+| `MARIO_ARTIFACTS_DIR` | `artifacts` | where evidence is written |
+
+## Run
+
+```sh
+export JEV_API_KEY="sk_jev_..."
+.venv/bin/mario-jev doctor    # readiness report for the environment
+.venv/bin/mario-jev run       # play, recording evidence
+.venv/bin/mario-jev replay    # rebuild the view from a recorded trace
+.venv/bin/mario-jev dashboard # live view
+```
+
+## Tests
+
+```sh
+.venv/bin/python -m pytest
+```
+
+Markers: `live_jev` (real network call), `playjev` (optional advisor stack),
+`slow` (takes more than a couple of seconds).
