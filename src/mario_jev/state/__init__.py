@@ -1,0 +1,86 @@
+"""Typed state: relative features, and their canonical JSON projection for Jev.
+
+``mario_jev.state`` holds no emulator or network dependency of its own: it is the
+typed vocabulary the rest of the pipeline speaks, plus the exact projection the
+plan fixes for the model.
+"""
+
+from .builder import (
+    DEFAULT_LOOKAHEAD_PX,
+    MIN_JUMP_WINDOW_FRAMES,
+    MarioStateBuilder,
+    nearest_enemy_gap,
+    sprite_gap_px,
+)
+from .mario_state import (
+    DEATH_INFO_KEYS,
+    GOAL_INFO_KEYS,
+    INFO_CLEAR,
+    INFO_DEATH,
+    INFO_FLAG_GET,
+    INFO_IS_DEAD,
+    INFO_IS_DYING,
+    INFO_LIFE,
+    INFO_PLAYER_STATE,
+    INFO_STAGE,
+    INFO_TIME,
+    INFO_WORLD,
+    INFO_X_POS,
+    INFO_X_POS_MAX,
+    INFO_Y_PIXEL,
+    PLAYER_STATE_DYING,
+    CandidateAssessment,
+    MarioState,
+    NearestEnemy,
+    PlayerFeatures,
+    Progress,
+    TerrainAhead,
+    is_death,
+    is_goal,
+    to_jev_state,
+)
+from .outcome import (
+    GOAL_OUTCOME,
+    HAZARD_OUTCOMES,
+    OUTCOME_PRECEDENCE,
+    SURVIVAL_OUTCOMES,
+    TerminalOutcome,
+)
+
+__all__ = [
+    "DEATH_INFO_KEYS",
+    "DEFAULT_LOOKAHEAD_PX",
+    "GOAL_INFO_KEYS",
+    "GOAL_OUTCOME",
+    "HAZARD_OUTCOMES",
+    "INFO_CLEAR",
+    "INFO_DEATH",
+    "INFO_FLAG_GET",
+    "INFO_IS_DEAD",
+    "INFO_IS_DYING",
+    "INFO_LIFE",
+    "INFO_PLAYER_STATE",
+    "INFO_STAGE",
+    "INFO_TIME",
+    "INFO_WORLD",
+    "INFO_X_POS",
+    "INFO_X_POS_MAX",
+    "INFO_Y_PIXEL",
+    "MIN_JUMP_WINDOW_FRAMES",
+    "OUTCOME_PRECEDENCE",
+    "PLAYER_STATE_DYING",
+    "SURVIVAL_OUTCOMES",
+    "CandidateAssessment",
+    "MarioState",
+    "MarioStateBuilder",
+    "NearestEnemy",
+    "PlayerFeatures",
+    "Progress",
+    "TerrainAhead",
+    "TerminalOutcome",
+    "is_death",
+    "is_goal",
+    "nearest_enemy_gap",
+    "sprite_gap_px",
+    "to_jev_state",
+]

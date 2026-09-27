@@ -129,9 +129,28 @@ routed through them instead of defaulting to inline execution.
      adapter refreshes it from live RAM (`_get_info()` reads RAM at call time). Without that step
      the rollout planner would compare every candidate against the wrong starting state.
 
-   Consequence for the cadence budget: at 350 fps a 7-candidate x 30-frame rollout costs ~0.6 s,
-   far above a 7.5 Hz tick. The planner must therefore take a **frame budget** and shorten its
-   horizon to fit, rather than assuming a fixed horizon.
+   Consequence for the cadence budget: the sweep cost is **not reproducible on this machine**.
+   Measured `per_frame_ms` ranged over `0.65 .. 2.35 ms` *within the same process*, so at the
+   default `rollout_budget_ms = 120` the planner chose horizons of `10, 20, 15, 18, 15` across
+   five consecutive runs. Two separate hazards follow, and both were measured rather than
+   reasoned about:
+   * `sweep_ms` mostly lands at or just under the budget, but does overshoot (one run measured
+     122 ms against a 120 ms budget).
+   * `elapsed_ms` — what the caller actually pays — is **1.0x to 3.5x** the budget, because it also
+     contains the calibration pass and a possible second correction sweep (`passes` was 2 in three
+     of five runs). The 7.5 Hz tick has 133 ms, so a 419 ms `plan()` cannot hold the cadence; the
+     degradation ladder in `docs/STRATEGY.md` §7 is what covers that case today.
+   The horizon must therefore be chosen from *measured* cost per machine and per load — never
+   assumed, and never reported as a single number. `RolloutTable` carries `horizon`, `sweep_ms`,
+   `elapsed_ms`, `base_ms`, `per_frame_ms` and `passes` so the journal can record all of it.
+   **Open item for WU4**: the caller must size its tick knowing that one call can cost up to ~3.5x
+   the budget.
+7. **Stepping past the end of an episode raises.** `nes_py` raises
+   `ValueError: cannot step in a done environment! call 'reset'` on the first step after the game
+   ends, and a candidate dying mid-rollout is exactly the signal the planner exists to produce.
+   The rollout loop must break on `StepResult.terminated` / `.truncated`. `load_state(snapshot)`
+   **does** clear the wrapper's done flag, so the sweep continues to the next candidate with no
+   `reset()`. Both behaviours are pinned by tests in WU3.
 
 ## 3. Real-time strategy (the core design constraint)
 
@@ -226,25 +245,22 @@ Goomba whose drawn sprite sat near column 139, while `0x03AE` (the offset block)
 offset block is the one that corresponds to the drawn sprite; nothing in this project positions
 with `0x0087`.
 
-### WU2.5 — Jev contract correction and credential bridge — **IN PROGRESS**
+### WU2.5 — Jev contract correction and credential bridge — **DONE** (`78e9798`)
 Forced by WU4's dependency: the endpoint and the question shape recorded in §2.2 were wrong, so
 the client would have been written against an API that rejects this key.
-- [ ] 2.5.1 `src/mario_jev/config.py` — `DEFAULT_ENDPOINT` corrected to
+- [x] 2.5.1 `src/mario_jev/config.py` — `DEFAULT_ENDPOINT` corrected to
       `https://api.typesafe.ai/v1/systemone`. `DEFAULT_MODEL` (`jev-latest`) was already right.
-- [ ] 2.5.2 `README.md` and `docs/STRATEGY.md` §3/§6 — the endpoint, the `questions`-is-a-map
-      shape, `instructions`, the criteria shapes, the `noul`-has-no-confidence caveat, the
-      401/403/422/429/529 ladder, and the mandatory `User-Agent`.
-- [ ] 2.5.3 `scripts/jev-env.sh` — the credential bridge the user chose: read the key from the
-      macOS Keychain (`security find-generic-password -s jev-api-key -a "$USER" -w`), export it
-      as `JEV_API_KEY`, then `exec "$@"`. It never echoes the key, fails loudly when the entry is
-      absent, and leaves an already-set `JEV_API_KEY` untouched so CI and gateway keys still work.
-- [ ] 2.5.4 `tests/test_credentials.py` — the bridge is tested without touching the real
-      credential: shell syntax validity, the executable bit, absent-entry failure with no key
-      material on stderr, and pass-through when `JEV_API_KEY` is already set.
-- [ ] 2.5.5 `tests/test_config.py` — pin the corrected host literally, so a regression back to
-      `thejevai.com` fails a test instead of failing at runtime.
+- [x] 2.5.2 `README.md` and `docs/STRATEGY.md` §1/§3/§6/§7 — the endpoint, the
+      `questions`-is-a-map shape, `instructions`, the criteria shapes, the `noul`-has-no-
+      confidence caveat, the 401/403/422/429/529 ladder, and the mandatory `User-Agent`.
+- [x] 2.5.3 `scripts/jev-env.sh` — the credential bridge the user chose: read the key from the
+      macOS Keychain, export it as `JEV_API_KEY`, then `exec "$@"`. Verified against the real
+      Keychain entry. Sourcing restores the caller's shell options, so strict mode cannot leak.
+- [x] 2.5.4 `tests/test_credentials.py` — 8 tests, none of which touches the real credential.
+- [x] 2.5.5 `tests/test_config.py` — the corrected host is pinned literally, with a negative
+      assertion for the old host.
 
-Baseline before this unit: **71 tests passing** (`.venv/bin/python -m pytest`).
+Test count after this unit: **80 passing, 0 skipped** (baseline 71).
 
 ### WU3 — Typed state and possible trajectories
 - [ ] 3.0 `src/mario_jev/state/` — typed `MarioState` with **relative** features (distance to
@@ -263,6 +279,59 @@ Baseline before this unit: **71 tests passing** (`.venv/bin/python -m pytest`).
       descriptions handed to Jev.
 - [ ] 3.4 Tests: synthetic scenes with a known correct answer (a pit that must be jumped, a
       Goomba that must not be walked into).
+
+#### WU3 contract — decided here, not open to the writer
+
+These are the interfaces WU4 will consume, so they are fixed in the plan rather than invented
+while coding. The writer chooses the *implementations*; these *shapes* are the review contract.
+
+**`to_jev_state()` must produce exactly this JSON-serializable projection** (`json.dumps` must
+accept it, and this is the same shape that Jev already answered coherently in a live 200 call):
+
+```
+{"player":        {"x", "y", "on_ground", "facing"},
+ "nearest_enemy": {"distance_px", "approaching"},
+ "terrain_ahead": {"gap_columns", "gap_distance_px", "wall_height"},
+ "progress":      {"world", "x_max", "lives", "time_left"},
+ "candidates":    {"<action name>": {"dx", "outcome", "risk", "final_x"}}}
+```
+
+`MarioState` carries **relative** features only: distance to the nearest active enemy ahead (from
+the RAM `0x03AE` block, never `0x0087`), gap width and gap distance ahead from the frame,
+`frames_to_jump_window`, vertical clearance, progress, lives and time left. `frames_to_jump_window`
+is the sharpest of these and is defined as: frames until Mario's front edge reaches the first hole
+column at the currently measured horizontal speed (computed from the `x_pos` delta between two
+successive ticks), `None` when there is no hole ahead or the speed is zero. It gets its own test.
+
+**Terminal outcome** is one of exactly five values from the plan, resolved in this precedence:
+`reaches_goal` > `falls_in_gap` > `hits_enemy` > `no_progress` > `lands_safe`. Death splits on
+whether Mario's x was over a hole column at the moment of death. `no_progress` means survived the
+horizon without advancing. The exact `info` keys for death and for reaching the goal must be read
+from the installed package and pinned in a test — assumed key names are how this project got the
+`x_pos` mapping wrong.
+
+**Risk cost** is a float in [0, 1], higher is worse, and the exact formula is the writer's — but
+it must be a named pure function whose tests assert these **orderings**: any hazard outcome
+(`falls_in_gap`, `hits_enemy`) > `no_progress` > the same surviving trajectory ending closer to an
+enemy, and `reaches_goal` is the minimum. A risk number that cannot be checked against an ordering
+is not reviewable.
+
+**Planner invariants**, each one a test:
+
+1. It MUST break the rollout on `StepResult.terminated` / `.truncated`. A naive
+   `for _ in range(H)` loop raises `ValueError: cannot step in a done environment!` the first time
+   a candidate dies — measured.
+2. It MUST `load_state(snapshot)` before every candidate, and MUST NOT cache `info` across that
+   call (the adapter refreshes `info`, the caller must not keep an old copy). A candidate that
+   terminated must not prevent the next one from running: `load_state` clears the done flag —
+   measured.
+3. It MUST leave the emulator exactly where it started, and MUST NOT advance `tick` (the pinned
+   invariant is `tick == start + 10` after a 10-step rollout).
+4. Horizon selection MUST come from measured cost inside the given `rollout_budget_ms`, clamped to
+   `[rollout_min_frames, rollout_max_frames]`, and the chosen horizon and the measured elapsed ms
+   MUST be reported in the returned table so WU5's journal can record them.
+5. Every measured test MUST run with `real_time=False`; `real_time=True` is the `MarioEmulator`
+   default and paces to 60 fps, which would silently make every timing assertion meaningless.
 
 ### WU4 — Jev decision layer, PlayJev advisor, execution policy
 - [ ] 4.1 `src/mario_jev/jev/` — real HTTP client for `POST /v1/systemone`: one request carrying
