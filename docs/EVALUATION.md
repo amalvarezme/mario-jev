@@ -34,7 +34,7 @@ rather than as a failure — which is the intended state here.
 
 ## Results
 
-| | run 1 (unpaced) | run 2 (paced) |
+| | run 1 (unpaced) | run 2 (paced, before the fix) |
 |---|---|---|
 | game frames (decision ticks) | 900 | 120 |
 | wall clock | 184.0 s | 157.2 s |
@@ -51,6 +51,10 @@ rather than as a failure — which is the intended state here.
 | progress (`x_max`) | 40 → **724** | 40 → 350 |
 | lives | 2 throughout | 2 throughout |
 | in-game seconds burned | 45 | 6 |
+
+The paced column is the state **before** the pacing defect was fixed; §2 records the fix and the same
+run re-measured afterwards (157 s → 18 s, 0.095 Hz → 0.850 Hz, sweep 1 205 ms → 70 ms). The unpaced
+column is unaffected by that fix.
 
 ## What worked
 
@@ -107,9 +111,42 @@ consequences compound:
 
 Separately, the pacer does not achieve its own configured rate even for bare stepping: 120 direct
 steps with `real_time=True` took 3.60 s (**30 ms per step ≈ 33 fps**), against a configured 60 fps.
-Pacing is therefore both unfaithful to its target and actively harmful to the agent. **Recommendation:
-leave `real_time` off** until the sweep uses a separate, unpaced emulator instance, and treat the
-pacer's 2× shortfall as its own defect.
+That defect is **untouched** by the fix below; re-measured afterwards it is 28.12 ms per step, i.e.
+**1.69× the configured 16.67 ms period**.
+
+**Fixed and re-measured the same day.** `FramePacer` gained a nestable `suspended()` context manager
+(suppressing sleeps, resetting the schedule on the outermost exit, never touching `enabled`), and
+`TrajectoryPlanner.plan()` now wraps its whole sweep — calibration, first sweep and correction sweep
+— in it. The reasoning is that a rollout is a *simulated* future: nothing about it should consume the
+real timeline, and the game is simply paused while the agent thinks.
+
+| measured | before | after |
+|---|---|---|
+| one `plan()`, paced, fixed 8-frame horizon, tick 0 | 1 821 ms | **58 ms** |
+| the same `plan()`, unpaced (control) | 93 ms | 58 ms |
+| `time.sleep` calls during that sweep | **67 for 68 steps** | **0** |
+| paced run, 120 frames — wall clock | 157 s | **18 s** |
+| paced run — decision rate | 0.095 Hz | **0.850 Hz** |
+| paced run — sweep p50 | 1 205 ms | **70 ms** |
+| paced run — horizon | 6 (the floor) | 7–9 |
+| paced run — below-confidence fallback | 40 % (6/15 calls) | **27 %** (4/15) |
+| paced run — slower than real time | 79× | **9×** |
+
+The mechanism is measured, not inferred: the sleep count was one per simulated step before the fix
+and zero after. Reverting only the planner's context manager reproduces the defect exactly
+(2 156 ms and 67 sleeps for 68 steps), which is how the regression test that pins it was checked.
+
+The absolute millisecond figures are samples, not constants, as with every timing number in this
+report: an independent verification measured the same pre-fix `plan()` at **3 774 ms** rather than
+1 821 ms, because it ran while this evaluation was executing on the same machine. The **sleep count**
+is the load-independent signal — 67 versus 0 for the same 68 steps — which is why that, and not the
+elapsed time, is what the regression test pins.
+
+What this does **not** fix, and the report still stands on: the cadence is a separate problem (§1 — a
+416 ms round trip cannot fit a 16.7 ms frame, with or without pacing), the pacer's own shortfall is
+untouched, and the stall in §3 happened in an **unpaced** run whose horizon was already 8. The
+conclusion narrows rather than disappears: the paced run is now usable, but the decision rate is
+still 11 % of the design and `real_time` still cannot make this agent real-time.
 
 ### 3. The agent stalls for two thirds of the run, and Jev is not the reason
 
@@ -185,14 +222,15 @@ In the order I would act on them, each with the evidence above:
 
 1. **Decouple Jev from the tick** (or accept ~1 Hz and say so). A synchronous call of 416 ms median
    inside a 16.7 ms frame budget cannot hold any cadence above about 2 Hz. Nothing else on this list
-   matters if the decision rate is 8 % of the design.
-2. **Do not pace the shared emulator.** Give the rollout sweep its own unpaced emulator, or disable
-   the pacer during `plan()`. This alone recovers 17× on the sweep, a horizon of 8–14 instead of 6,
-   and a fallback rate of 11 % instead of 40 %.
+   matters if the decision rate is 8 % of the design. **Still open.**
+2. ~~**Do not pace the shared emulator.**~~ **Fixed and re-measured** — see §2. `FramePacer.suspended()`
+   plus one `with` in `plan()`: the sweep sleeps zero times, the paced run went from 157 s to 18 s, the
+   horizon recovered from its floor of 6, and the fallback rate fell from 40 % to 27 %.
 3. **Record the retry, and the timeout.** A 20 s timeout that ends in success currently leaves an
-   empty `degradations` list and an unexplained 21 s latency.
+   empty `degradations` list and an unexplained 21 s latency. **Still open.**
 4. **Give the agent a way out of a blind rollout.** When every candidate is identical, the agent
    stands still forever. A longer horizon for a stalled tick, or treating "all candidates equal and
    `no_progress`" as its own degraded source, would make the stall visible and survivable.
-5. **Fix the pacer's own rate.** 30 ms per step against a configured 16.7 ms is a 2× shortfall in the
-   component whose entire job is timing.
+   **Still open** — and §2's fix does not help here: the stall happened in an unpaced run.
+5. **Fix the pacer's own rate.** 28.12 ms per step against a configured 16.67 ms is **1.69×** the
+   configured period. **Still open.**

@@ -718,3 +718,86 @@ def test_steady_state_reuses_the_cost_and_keeps_each_sweep_inside_the_budget(
         # And a steady-state call is one sweep plus the bookkeeping around it, not
         # a sweep plus the calibration the first call already paid for.
         assert table.elapsed_ms - table.sweep_ms <= first_overhead_ms
+
+
+# -- the sweep is a simulated future, so it must not consume the real timeline ------
+
+
+def _counting_sleeps(monkeypatch) -> list[float]:
+    """Count ``env``'s sleeps instead of performing them.
+
+    The pacer reaches ``time.sleep`` through the ``time`` module that ``env``
+    imported, so replacing that attribute observes exactly the sleeps a paced
+    emulator would have taken, deterministically and without real waiting.
+    """
+    import mario_jev.emulator.env as env_module
+
+    calls: list[float] = []
+    monkeypatch.setattr(env_module.time, "sleep", calls.append)
+    return calls
+
+
+def test_the_sweep_does_not_pace_the_simulated_future(
+    emulator_factory, monkeypatch
+) -> None:
+    # A paced emulator sleeps once per frame, so a sweep that is *not* suspended
+    # issues roughly one sleep per emulator step. With the suspension in place
+    # ``plan()`` must issue no sleeps at all, which is what the factor of 4 leaves
+    # room for: it fails loudly for pacing (~1 sleep/step) while tolerating a few
+    # stray sleeps if a future change ever introduces one deliberately.
+    sleeps = _counting_sleeps(monkeypatch)
+    emulator = emulator_factory(real_time=True)
+    emulator.reset(seed=0)
+    planner = TrajectoryPlanner(budget_ms=120.0, min_frames=6, max_frames=48)
+
+    table = planner.plan(emulator)
+
+    assert table.steps_taken > 0
+    assert len(sleeps) < table.steps_taken / 4
+
+
+def test_the_unpaced_sweep_is_pinned_to_the_recorded_result(
+    emulator: MarioEmulator,
+) -> None:
+    # Recorded from the code before the suspension was added, with real_time=False.
+    # The suspension must not change a single frame of the sweep itself.
+    planner = TrajectoryPlanner(budget_ms=5000.0, min_frames=8, max_frames=8)
+
+    table = planner.plan(emulator)
+
+    assert table.tick == 0
+    assert table.horizon == 8
+    assert table.calibration_frames == 12
+    assert table.steps_taken == 68
+    assert table.passes == 1
+    assert table.start_x == 40
+    assert {
+        candidate.name: (candidate.outcome.value, candidate.dx, candidate.frames)
+        for candidate in table.candidates
+    } == {
+        "NOOP": ("no_progress", 0, 8),
+        "right": ("lands_safe", 2, 8),
+        "right+A": ("lands_safe", 2, 8),
+        "right+B": ("lands_safe", 3, 8),
+        "right+A+B": ("lands_safe", 2, 8),
+        "A": ("no_progress", 0, 8),
+        "left": ("no_progress", -3, 8),
+    }
+
+
+def test_the_sweep_cost_does_not_depend_on_pacing(emulator_factory) -> None:
+    # Coarse sanity check only: this compares two wall-clock measurements, so it
+    # can be disturbed by machine load. The deterministic pin is
+    # ``test_the_sweep_does_not_pace_the_simulated_future`` above, which counts
+    # sleeps rather than seconds. Both plans run the same stage at the same tick
+    # with the same fixed horizon, so removing the pacing should bring them close.
+    def elapsed_ms(real_time: bool) -> float:
+        emulator = emulator_factory(real_time=real_time)
+        emulator.reset(seed=0)
+        planner = TrajectoryPlanner(budget_ms=5000.0, min_frames=8, max_frames=8)
+        return planner.plan(emulator).elapsed_ms
+
+    paced = elapsed_ms(True)
+    unpaced = elapsed_ms(False)
+
+    assert paced < unpaced * 2

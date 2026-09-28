@@ -18,8 +18,9 @@ Two measured facts shape this adapter:
 from __future__ import annotations
 
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Iterator, Mapping
 
 import numpy as np
 
@@ -57,7 +58,14 @@ class FramePacer:
     and make every measurement meaningless.
     """
 
-    __slots__ = ("_period", "_enabled", "_next_deadline", "_lag_total", "_last_lag")
+    __slots__ = (
+        "_period",
+        "_enabled",
+        "_next_deadline",
+        "_lag_total",
+        "_last_lag",
+        "_suspend_depth",
+    )
 
     def __init__(self, target_fps: float, enabled: bool = True) -> None:
         if target_fps <= 0:
@@ -67,6 +75,7 @@ class FramePacer:
         self._next_deadline: float | None = None
         self._lag_total = 0.0
         self._last_lag = 0.0
+        self._suspend_depth = 0
 
     @property
     def enabled(self) -> bool:
@@ -86,8 +95,52 @@ class FramePacer:
         self._lag_total = 0.0
         self._last_lag = 0.0
 
+    @contextmanager
+    def suspended(self) -> Iterator[None]:
+        """Run without pacing, then resume on a fresh schedule.
+
+        Used by the rollout sweep: its steps are simulated futures and must not
+        consume the real timeline. On exit the schedule is reset, so resuming does
+        not hand the next real frame a deadline that expired while the sweep ran --
+        the game is effectively paused while the agent thinks, which is what the
+        pause really is.
+
+        The suspension is nestable and is counted, not toggled: an inner exit
+        leaves an outer suspension in force. ``enabled`` is deliberately left
+        alone throughout, so a pacer that was disabled comes back disabled.
+
+        The honest consequence is that the lag accounting no longer charges the
+        sweep to the real frame's schedule. That is intended, not a regression: a
+        suspended step is not part of the real timeline, so there is no schedule
+        for it to be behind. ``last_lag_s`` and ``total_lag_s`` therefore describe
+        the real frames only, and the first real frame after the sweep starts a
+        fresh period from the moment it is requested.
+
+        Be precise about what that costs: the outermost exit calls :meth:`reset`,
+        which clears ``total_lag_s`` as well as the deadline. A caller must not
+        read it as a total since the run began -- it is the total **since the last
+        resume**. That is the right meaning here (the sweep was a pause, not a
+        frame the game missed), but it is a side effect of the reset rather than a
+        separate decision, so it is stated rather than implied.
+        """
+        self._suspend_depth += 1
+        try:
+            yield
+        finally:
+            self._suspend_depth -= 1
+            if self._suspend_depth == 0:
+                # Start over: a deadline set before the sweep is in the past by
+                # the time pacing resumes, and carrying it over would make the
+                # first real frame look late for a delay the game never had.
+                self.reset()
+
     def wait(self) -> float:
         """Sleep until the next frame is due. Returns the seconds actually slept."""
+        if self._suspend_depth:
+            # A suspended step is a simulated future: it must not touch the real
+            # schedule, and it must not sleep at all.
+            return 0.0
+
         now = time.monotonic()
         if self._next_deadline is None:
             self._next_deadline = now + self._period

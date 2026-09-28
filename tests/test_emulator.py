@@ -315,3 +315,97 @@ def test_pacer_reports_lag_instead_of_skipping_frames() -> None:
 def test_pacer_rejects_a_non_positive_rate() -> None:
     with pytest.raises(ValueError):
         FramePacer(0.0)
+
+
+# -- suspension ------------------------------------------------------------------
+
+
+@pytest.fixture
+def sleep_calls(monkeypatch) -> list[float]:
+    """Count the pacer's sleeps instead of performing them.
+
+    ``env`` imports the ``time`` module and calls ``time.sleep`` through it, so
+    replacing that attribute counts every sleep the pacer asks for while keeping
+    the test instant. The clock behind ``time.monotonic`` is left alone.
+    """
+    import mario_jev.emulator.env as env_module
+
+    calls: list[float] = []
+    monkeypatch.setattr(env_module.time, "sleep", calls.append)
+    return calls
+
+
+def test_suspension_suppresses_sleeps_and_resumes_on_a_fresh_schedule(
+    sleep_calls: list[float],
+) -> None:
+    pacer = FramePacer(200.0, enabled=True)  # 5 ms per frame
+    pacer.wait()  # arm the deadline
+
+    with pacer.suspended():
+        assert pacer.wait() == 0.0
+        assert pacer.wait() == 0.0
+        assert sleep_calls == []
+
+    # The outermost exit resets the schedule, so the next real frame arms a fresh
+    # period instead of inheriting a deadline that expired while suspended.
+    assert pacer.wait() == 0.0
+    assert sleep_calls == []
+
+
+def test_pacing_still_sleeps_outside_a_suspension(sleep_calls: list[float]) -> None:
+    pacer = FramePacer(200.0, enabled=True)  # 5 ms per frame
+    pacer.wait()  # arm the deadline
+
+    slept = pacer.wait()
+
+    assert slept > 0.0
+    assert len(sleep_calls) == 1
+
+
+def test_an_inner_suspension_exit_does_not_re_enable_pacing(
+    sleep_calls: list[float],
+) -> None:
+    pacer = FramePacer(200.0, enabled=True)
+    pacer.wait()  # arm the deadline
+
+    with pacer.suspended():
+        with pacer.suspended():
+            assert pacer.wait() == 0.0
+        # The inner exit must not re-enable pacing: an outer suspension is still
+        # in force, so the very next wait must still perform no sleep.
+        assert pacer.wait() == 0.0
+
+    assert sleep_calls == []
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_suspension_preserves_the_enabled_state(enabled: bool) -> None:
+    # A caller must never gain pacing it did not ask for, and a disabled pacer
+    # must come back disabled.
+    pacer = FramePacer(60.0, enabled=enabled)
+
+    with pacer.suspended():
+        pass
+
+    assert pacer.enabled is enabled
+
+
+def test_enabled_stays_a_read_only_property() -> None:
+    pacer = FramePacer(60.0, enabled=True)
+
+    with pytest.raises(AttributeError):
+        pacer.enabled = False  # type: ignore[misc]
+
+
+def test_reset_still_clears_the_schedule_and_the_lag() -> None:
+    pacer = FramePacer(1000.0, enabled=True)  # 1 ms per frame
+    pacer.wait()
+    time.sleep(0.02)  # fall far behind, so there is lag to clear
+    pacer.wait()
+    assert pacer.last_lag_s > 0.0
+
+    pacer.reset()
+
+    assert pacer.last_lag_s == 0.0
+    assert pacer.total_lag_s == 0.0
+    assert pacer.wait() == 0.0  # a fresh deadline is armed without sleeping

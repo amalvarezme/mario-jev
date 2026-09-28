@@ -845,6 +845,16 @@ the report carries the numbers plus the exact commands that produced them. Headl
   PlayJev advisor was disabled throughout because `torch` is absent — its contribution is unknown
   rather than zero.
 
+**Follow-up on the report's finding #2, same day**: `FramePacer.suspended()` (nestable, resets the
+schedule on the outermost exit, never touches `enabled`) plus one `with` in `TrajectoryPlanner.plan()`
+wrapping the whole sweep. Measured: one paced `plan()` at a fixed 8-frame horizon went from **1 821 ms
+to 58 ms**, with `time.sleep` calls during the sweep from **67 per 68 steps to 0**; and the paced
+evaluation run (120 frames, identical parameters) went from **157 s to 18 s**, decision rate 0.095 →
+**0.850 Hz**, sweep p50 1 205 → **70 ms**, fallback 40 % → **27 %**, horizon floor 6 → 7–9. Findings
+#1 (decouple Jev from the tick), #3 (record the retry and the timeout), #4 (a way out of a blind
+rollout) and #5 (the pacer's own rate: 28.12 ms/step against 16.67 configured) remain open, and
+`docs/EVALUATION.md` now says so in each case rather than leaving the fixed one reading as open.
+
 ## 5. Review workload forecast
 
 | Field | Value |

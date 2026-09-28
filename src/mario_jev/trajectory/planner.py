@@ -417,66 +417,72 @@ class TrajectoryPlanner:
         tick = int(emulator.tick)
         start_x = int(dict(emulator.info)[INFO_X_POS])
 
-        # Warm start: only the first call on an instance pays for a calibration.
-        # Later calls size their horizon from what the machine cost last time,
-        # which is what keeps the steady-state tick at roughly one sweep.
-        if self._remembered is None:
-            calibration = self._calibrate(emulator, snapshot)
-            cost = _CostModel(
-                base_ms=calibration.base_ms, per_frame_ms=calibration.per_frame_ms
-            )
-            calibration_frames = calibration.frames
-            cost_source = CostSource.CALIBRATED
-        else:
-            cost = self._remembered
-            calibration_frames = 0
-            cost_source = CostSource.REUSED
-        # Seed the next call's model with this call's, before the sweep can refute
-        # it. A calibrated call hands its measurement on; a reused call keeps the
-        # one it inherited.
-        self._remembered = cost
-
-        horizon = choose_horizon(
-            budget_ms=self._budget_ms,
-            candidate_count=len(self._actions),
-            base_ms=cost.base_ms,
-            per_frame_ms=cost.per_frame_ms,
-            min_frames=self._min_frames,
-            max_frames=self._max_frames,
-        )
-
-        sweep_ms, candidates, sweep_steps = self._sweep(emulator, snapshot, horizon)
-        steps_taken = calibration_frames + sweep_steps
-        passes = 1
-
-        # The horizon above comes from a short calibration or a remembered model,
-        # so it can under-load a busy machine. One bounded correction: if the
-        # measured sweep overran the budget, re-run at the horizon the measurement
-        # says fits, and let the fresh measurement replace the remembered model so
-        # the next call does not repeat the mistake.
-        if (
-            passes < MAX_SWEEP_PASSES
-            and sweep_ms > self._budget_ms
-            and horizon > self._min_frames
-        ):
-            tighter = max(
-                self._min_frames, int(horizon * self._budget_ms / sweep_ms)
-            )
-            if tighter < horizon:
-                overran_ms = sweep_ms
-                overran_horizon = horizon
-                sweep_ms, candidates, extra_steps = self._sweep(
-                    emulator, snapshot, tighter
+        # The whole sweep runs with pacing suspended: every step below is a
+        # simulated future rolled forward from the snapshot, so it must not
+        # consume the real timeline. The loop's own `step()` keeps its pacing
+        # untouched -- only the rollout is exempt, and the schedule is reset on
+        # the way out so the next real frame starts a fresh period.
+        with emulator.pacer.suspended():
+            # Warm start: only the first call on an instance pays for a calibration.
+            # Later calls size their horizon from what the machine cost last time,
+            # which is what keeps the steady-state tick at roughly one sweep.
+            if self._remembered is None:
+                calibration = self._calibrate(emulator, snapshot)
+                cost = _CostModel(
+                    base_ms=calibration.base_ms, per_frame_ms=calibration.per_frame_ms
                 )
-                steps_taken += extra_steps
-                horizon = tighter
-                passes += 1
-                self._remembered = self._learn_from_overrun(
-                    sweep_ms=overran_ms,
-                    horizon=overran_horizon,
-                    refuted_horizon=tighter,
-                    base_ms=cost.base_ms,
+                calibration_frames = calibration.frames
+                cost_source = CostSource.CALIBRATED
+            else:
+                cost = self._remembered
+                calibration_frames = 0
+                cost_source = CostSource.REUSED
+            # Seed the next call's model with this call's, before the sweep can refute
+            # it. A calibrated call hands its measurement on; a reused call keeps the
+            # one it inherited.
+            self._remembered = cost
+
+            horizon = choose_horizon(
+                budget_ms=self._budget_ms,
+                candidate_count=len(self._actions),
+                base_ms=cost.base_ms,
+                per_frame_ms=cost.per_frame_ms,
+                min_frames=self._min_frames,
+                max_frames=self._max_frames,
+            )
+
+            sweep_ms, candidates, sweep_steps = self._sweep(emulator, snapshot, horizon)
+            steps_taken = calibration_frames + sweep_steps
+            passes = 1
+
+            # The horizon above comes from a short calibration or a remembered model,
+            # so it can under-load a busy machine. One bounded correction: if the
+            # measured sweep overran the budget, re-run at the horizon the measurement
+            # says fits, and let the fresh measurement replace the remembered model so
+            # the next call does not repeat the mistake.
+            if (
+                passes < MAX_SWEEP_PASSES
+                and sweep_ms > self._budget_ms
+                and horizon > self._min_frames
+            ):
+                tighter = max(
+                    self._min_frames, int(horizon * self._budget_ms / sweep_ms)
                 )
+                if tighter < horizon:
+                    overran_ms = sweep_ms
+                    overran_horizon = horizon
+                    sweep_ms, candidates, extra_steps = self._sweep(
+                        emulator, snapshot, tighter
+                    )
+                    steps_taken += extra_steps
+                    horizon = tighter
+                    passes += 1
+                    self._remembered = self._learn_from_overrun(
+                        sweep_ms=overran_ms,
+                        horizon=overran_horizon,
+                        refuted_horizon=tighter,
+                        base_ms=cost.base_ms,
+                    )
 
         # Put the emulator back exactly where it was found. The frame counter is
         # deliberately *not* rewound: `load_state` does not rewind it, and a
