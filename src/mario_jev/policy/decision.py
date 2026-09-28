@@ -70,6 +70,12 @@ class DecisionSource(StrEnum):
 
     #: Jev answered and its choice was executed.
     JEV = "jev"
+    #: Jev answered an **earlier** tick and its choice was executed on this one. The
+    #: age is on ``TickRecord.answer_age_ticks``; this member only keeps "Jev decided
+    #: this" from silently meaning "Jev decided this three ticks ago". The value is
+    #: pinned to the string the record already carried, so promoting it from a free
+    #: module constant into this closed set changed nothing observable.
+    JEV_STALE = "jev_stale"
     #: No new decision was requested on this frame; the last decided action ran.
     HOLD = "hold"
     #: Jev chose a lethal candidate while a non-lethal one was on the table.

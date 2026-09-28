@@ -14,6 +14,8 @@ the real thing rather than against a fake.
 from __future__ import annotations
 
 import json
+import time
+from concurrent.futures import Future
 from dataclasses import fields, replace
 from pathlib import Path
 from typing import Callable
@@ -43,11 +45,15 @@ from mario_jev.jev import (
     build_questions,
 )
 from mario_jev.policy import (
+
+    JEV_STALE_DISCARDED,
     OVERSHOOT_FACTOR,
+    STALE_LIMIT_CADENCES,
     TERMINATIONS,
     DecisionCadence,
     DecisionSource,
     ExecutionLoop,
+    JevDispatcher,
     RunSummary,
     TickDecision,
     TickRecord,
@@ -480,6 +486,80 @@ class FakeAdvisor:
         return self.answer
 
 
+class InlineRunner:
+    """A runner that finishes the call during :meth:`submit`, on the calling thread.
+
+    It exists so the tests written against the *old* synchronous loop keep testing
+    what they were written to test. Those tests are about the decision rule, the
+    cadence, the guardrail and what aborts a run -- none of which changed -- and
+    with this runner a call fired on a tick is finished and taken on that same
+    tick, so their assertions still describe the same tick they always did.
+
+    It is not a shortcut around the new behaviour: the ticks where the answer
+    lands *later* are exactly the new behaviour, and they are exercised through
+    :class:`ManualRunner` in their own tests below.
+    """
+
+    def __init__(self) -> None:
+        self.submitted = 0
+        self.shutdowns = 0
+
+    def submit(self, fn: Callable[[], object]) -> Future[object]:
+        self.submitted += 1
+        future: Future[object] = Future()
+        future.set_result(fn())
+        return future
+
+    def shutdown(self, *, wait: bool = True) -> None:
+        self.shutdowns += 1
+
+
+class ManualRunner:
+    """A runner the test drives by hand: the call finishes when the test says so.
+
+    This is what makes "the game kept moving while Jev thought" a deterministic
+    assertion rather than a race. No test below waits on a thread, and none reads
+    the real clock to decide whether a call has landed.
+    """
+
+    def __init__(self) -> None:
+        self.pending: list[tuple[Future[object], Callable[[], object]]] = []
+        self.submitted = 0
+        self.shutdowns = 0
+
+    def submit(self, fn: Callable[[], object]) -> Future[object]:
+        self.submitted += 1
+        future: Future[object] = Future()
+        self.pending.append((future, fn))
+        return future
+
+    def run_next(self) -> None:
+        """Finish the oldest submitted call, as a real worker eventually would."""
+        future, fn = self.pending.pop(0)
+        future.set_result(fn())
+
+    def shutdown(self, *, wait: bool = True) -> None:
+        self.shutdowns += 1
+
+
+class StepClock:
+    """A clock that advances a fixed amount per reading, so a call costs exactly that.
+
+    The dispatcher reads it twice per call, once on each side of ``client.ask``, so
+    ``step_s=20.0`` is a call that took twenty seconds -- without anything waiting
+    twenty seconds.
+    """
+
+    def __init__(self, *, step_s: float) -> None:
+        self.step_s = step_s
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        value = self.now
+        self.now += self.step_s
+        return value
+
+
 class ScriptedTransport:
     """Hands back queued results and remembers the requests; never opens a socket."""
 
@@ -520,9 +600,28 @@ def loop_with(
     planner: object | None = None,
     advisor: object | None = None,
     builder: object | None = None,
+    runner: object | None = None,
+    clock: Callable[[], float] | None = None,
 ) -> tuple[ExecutionLoop, FakeEmulator, object]:
+    """A loop over fakes, whose Jev call finishes inside the tick unless told otherwise.
+
+    The dispatcher is built here, over the injected client, with an
+    :class:`InlineRunner` by default. A test that wants the call to *outlive* the
+    tick passes a :class:`ManualRunner` and drives it.
+
+    With no client there is nothing to dispatch: the loop builds its own client and
+    its own default dispatcher, which those tests never fire because they configure
+    no credential.
+    """
     emulator = emulator if emulator is not None else FakeEmulator()
     planner = planner if planner is not None else FakePlanner(table or all_safe_table())
+    dispatcher = None
+    if client is not None:
+        dispatcher = JevDispatcher(
+            client,  # type: ignore[arg-type]
+            runner=runner if runner is not None else InlineRunner(),  # type: ignore[arg-type]
+            clock=clock if clock is not None else time.perf_counter,
+        )
     loop = ExecutionLoop(
         settings,
         emulator=emulator,
@@ -530,6 +629,7 @@ def loop_with(
         client=client,  # type: ignore[arg-type]
         builder=builder if builder is not None else FakeBuilder(),
         advisor=advisor,  # type: ignore[arg-type]
+        dispatcher=dispatcher,
     )
     return loop, emulator, planner
 
@@ -1219,6 +1319,9 @@ def summary_with(termination: str) -> RunSummary:
         ticks=1,
         frames=1,
         decisions=0,
+        # No default on ``answers_applied`` either: a construction that forgets to
+        # say how many answers were applied must fail rather than report zero.
+        answers_applied=0,
         sources={},
         degradations={},
         elapsed_s=1.0,
@@ -1679,3 +1782,257 @@ def test_a_retry_and_a_stall_escalation_co_occur_and_are_both_counted() -> None:
     # The existing counter aggregates both; neither needs a summary field of its own.
     assert summary.degradations[JEV_RETRIED] == ticks
     assert summary.degradations[STALL_ESCALATION] == 1
+
+
+# -- the call off the tick: the game never waits, and what lands is dated ------------
+#
+# The dispatcher's own contract is pinned in ``tests/test_dispatch.py``; these tests
+# are about the *loop*: that a tick never waits for Jev, and that an answer which
+# arrives late is dated instead of being presented as this tick's own decision.
+
+
+def phase_total(record: TickRecord) -> float:
+    """The tick's phases, which is every entry in ``latencies_ms`` but ``total``.
+
+    ``total`` is a member of the same mapping, so summing *its* values would count
+    it twice and no record could ever satisfy the invariant. What the invariant
+    bounds is the phases: each is measured inside the tick and they are disjoint,
+    so their sum is at most the tick's own wall clock.
+    """
+    return sum(
+        value for name, value in record.latencies_ms.items() if name != "total"
+    )
+
+
+def test_a_twenty_second_call_does_not_stop_the_game() -> None:
+    """The deterministic proof of the whole change, and the number it exists for.
+
+    A call is given a 20 s cost and then held open. The world must keep moving: the
+    frames advance, no tick's own wall clock contains those 20 s, and no tick claims
+    to have applied an answer it never saw.
+    """
+    runner = ManualRunner()
+    client = FakeClient(response("right", 0.9))
+    loop, emulator, _ = loop_with(
+        settings=make_settings(cadence=1),
+        client=client,
+        runner=runner,
+        clock=StepClock(step_s=20.0),
+    )
+
+    records = [loop.step() for _ in range(3)]
+
+    # The call is still in flight -- and three game frames ran anyway.
+    assert runner.pending and runner.submitted == 1
+    assert client.calls == 0, "a held call must not have reached the client yet"
+    assert emulator.tick == 3
+    assert [record.frame_index for record in records] == [0, 1, 2]
+    # Not one tick absorbed the 20 s. A tick that waited for the call would report a
+    # total in the tens of seconds; 10 000 ms is a wide margin over the few
+    # milliseconds a fake tick costs and a hard floor under the call's own cost.
+    assert all(record.latencies_ms["total"] < 10_000.0 for record in records)
+    assert all(record.jev_call_ms is None for record in records)
+    assert all(record.answer_age_ticks is None for record in records)
+
+    # And when it finally lands, the tick that takes it says what it cost and how
+    # old it is, instead of presenting it as a decision made now.
+    runner.run_next()
+    applied = loop.step()
+
+    assert applied.jev_call_ms == 20_000.0
+    assert applied.asked_at_tick == 0
+    assert applied.answer_age_ticks == 3
+    assert applied.decision.source is DecisionSource.JEV_STALE
+    # The call's 20 s is in its own field, so the tick's phases still fit inside the
+    # tick's own total -- which is what keeps the published arithmetic readable.
+    assert phase_total(applied) <= applied.latencies_ms["total"] + 1e-6
+
+
+def test_a_tick_while_a_call_is_in_flight_fires_nothing() -> None:
+    runner = ManualRunner()
+    client = FakeClient(response("right", 0.9), response("right", 0.9))
+    loop, _, _ = loop_with(
+        settings=make_settings(cadence=1), client=client, runner=runner
+    )
+
+    fired = loop.step()
+    waiting = loop.step()
+    still_waiting = loop.step()
+
+    assert runner.submitted == 1, "a second call was fired while one was in flight"
+    assert fired.jev_questions is not None
+    assert waiting.jev_questions is None
+    assert still_waiting.jev_questions is None
+    # A call that was not fired is not counted as a decision either.
+    assert (fired.decision.jev_called, waiting.decision.jev_called) == (True, False)
+
+
+def test_an_answer_that_lands_on_its_own_tick_is_age_zero_and_plain_jev() -> None:
+    """The same-tick case, which is what every pre-existing test still exercises."""
+    loop, _, _ = loop_with(
+        settings=make_settings(cadence=1),
+        client=FakeClient(response("right", 0.9)),
+    )
+
+    record = loop.step()
+
+    assert record.answer_age_ticks == 0
+    assert record.asked_at_tick == record.tick
+    assert record.decision.source is DecisionSource.JEV
+    assert record.jev_call_ms is not None
+
+
+def test_an_answer_one_tick_late_is_applied_as_stale_with_its_real_age() -> None:
+    runner = ManualRunner()
+    loop, _, _ = loop_with(
+        settings=make_settings(cadence=1),
+        client=FakeClient(response("right", 0.9)),
+        runner=runner,
+    )
+
+    loop.step()  # tick 0 fires
+    runner.run_next()  # the worker finishes it
+    applied = loop.step()  # tick 1 takes it
+
+    assert applied.asked_at_tick == 0
+    assert applied.answer_age_ticks == 1
+    assert applied.decision.source is DecisionSource.JEV_STALE
+
+
+def test_an_answer_older_than_the_bound_is_discarded_and_the_tick_holds() -> None:
+    """Past the bound the answer describes a world the agent has left.
+
+    The tick holds its last action rather than acting on it -- which is what a tick
+    with no decision at all already did -- and the discard is *recorded*, because the
+    call was made and still cost what ``jev_call_ms`` says.
+    """
+    runner = ManualRunner()
+    bound = STALE_LIMIT_CADENCES * 1
+    loop, _, _ = loop_with(
+        settings=make_settings(cadence=1),
+        client=FakeClient(response("right", 0.9)),
+        runner=runner,
+        clock=StepClock(step_s=20.0),
+    )
+
+    for _ in range(bound + 2):  # ticks 0 .. bound+1, the call held open throughout
+        loop.step()
+    runner.run_next()
+    observed = loop.step()
+
+    assert observed.answer_age_ticks is None, "a stale answer was applied"
+    assert observed.jev_call_ms == 20_000.0, "the call's cost went unrecorded"
+    assert JEV_STALE_DISCARDED in observed.degradations
+    assert observed.decision.source is DecisionSource.HOLD
+
+
+def test_a_failed_call_is_recorded_on_the_tick_that_observes_it() -> None:
+    """The failure is not lost, only dated: it belongs to the tick that saw it."""
+    runner = ManualRunner()
+    client = FakeClient(error=JevUnavailable("the endpoint was unreachable"))
+    loop, _, _ = loop_with(
+        settings=make_settings(cadence=1),
+        client=client,
+        runner=runner,
+        clock=StepClock(step_s=0.5),
+    )
+
+    fired = loop.step()
+
+    assert fired.decision.source is not DecisionSource.FALLBACK_DEGRADED
+    runner.run_next()
+    observed = loop.step()
+
+    assert observed.decision.source is DecisionSource.FALLBACK_DEGRADED
+    assert observed.decision.reason == "the endpoint was unreachable"
+    assert observed.jev_call_ms == 500.0
+    assert observed.decision.jev_called is False, "the fire belongs to the earlier tick"
+
+
+def test_a_fatal_error_aborts_on_the_tick_that_observes_it_and_closes_the_worker() -> (
+    None
+):
+    """A rejected credential must still abort, and it must not leak the worker."""
+    runner = ManualRunner()
+    client = FakeClient(error=JevAuthError("the credential was rejected", status=401))
+    loop, _, _ = loop_with(
+        settings=make_settings(cadence=1), client=client, runner=runner
+    )
+
+    loop.step()  # tick 0 fires and the worker carries the rejection back
+    runner.run_next()
+
+    with pytest.raises(JevAuthError):
+        loop.run(max_ticks=5)
+
+    assert runner.shutdowns == 1, "the abort path left the dispatcher open"
+
+
+def test_run_closes_the_dispatcher_on_the_normal_path() -> None:
+    runner = ManualRunner()
+    loop, _, _ = loop_with(
+        settings=make_settings(key=None, cadence=1),
+        client=FakeClient(),
+        runner=runner,
+    )
+
+    loop.run(max_ticks=2)
+
+    assert runner.shutdowns == 1
+
+
+def test_decisions_counts_calls_fired_while_answers_applied_counts_what_landed() -> None:
+    """Two counts, two meanings, and the difference is the whole point of the change."""
+    held = ManualRunner()
+    held_loop, _, _ = loop_with(
+        settings=make_settings(cadence=1),
+        client=FakeClient(response("right", 0.9)),
+        runner=held,
+    )
+    held_summary = held_loop.run(max_ticks=3)
+
+    assert held_summary.decisions == 1, "one call was fired"
+    assert held_summary.answers_applied == 0, "and none of them landed before the cap"
+
+    landed_loop, _, _ = loop_with(
+        settings=make_settings(cadence=1),
+        client=FakeClient(*(response("right", 0.9) for _ in range(3))),
+    )
+    landed_summary = landed_loop.run(max_ticks=3)
+
+    assert landed_summary.decisions == 3
+    assert landed_summary.answers_applied == 3
+
+
+def test_the_phase_times_never_exceed_the_tick_total_even_under_a_twenty_second_call() -> (
+    None
+):
+    """The invariant the published arithmetic rests on, on every record of a run."""
+    runner = ManualRunner()
+    # One response per tick, because every taken call frees the slot for the next.
+    client = FakeClient(
+        response("right", 0.9, attempts=2),
+        *(response("right", 0.9) for _ in range(5)),
+    )
+    loop, _, _ = loop_with(
+        settings=make_settings(cadence=1),
+        client=client,
+        runner=runner,
+        clock=StepClock(step_s=20.0),
+    )
+
+    records: list[TickRecord] = []
+    for _ in range(6):
+        records.append(loop.step())
+        if runner.pending:
+            runner.run_next()
+
+    assert any(JEV_RETRIED in record.degradations for record in records)
+    for record in records:
+        phases = phase_total(record)
+        assert phases <= record.latencies_ms["total"] + 1e-6, (
+            f"tick {record.tick}: phases {phases} exceed total "
+            f"{record.latencies_ms['total']} -- a call's cost leaked into the phases"
+        )
+        if record.jev_call_ms is not None:
+            assert record.jev_call_ms == 20_000.0

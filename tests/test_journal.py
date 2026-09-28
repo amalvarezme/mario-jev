@@ -21,8 +21,10 @@ transport, so the records are genuine rows rather than fixtures.
 from __future__ import annotations
 
 import json
+from concurrent.futures import Future
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
 import mario_jev.journal
 import numpy as np
@@ -56,6 +58,7 @@ from mario_jev.perception import detect
 from mario_jev.policy import (
     DecisionSource,
     ExecutionLoop,
+    JevDispatcher,
     RunSummary,
     TickDecision,
     TickRecord,
@@ -220,6 +223,10 @@ def make_summary(**overrides: object) -> RunSummary:
         "ticks": 2,
         "frames": 2,
         "decisions": 1,
+        # Also required rather than defaulted, for the same reason as
+        # ``termination`` below: a construction that forgets it must fail rather
+        # than report zero applied answers. One of the two ticks applied an answer.
+        "answers_applied": 1,
         "sources": {DecisionSource.FALLBACK_NO_KEY: 1, DecisionSource.JEV: 1},
         "degradations": {"timing_overrun": 1},
         "elapsed_s": 0.25,
@@ -738,6 +745,35 @@ def ok_result(choice: str = "right") -> HttpResult:
     return HttpResult(status=200, body=body, elapsed_ms=1.0)
 
 
+class InlineRunner:
+    """A runner that finishes the call during ``submit``, on the calling thread.
+
+    These end-to-end journal tests are about what the run *writes*, not about which
+    tick an answer eventually lands on. With the real one-worker dispatcher that
+    would be a race -- whether the call has finished by the time the same tick takes
+    it depends on thread scheduling -- so the tests that assert per-tick sources and
+    per-tick responses drive the completion themselves, exactly as the loop's own
+    tests do. The ticks where an answer arrives *later* are pinned deterministically
+    in ``tests/test_policy.py`` and ``tests/test_dispatch.py``, over a hand-driven
+    runner. This double is deliberately local rather than shared through
+    ``conftest.py``: it is twelve lines, and test files here do not import each
+    other.
+    """
+
+    def submit(self, fn: Callable[[], object]) -> Future[object]:
+        future: Future[object] = Future()
+        future.set_result(fn())
+        return future
+
+    def shutdown(self, *, wait: bool = True) -> None:
+        """Nothing was started, so there is nothing to join."""
+
+
+def inline_dispatcher(client: object) -> JevDispatcher:
+    """A dispatcher over ``client`` whose calls finish inside the tick that fired them."""
+    return JevDispatcher(client, runner=InlineRunner())  # type: ignore[arg-type]
+
+
 def run_observed(
     tmp_path: Path, emulator: MarioEmulator, *, max_ticks: int = 2
 ) -> tuple[Journal, RunSummary, Settings]:
@@ -753,7 +789,9 @@ def run_observed(
         transport=transport,
         sleeper=SilentSleeper(),
     )
-    loop = ExecutionLoop(settings, emulator=emulator, client=client)
+    loop = ExecutionLoop(
+        settings, emulator=emulator, client=client, dispatcher=inline_dispatcher(client)
+    )
     path = tmp_path / "run.jsonl"
     writer = JournalWriter(path, settings=settings, clock=fixed_clock)
     summary = loop.run(max_ticks=max_ticks, observer=writer.observer())
@@ -783,7 +821,11 @@ def run_with_advisor(
         sleeper=SilentSleeper(),
     )
     loop = ExecutionLoop(
-        settings, emulator=emulator, client=client, advisor=advisor  # type: ignore[arg-type]
+        settings,
+        emulator=emulator,
+        client=client,  # type: ignore[arg-type]
+        advisor=advisor,  # type: ignore[arg-type]
+        dispatcher=inline_dispatcher(client),
     )
     writer = JournalWriter(path, settings=settings, clock=fixed_clock)
     summary = loop.run(max_ticks=1, observer=writer.observer())

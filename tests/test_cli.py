@@ -360,7 +360,16 @@ def test_replay_prints_recorded_decisions_and_is_byte_identical(monkeypatch, cap
     code, journal_path, responder = _run_real_journal(monkeypatch, tmp_path, max_ticks=3)
     assert code == 0
     journal = read_journal(journal_path)
-    assert responder.calls == len(journal.ticks) == 3
+    # The exact number of calls is timing-dependent now, and pinning it would be a
+    # race: with at most one call in flight over a real worker, whether a call has
+    # finished by the time the next tick *takes* it decides how many are fired. What
+    # is deterministic -- and what this test is about -- is that the journal's own
+    # count is the truth about the calls that were really made, and that every tick
+    # executed a frame. The firing rule itself is pinned deterministically in
+    # tests/test_dispatch.py and tests/test_policy.py, over a hand-driven runner.
+    assert 1 <= responder.calls <= 3
+    assert responder.calls == journal.summary["decisions"]
+    assert len(journal.ticks) == 3
     capsys.readouterr()  # drop the run report
 
     first_code = cli.main(["replay", str(journal_path)])
@@ -445,10 +454,11 @@ def test_run_end_to_end_writes_a_readable_journal(monkeypatch, capsys, tmp_path)
     out = capsys.readouterr().out
 
     assert code == 0
-    assert responder.calls == 3
+    assert 1 <= responder.calls <= 3
     assert journal_path.is_file()
     journal = read_journal(journal_path)
     assert len(journal.ticks) == 3
+    assert responder.calls == journal.summary["decisions"]
     summary = journal.summary
     # The printed report matches the journal's own summary line.
     assert f"ticks: {summary['ticks']}" in out

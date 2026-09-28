@@ -10,10 +10,40 @@ Each :meth:`ExecutionLoop.step` does the same five things, in order:
 1. read the loop's own game-frame counter and the raw ``emulator.tick``;
 2. build the typed state from the frame, RAM and ``info``;
 3. run the rollout sweep every tick, because the trajectories are local and cheap;
-4. decide with :func:`~mario_jev.policy.decision.select_action`, consulting Jev only
-   when the cadence is due, a credential is configured, and there are candidates;
+4. decide with :func:`~mario_jev.policy.decision.select_action`, *submitting* a Jev
+   call only when the cadence is due, a credential is configured, there are
+   candidates and nothing is already in flight, and applying whatever answer has
+   finished by now;
 5. execute the decided action with the real emulator, then advance the loop's
    game-frame counter by exactly one.
+
+The tick never waits for Jev
+----------------------------
+
+Step 4 used to call ``JevClient.ask`` **in series inside the tick**, and the
+measured cost was the whole world stopping: 900 frames in 184 s (4.9 game frames
+per second), and one tick that spent 21 271.52 ms inside Jev out of a 21 375.84 ms
+tick because a single attempt timed out. The call now goes to a
+:class:`~mario_jev.policy.dispatch.JevDispatcher`, which submits it to one worker
+and returns immediately; the tick fires at most one call, takes whatever has
+finished, and executes its frame either way.
+
+That splits one fact into three, so the record carries three:
+
+* this tick **fired** a call -- ``TickDecision.jev_called``, counted by
+  :attr:`RunSummary.decisions`;
+* this tick **applied** an answer, and how old it was --
+  :attr:`TickRecord.asked_at_tick` and :attr:`TickRecord.answer_age_ticks`,
+  counted by :attr:`RunSummary.answers_applied`;
+* what the **call itself** cost -- :attr:`TickRecord.jev_call_ms`.
+
+An answer older than ``STALE_LIMIT_CADENCES * decision_cadence_frames`` ticks is
+discarded and the tick records :data:`JEV_STALE_DISCARDED`; it is not cancelled,
+because nothing can cancel it (see :mod:`mario_jev.policy.dispatch`). An applied
+answer that was asked on an earlier tick is recorded as
+:attr:`~mario_jev.policy.decision.DecisionSource.JEV_STALE` rather
+than ``jev``, so "Jev decided this" never silently means "Jev decided this three
+ticks ago".
 
 The loop owns the frame index because the planner does not. The rollout sweep steps
 the same emulator while enumerating candidates and never rewinds its counter, so
@@ -28,6 +58,17 @@ rollout's own ``elapsed_ms`` exceeds ``rollout_budget_ms * OVERSHOOT_FACTOR``, a
 ``JEV_RETRIED`` when the tick's successful response reports more than one
 transport attempt. The loop holds one planner across ticks; the limit stays
 visible in the journal.
+
+``latencies_ms`` keeps meaning *what this tick spent in each phase*, so the phases
+-- everything in the mapping except ``total`` itself -- sum to at most
+``latencies_ms["total"]`` on every record. (``total`` is a member of the same
+mapping, so a sum over *its* values would be counting it twice; the invariant is
+about the phases it bounds.)
+``latencies_ms["jev"]`` is therefore the time the tick spent in Jev code --
+building questions, submitting, taking -- and **not** what the call cost; the
+call's own duration is ``jev_call_ms``. The two are separate on purpose: a 21 s
+call now lands on a tick whose ``total`` is a couple of milliseconds, and folding
+it back into ``latencies_ms`` would break the arithmetic the evaluation reads.
 
 The one exception is the measured stall, and it is recorded too. The loop counts
 consecutive frames in which the state's ``x_max`` does not advance, and after
@@ -49,12 +90,17 @@ recorded as ``advisor=None`` alongside the measured ``advisor_absence`` it holds
 tick proceeds unchanged. ``JevClient`` holds
 no session, so ``close()`` releases nothing and a closed client still serves; the
 client cannot be absent either, because ``__init__`` substitutes a default. In this
-module, exactly one exception is caught, and only around the client call:
+module, exactly one exception is handled, and only where a finished call is taken:
 :class:`~mario_jev.jev.JevUnavailable`. It becomes ``degraded_reason``, which turns
 into ``FALLBACK_DEGRADED``. ``JevAuthError``, ``JevRequestError`` and
-``JevProtocolError`` are **not** caught here: a rejected credential, a malformed
+``JevProtocolError`` are **not** handled here: a rejected credential, a malformed
 request or a drifted contract aborts the run, because an endless fallback would
 make a run that never once consulted Jev look Jev-driven.
+
+With the call off the tick, both are attributed to the tick that **observes** them
+rather than the tick that fired them -- the failure is not lost, only dated
+honestly. The fatal ones are re-raised out of that tick, and ``run()`` closes the
+dispatcher on every exit path, including that one, so no worker outlives the run.
 
 Advisor boundary (stated plainly)
 ---------------------------------
@@ -81,7 +127,7 @@ from __future__ import annotations
 
 import time
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable, Mapping
 
 import numpy as np
@@ -89,7 +135,7 @@ import numpy as np
 from mario_jev.advisor import AdvisorAbsence, AdvisorAdvice, PlayJevAdvisor
 from mario_jev.config import Settings
 from mario_jev.emulator import MarioEmulator, StepResult
-from mario_jev.jev import JevClient, JevUnavailable, build_questions
+from mario_jev.jev import JevClient, JevResponse, JevUnavailable, build_questions
 from mario_jev.perception import FramePerception, detect
 from mario_jev.state import MarioState, MarioStateBuilder, is_death, is_goal
 from mario_jev.trajectory import RolloutTable, TrajectoryPlanner
@@ -105,6 +151,7 @@ from .decision import (
     journal_state,
     select_action,
 )
+from .dispatch import JevDispatcher
 
 #: How far past the rollout budget a sweep may go before the tick is recorded as
 #: overrunning. The loop does not try to repair the overrun; it records it.
@@ -132,6 +179,23 @@ STALL_ESCALATION = "stall_escalation"
 #: timed-out attempt plus the 577 ms one that worked is the missing time.
 JEV_RETRIED = "jev_retried"
 
+#: How many decision cadences an answer may be old and still be applied. The
+#: bound is ``STALE_LIMIT_CADENCES * settings.decision_cadence_frames`` ticks, so
+#: it scales with how often the loop asks rather than with a wall clock the tick
+#: does not consult. Three is read off the measurement: the median round trip was
+#: 416 ms against a tick of roughly 200 ms, so an answer normally lands within a
+#: couple of ticks, and one three cadences old describes a world the agent left.
+STALE_LIMIT_CADENCES = 3
+
+#: The degradation recorded on a tick that took an answer older than the staleness
+#: bound and threw it away. It is recorded rather than passed over in silence
+#: because the call was still made and still cost what it cost -- ``jev_call_ms``
+#: says how much -- and a run where this appears often is a run whose cadence asks
+#: faster than the model answers. The *source* of a stale answer that was applied is
+#: not here: it is :attr:`~mario_jev.policy.decision.DecisionSource.JEV_STALE`, in
+#: the closed set that owns every ``decision.source`` value.
+JEV_STALE_DISCARDED = "jev_stale_discarded"
+
 #: The closed set of reasons a run can stop. It lives here because the loop is
 #: what observes the stop; the journal and the readers only copy the
 #: classification out. A value outside this set is a bug, not a new state, and
@@ -142,7 +206,9 @@ TERMINATIONS: frozenset[str] = frozenset(
 
 __all__ = [
     "JEV_RETRIED",
+    "JEV_STALE_DISCARDED",
     "OVERSHOOT_FACTOR",
+    "STALE_LIMIT_CADENCES",
     "STALL_ESCALATION",
     "STALL_FRAMES",
     "TERMINATIONS",
@@ -217,8 +283,27 @@ class TickRecord:
     journal records only the questions the policy genuinely built. The state that
     accompanied them is on ``state``, whose :meth:`MarioState.to_jev_state` is the
     frozen projection that was sent; ``JevResponse.as_dict()`` remains the
-    sanctioned record of the reply in ``jev_response``. ``latencies_ms`` always
-    holds at least ``rollout``, ``jev``, ``advisor`` and ``total``.
+    sanctioned record of the reply in ``jev_response``.
+
+    With the call off the tick, ``jev_questions`` is what this tick **fired** and
+    ``jev_response`` is what this tick **applied**, and they need not describe the
+    same call: a tick can fire one and apply an earlier one, or do only one of the
+    two. ``asked_at_tick`` closes that gap -- it is the ``tick`` on which the
+    applied answer was asked, and ``answer_age_ticks`` is ``tick -
+    asked_at_tick``. Both are ``None`` on a tick that applied no answer, which
+    includes a tick that discarded a stale one; the discard is on ``degradations``
+    as :data:`JEV_STALE_DISCARDED` instead.
+
+    ``jev_call_ms`` is what the *call* cost, measured in the worker around
+    ``client.ask``, on the tick that observed it finish. It is set whenever a call
+    was taken -- applied, discarded or failed -- because the cost was paid either
+    way. It is deliberately **not** in ``latencies_ms``: that mapping always holds
+    at least ``rollout``, ``jev``, ``advisor`` and ``total``, and it means what
+    *this tick* spent, so the phases it holds -- everything except ``total``
+    itself -- sum to at most ``total`` on every record. ``latencies_ms["jev"]`` is the few microseconds of
+    submitting and taking; a 21 s call that arrives on a 2 ms tick belongs in
+    ``jev_call_ms`` and nowhere else, because a tick's ``total`` does not contain
+    it and pretending otherwise would break the arithmetic downstream reads.
 
     ``advisor`` is the advice that reached the tick, or ``None``. When it is
     ``None``, ``advisor_absence`` tells the journal *why*: the advisor was enabled
@@ -252,6 +337,13 @@ class TickRecord:
     advisor_absence: AdvisorAbsence | None = field(compare=False)
     latencies_ms: Mapping[str, float]
     degradations: tuple[str, ...]
+    # These three sit after ``degradations`` rather than beside ``jev_response``
+    # only because a dataclass puts its defaulted fields last. ``None`` is the
+    # honest reading for a tick that applied no answer and observed no call, which
+    # is most ticks, and it is the same reason ``terminated`` defaults to ``False``.
+    asked_at_tick: int | None = None
+    answer_age_ticks: int | None = None
+    jev_call_ms: float | None = None
     terminated: bool = False
     truncated: bool = False
 
@@ -270,10 +362,24 @@ class RunSummary:
     """The measured shape of one run, counted rather than claimed.
 
     ``ticks`` is the number of completed steps and ``frames`` the number of game
-    frames the loop advanced (one per step). ``decisions`` counts ticks where
-    ``TickDecision.jev_called`` is true, so a run that never consulted Jev cannot
-    overstate its rate. ``decision_rate_hz`` is ``decisions / elapsed_s``, or
-    ``0.0`` when ``elapsed_s <= 0``.
+    frames the loop advanced (one per step).
+
+    ``decisions`` counts ticks that **fired** a Jev call -- ticks where
+    ``TickDecision.jev_called`` is true -- and ``decision_rate_hz`` is
+    ``decisions / elapsed_s`` (``0.0`` when ``elapsed_s <= 0``), so it is the rate
+    at which the loop *asked*. Both kept that meaning exactly when the call moved
+    off the tick, which is the point: every number already published in
+    ``docs/EVALUATION.md`` was computed from them, and silently redefining a field
+    would invalidate a report rather than update it.
+
+    ``answers_applied`` is the other meaning, and it is a different number:
+    the count of ticks that **applied** an answer, fresh or stale -- exactly the
+    records whose ``answer_age_ticks`` is not ``None``. It can be lower than
+    ``decisions`` (a call failed, or its answer was discarded as stale, or the run
+    ended with one still in flight) and it is never higher, because at most one
+    call is in flight and every applied answer was fired first. It has no default,
+    for the same reason ``termination`` has none: a construction that forgets it
+    must fail rather than quietly report zero applied answers.
 
     ``termination`` says *why* the run stopped, as one member of
     :data:`TERMINATIONS`, and it is what turns ``ticks: 805`` against a 900-tick
@@ -296,6 +402,7 @@ class RunSummary:
     ticks: int
     frames: int
     decisions: int
+    answers_applied: int
     sources: Mapping[DecisionSource, int]
     degradations: Mapping[str, int]
     elapsed_s: float
@@ -319,7 +426,12 @@ class ExecutionLoop:
     Every collaborator can be injected. With none injected the loop builds the real
     ones from ``settings``: a :class:`MarioEmulator` on ``settings.stage``, a
     :class:`TrajectoryPlanner`, a :class:`JevClient`, a :class:`MarioStateBuilder`,
-    and — only when ``settings.advisor_enabled`` — a :class:`PlayJevAdvisor`.
+    a :class:`~mario_jev.policy.dispatch.JevDispatcher` over that client, and —
+    only when ``settings.advisor_enabled`` — a :class:`PlayJevAdvisor`.
+
+    The dispatcher is injectable for the same reason the client is: it carries the
+    ``runner`` seam, so a test can drive a call to completion by hand instead of
+    waiting on a thread. ``run()`` closes whichever dispatcher it was given.
     """
 
     __slots__ = (
@@ -328,6 +440,7 @@ class ExecutionLoop:
         "_builder",
         "_cadence",
         "_client",
+        "_dispatcher",
         "_emulator",
         "_end_info",
         "_ended",
@@ -349,6 +462,7 @@ class ExecutionLoop:
         client: JevClient | None = None,
         builder: MarioStateBuilder | None = None,
         advisor: PlayJevAdvisor | None = None,
+        dispatcher: JevDispatcher | None = None,
     ) -> None:
         if emulator is None:
             emulator = MarioEmulator(
@@ -367,6 +481,9 @@ class ExecutionLoop:
             client if client is not None else JevClient.from_settings(settings)
         )
         self._builder = builder if builder is not None else MarioStateBuilder()
+        self._dispatcher = (
+            dispatcher if dispatcher is not None else JevDispatcher(self._client)
+        )
         if advisor is None and settings.advisor_enabled:
             advisor = PlayJevAdvisor.from_settings(settings)
         self._advisor = advisor
@@ -471,43 +588,100 @@ class ExecutionLoop:
             else None
         )
 
-        # 4. Jev, only on a cadence tick with a credential and something to ask
-        #    about. ``build_questions`` refuses an empty candidate set, so the
-        #    candidates are part of the gate rather than an afterthought.
+        # 4. Jev, in two independent halves that share a tick but not a call.
+        #
+        #    Fire, only on a cadence tick with a credential, something to ask about
+        #    and nothing already in flight. ``build_questions`` refuses an empty
+        #    candidate set, so the candidates are part of the gate rather than an
+        #    afterthought, and a refused fire builds no questions at all -- the
+        #    record's ``jev_questions is None`` is how the tick says it did not ask.
         cadence_due = self._cadence.due(frame_index)
         jev_questions: dict[str, object] | None = None
-        response = None
+        response: JevResponse | None = None
         degraded_reason: str | None = None
+        asked_at_tick: int | None = None
+        answer_age_ticks: int | None = None
+        jev_call_ms: float | None = None
+        fired = False
         jev_started = time.perf_counter()
-        if cadence_due and settings.jev_available and table.candidates:
+        if (
+            cadence_due
+            and settings.jev_available
+            and table.candidates
+            and not self._dispatcher.in_flight
+        ):
             questions = build_questions(state)
             # Recorded only because the policy built them; the client exposes no
             # request handle, so this is the ask, not a capture of the wire request.
             jev_questions = questions
-            try:
-                response = self._client.ask(questions, state)
-            except JevUnavailable as exc:
-                # The only catch in the loop. Auth, request and protocol errors are
-                # deliberately allowed to propagate and abort the run.
-                degraded_reason = str(exc)
-        latencies["jev"] = _elapsed_ms(jev_started)
-        # A successful call that took more than one transport attempt paid for a
-        # failed one first, and the tick's own wall clock is the only place that
-        # cost otherwise shows up. A failed call has no response and is already
-        # recorded as ``FALLBACK_DEGRADED``; a tick that made no call has no
-        # attempt count at all, which is why this reads the response rather than
-        # defaulting to 1.
-        if response is not None and response.attempts > 1:
-            degradations.append(JEV_RETRIED)
+            fired = self._dispatcher.request(questions, state, tick=self._tick)
 
+        #    Take, on every tick, and never block. What comes back was asked on
+        #    this tick or an earlier one, and the tick that observes it is the tick
+        #    that must account for it.
+        taken = self._dispatcher.take()
+        if taken is not None:
+            # The call cost what it cost whether or not its answer is used, and
+            # this is the only tick that can report it.
+            jev_call_ms = taken.call_ms
+            if taken.error is not None:
+                if isinstance(taken.error, JevUnavailable):
+                    # The only failure the loop absorbs, recorded on the tick that
+                    # saw it rather than the one that fired it.
+                    degraded_reason = str(taken.error)
+                else:
+                    # Auth, request and protocol errors abort the run. The worker
+                    # carried the exception back instead of raising it out of a
+                    # thread; re-raising it here is what keeps the committed
+                    # contract that those never degrade.
+                    raise taken.error
+            elif taken.response is not None:
+                # A successful call that took more than one transport attempt paid
+                # for a failed one first, and nothing else records that cost. It is
+                # read off the taken response, so a tick that took no call has no
+                # attempt count at all rather than a defaulted 1.
+                if taken.response.attempts > 1:
+                    degradations.append(JEV_RETRIED)
+                age = self._tick - taken.asked_at_tick
+                if age <= STALE_LIMIT_CADENCES * settings.decision_cadence_frames:
+                    response = taken.response
+                    asked_at_tick = taken.asked_at_tick
+                    answer_age_ticks = age
+                else:
+                    # Discarded, not cancelled: the call ran to completion and this
+                    # tick simply refuses to act on a world the agent has left.
+                    degradations.append(JEV_STALE_DISCARDED)
+        latencies["jev"] = _elapsed_ms(jev_started)
+
+        # ``select_action`` decides on a *frame*, and with the call off the tick the
+        # frames that carry a decision are the frames an answer lands on, not the
+        # frames a call is fired on. So the rule is told a decision is due when
+        # there is an answer to apply (however old, however failed) -- and, when no
+        # credential is configured, on the cadence itself, which is the one branch
+        # that decides without an answer. Every other tick holds: no answer yet,
+        # one in flight, or one discarded as stale.
+        answer_available = response is not None or degraded_reason is not None
         decision = select_action(
             table,
             response,
             settings,
-            cadence_due=cadence_due,
+            cadence_due=answer_available or (cadence_due and not settings.jev_available),
             last_action=self._last_action,
             degraded_reason=degraded_reason,
         )
+        # Two corrections the pure rule cannot make, because it sees one tick and
+        # these are facts about two. ``jev_called`` means "this tick fired a call",
+        # which is what ``RunSummary.decisions`` counts; the rule infers it from
+        # having consulted an answer, and an answer can be consulted a tick or
+        # three after it was asked for. And an answer from an earlier tick is
+        # ``DecisionSource.JEV_STALE`` rather than ``JEV`` -- only where the rule
+        # chose ``JEV``, since ``guardrail_lethal`` and
+        # ``fallback_below_confidence`` already name something more specific and
+        # carry the age in the record either way.
+        source = decision.source
+        if source is DecisionSource.JEV and answer_age_ticks:
+            source = DecisionSource.JEV_STALE
+        decision = replace(decision, source=source, jev_called=fired)
         self._last_action = decision.action
 
         # 5. Execute. A decided name the emulator does not know is a KeyError here,
@@ -539,6 +713,9 @@ class ExecutionLoop:
             advisor_absence=advisor_absence,
             latencies_ms=latencies,
             degradations=tuple(degradations),
+            asked_at_tick=asked_at_tick,
+            answer_age_ticks=answer_age_ticks,
+            jev_call_ms=jev_call_ms,
             terminated=bool(result.terminated),
             truncated=bool(result.truncated),
         )
@@ -580,42 +757,57 @@ class ExecutionLoop:
         The summary says *why* it stopped, classified by
         :func:`classify_termination` from the ending step's own info. Reaching
         ``limit`` is ``"max_ticks"``; anything else is the episode's own signal.
+
+        The dispatcher is closed on **every** exit path, including the one where a
+        :class:`~mario_jev.jev.JevAuthError` or
+        :class:`~mario_jev.jev.JevRequestError` aborts the run, so no worker
+        outlives the run. Closing joins, so a run that aborts while a call is still
+        running waits for it; there is nothing to cancel it with, and a lingering
+        thread would be worse than a bounded wait.
         """
         limit = self._settings.max_ticks if max_ticks is None else max_ticks
         started = time.perf_counter()
         ticks = 0
         decisions = 0
+        answers_applied = 0
         last: TickRecord | None = None
         sources: Counter[DecisionSource] = Counter()
         degradations: Counter[str] = Counter()
 
-        while limit is None or ticks < limit:
-            record = self.step()
-            last = record
-            ticks += 1
-            sources[record.decision.source] += 1
-            degradations.update(record.degradations)
-            if record.decision.jev_called:
-                decisions += 1
-            if observer is not None:
-                observer(record)
-            if self._ended:
-                break
+        try:
+            while limit is None or ticks < limit:
+                record = self.step()
+                last = record
+                ticks += 1
+                sources[record.decision.source] += 1
+                degradations.update(record.degradations)
+                # Two counters, two meanings: a call fired, and an answer applied.
+                if record.decision.jev_called:
+                    decisions += 1
+                if record.answer_age_ticks is not None:
+                    answers_applied += 1
+                if observer is not None:
+                    observer(record)
+                if self._ended:
+                    break
 
-        elapsed_s = time.perf_counter() - started
-        rate = 0.0 if elapsed_s <= 0 else decisions / elapsed_s
-        termination = classify_termination(
-            ended=self._ended,
-            truncated=last is not None and last.truncated,
-            info={} if self._end_info is None else self._end_info,
-        )
-        return RunSummary(
-            ticks=ticks,
-            frames=ticks,
-            decisions=decisions,
-            sources=sources,
-            degradations=degradations,
-            elapsed_s=elapsed_s,
-            decision_rate_hz=rate,
-            termination=termination,
-        )
+            elapsed_s = time.perf_counter() - started
+            rate = 0.0 if elapsed_s <= 0 else decisions / elapsed_s
+            termination = classify_termination(
+                ended=self._ended,
+                truncated=last is not None and last.truncated,
+                info={} if self._end_info is None else self._end_info,
+            )
+            return RunSummary(
+                ticks=ticks,
+                frames=ticks,
+                decisions=decisions,
+                answers_applied=answers_applied,
+                sources=sources,
+                degradations=degradations,
+                elapsed_s=elapsed_s,
+                decision_rate_hz=rate,
+                termination=termination,
+            )
+        finally:
+            self._dispatcher.close()
