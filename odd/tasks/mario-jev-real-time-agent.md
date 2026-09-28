@@ -816,11 +816,34 @@ are safe only because they are constants.
 only through `read_journal`), and dashboard/`doctor` network-touch behaviour (not required).
 
 
-### WU6 — Live evaluation (gated on the user's ROM and key)
-- [ ] 6.1 Run world 1-1 live; record progress (`x` reached), deaths, `flag_get`, measured
+### WU6 — Live evaluation — **DONE**
+- [x] 6.1 Run world 1-1 live; record progress (`x` reached), deaths, `flag_get`, measured
       decisions/second, Jev latency distribution, fallback rate, and vision-vs-RAM error rate.
-- [ ] 6.2 Honest report: what worked, what degraded, what the vision layer got wrong, and where
+- [x] 6.2 Honest report: what worked, what degraded, what the vision layer got wrong, and where
       the cadence broke down.
+
+**As landed**: `docs/EVALUATION.md`, from two live runs against the real API —
+`artifacts/eval-1-1.jsonl` (900 frames, unpaced) and `artifacts/paced-1-1.jsonl` (120 frames, paced).
+`artifacts/` is gitignored by this project's own `.gitignore`, so the journals stay local evidence and
+the report carries the numbers plus the exact commands that produced them. Headline measurements:
+
+* **vision vs RAM: 900/900 detections, 0 box disagreements, 0 ground disagreements**, offsets 3.02 px
+  mean (5 max) horizontally — measured by replaying the recorded actions on a fresh seeded emulator,
+  which reproduced the run's states exactly.
+* **the cadence does not hold**: 0.614 Hz unpaced and 0.095 Hz paced against a designed 7.5 Hz — 12×
+  and 79× slower than real time. A 416 ms median round trip cannot fit a 16.7 ms frame.
+* **`real_time=True` is actively harmful**: it paces every emulator step, so the rollout sweep went
+  from a 72 ms to a **1 205 ms** median, the horizon collapsed to its floor of 6, and the
+  below-confidence rate rose from 10.6 % to 40 %.
+* **the agent stalled for 600 of 900 frames** against a 48 px wall, because all seven candidates
+  reported `dx <= 0` with identical risk — the rollout had no signal. Jev agreed with the rollout's
+  own safest candidate on 112/113 calls, so this is not Jev's error.
+* **a 21 s tick left an empty `degradations` list** (a timeout followed by a successful retry) and the
+  header records neither `jev_timeout_s` nor `jev_max_attempts`, so that stall cannot be
+  reconstructed from the journal.
+* live coverage gaps, stated in the report: no death occurred, `flag_get` never fired, and the
+  PlayJev advisor was disabled throughout because `torch` is absent — its contribution is unknown
+  rather than zero.
 
 ## 5. Review workload forecast
 
