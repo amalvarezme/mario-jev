@@ -33,6 +33,19 @@ SCREEN_SHAPE: tuple[int, int, int] = (240, 256, 3)
 #: Observation mode that returns a C-contiguous copy rather than a live view.
 _COPY_MODE = "rgb_array_contiguous"
 
+#: How far behind its absolute schedule :class:`FramePacer` will let the deficit
+#: grow before it stops trying to repay it. A machine this far behind is not
+#: going to catch up, and pretending otherwise only makes the next steps burst:
+#: every later wake-up would find the deadline long past and return without
+#: sleeping, so the deficit is written off once instead of being carried.
+#: How far behind the absolute schedule may fall before the deficit is written off
+#: instead of repaid, in periods. Four is a **judgement, not a measurement**: at 60
+#: fps it is 66 ms. Smaller, and a briefly-loaded machine would write off a deficit
+#: it could still repay; larger, and one stall hands the loop a longer run of
+#: sleep-free frames. There is nothing here to measure on a machine whose own
+#: ``time.sleep`` cannot reliably deliver the period.
+MAX_DEFICIT_PERIODS = 4
+
 
 @dataclass(frozen=True, slots=True)
 class StepResult:
@@ -53,9 +66,54 @@ class StepResult:
 class FramePacer:
     """Wall-clock pacing so the emulator runs at roughly real time.
 
-    When the caller falls behind, this reports the lag instead of trying to
-    catch up by skipping frames: skipping would silently change the game speed
-    and make every measurement meaningless.
+    The schedule is *absolute*: each deadline is the previous deadline plus one
+    period, never ``now`` plus one period. That distinction is the whole point.
+    Re-anchoring on ``now`` would forgive the time a slow step overran by, which
+    permanently adds that step's work to the period and makes the effective rate
+    ``period + work`` instead of ``period``. Advancing the deadline by one period
+    instead repays the deficit over the following steps.
+
+    A deficit is repaid by *skipping sleeps*, and skipping a sleep never skips a
+    game frame: the emulator still executes exactly one frame per
+    :meth:`MarioEmulator.step` call, so the game sees the same frame sequence
+    either way. Only the sleeping changes.
+
+    The lag is reported and accumulated, never hidden, so a machine that
+    genuinely cannot keep up stays visible in :attr:`last_lag_s` and
+    :attr:`total_lag_s` even while the schedule tries to repay it. Repayment is
+    bounded by :data:`MAX_DEFICIT_PERIODS`.
+
+    When the lag is observed, and why it matters
+    --------------------------------------------
+
+    A deficit is discovered at the **head** of a wait: :meth:`wait` reads the
+    clock once on entry and compares it to the deadline it armed last time. Every
+    way of falling behind therefore surfaces one wait later than it happened,
+    including ``time.sleep`` itself overshooting -- and it does overshoot, because
+    the OS only guarantees *at least* the requested duration.
+
+    The consequence is precise and is not a rounding detail:
+
+    * :attr:`last_lag_s` is ``0.0`` on the wait whose own sleep overshot. That
+      wait slept, so nothing was late *when it looked*; the overshoot had not
+      happened yet.
+    * The **next** wait finds the clock past its deadline and reports that as its
+      own ``last_lag_s``. The amount is ``overshoot - period``, not the overshoot:
+      the sleep was entitled to consume one period, so a 2.5-period sleep against
+      a one-period request lands 1.5 periods past the following deadline. An
+      overshoot shorter than one period is absorbed by the next (shorter) sleep and
+      is correctly reported as no lag at all.
+    * :attr:`total_lag_s` charges that deficit exactly once, on the wait that
+      discovers it. The wait that overslept charges nothing, and no oversleep is
+      counted twice.
+
+    Two consequences for a reader. ``last_lag_s`` read per frame is a one-wait
+    lagged signal. ``total_lag_s`` is the *integral of observed lateness over
+    waits*, not the sum of distinct stalls: while a deficit is being repaid, each
+    sleep-free wait observes and charges what is still outstanding, so one
+    1.5-period deficit repaid over two waits totals 2.0 periods. That is the
+    intended "how far behind did this run get" reading, and it is why the total is
+    the number to trust rather than the per-frame one.
     """
 
     __slots__ = (
@@ -135,7 +193,19 @@ class FramePacer:
                 self.reset()
 
     def wait(self) -> float:
-        """Sleep until the next frame is due. Returns the seconds actually slept."""
+        """Sleep until the next frame is due.
+
+        Returns the **measured** duration of this call's sleep, in seconds: the
+        clock is read either side of ``time.sleep`` and the difference is
+        returned, so an oversleeping OS is reported as what it cost rather than as
+        what was asked for. A wait that did not sleep returns ``0.0``.
+
+        The measurement is deliberately *only* a return value. The schedule is
+        still advanced by exactly one period and the deficit the oversleep created
+        is still discovered, and charged once, at the head of the following wait
+        (see the class docstring). Subtracting the measured overshoot here as well
+        would charge it twice.
+        """
         if self._suspend_depth:
             # A suspended step is a simulated future: it must not touch the real
             # schedule, and it must not sleep at all.
@@ -153,15 +223,28 @@ class FramePacer:
 
         remaining = self._next_deadline - now
         if remaining > 0:
+            before = time.monotonic()
             time.sleep(remaining)
+            slept = time.monotonic() - before
             self._next_deadline += self._period
             self._last_lag = 0.0
-            return remaining
+            return slept
 
         # Behind schedule: do not sleep, and record the lag honestly.
-        self._last_lag = -remaining
-        self._lag_total += self._last_lag
-        self._next_deadline = now + self._period
+        deficit = -remaining
+        self._last_lag = deficit
+        self._lag_total += deficit
+        if deficit > MAX_DEFICIT_PERIODS * self._period:
+            # Too far behind to repay. Write the deficit off in one place, which
+            # bounds the run-away: without this a permanently slow machine would
+            # drift arbitrarily far behind and every later wake-up would be a
+            # sleep-free burst. The lag already charged above is not erased.
+            self._next_deadline = now + self._period
+        else:
+            # Repay, do not forgive: advance the absolute schedule exactly as
+            # the happy path does, so the following steps skip their sleeps
+            # until the schedule is met again.
+            self._next_deadline += self._period
         return 0.0
 
 

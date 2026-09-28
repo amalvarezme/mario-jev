@@ -7,8 +7,6 @@ become true again.
 
 from __future__ import annotations
 
-import time
-
 import pytest
 
 from mario_jev.emulator import (
@@ -20,6 +18,7 @@ from mario_jev.emulator import (
     build_actions,
     parse_stage,
 )
+from mario_jev.emulator.env import MAX_DEFICIT_PERIODS
 
 # -- action set ------------------------------------------------------------------
 
@@ -278,38 +277,341 @@ def test_the_emulator_is_a_context_manager_and_closes(emulator_factory) -> None:
 
 # -- pacing ----------------------------------------------------------------------
 
+#: 64 fps, not 60. ``1/64`` is exact in binary floating point and so is every
+#: multiple of it used below, which lets the schedule assertions be exact
+#: equalities instead of tolerances that could hide real drift.
+VIRTUAL_FPS = 64.0
+VIRTUAL_PERIOD = 1.0 / VIRTUAL_FPS
 
-def test_pacer_is_a_no_op_when_disabled() -> None:
+
+class VirtualClock:
+    """A monotonic clock that only moves when a test says so.
+
+    Every pacing property below is pinned against this clock, and **no test in
+    this file asserts a real elapsed interval**. That is deliberate: a loaded
+    machine turns a requested 16.67 ms ``time.sleep`` into ~100 ms, so a
+    wall-clock assertion would measure the machine rather than the pacer and
+    would be a flake by construction.
+
+    ``env`` imports the ``time`` module and calls ``time.monotonic`` and
+    ``time.sleep`` through it, so replacing those two attributes is enough to put
+    the pacer on this clock.
+
+    The :func:`clock` fixture that installs it is ``autouse`` for this whole file
+    rather than requested per test, so "no pacer in this file ever reaches the real
+    clock" is a property of the module instead of a habit each test has to
+    remember. Nothing here needs the real clock: the emulator fixtures build with
+    ``real_time=False``, so their pacer never sleeps either way.
+    """
+
+    def __init__(self, overshoots: list[float] | None = None) -> None:
+        self.now = 0.0
+        #: Every duration the pacer asked to sleep, in order.
+        self.sleeps: list[float] = []
+        #: Extra time each sleep overshoots by, consumed one entry per sleep.
+        #: Empty means sleeps land exactly on the deadline.
+        self.overshoots: list[float] = list(overshoots or ())
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        overshoot = self.overshoots.pop(0) if self.overshoots else 0.0
+        self.now += seconds + overshoot
+
+    def advance(self, seconds: float) -> None:
+        """Simulate work: time passes without the pacer having slept for it."""
+        self.now += seconds
+
+
+@pytest.fixture(autouse=True)
+def clock(monkeypatch) -> VirtualClock:
+    """Put ``env``'s clock on a :class:`VirtualClock` for every test in this file.
+
+    ``autouse`` on purpose. A test that only wants to know that a *disabled* pacer
+    does not sleep still calls ``time.monotonic`` through ``env``, and if it were
+    the one test left unpatched then the file's claim would be "almost every pacing
+    test drives the virtual clock", which is not a property anyone can rely on.
+    Tests that need to move time or inspect the sleeps request ``clock`` by name
+    and get this same instance.
+    """
+    import mario_jev.emulator.env as env_module
+
+    virtual = VirtualClock()
+    monkeypatch.setattr(env_module.time, "monotonic", virtual.monotonic)
+    monkeypatch.setattr(env_module.time, "sleep", virtual.sleep)
+    return virtual
+
+
+def test_pacer_is_a_no_op_when_disabled(clock: VirtualClock) -> None:
     pacer = FramePacer(60.0, enabled=False)
 
     assert pacer.wait() == 0.0
     assert pacer.wait() == 0.0
+    # Named explicitly so the no-op claim covers the sleeping too, not only the
+    # returned zeros: a disabled pacer that slept and returned 0.0 would pass the
+    # two assertions above.
+    assert clock.sleeps == []
 
 
-def test_pacer_sleeps_roughly_one_period_per_frame() -> None:
-    pacer = FramePacer(200.0, enabled=True)  # 5 ms per frame
+def test_pacer_sleeps_one_period_per_frame(clock: VirtualClock) -> None:
+    pacer = FramePacer(VIRTUAL_FPS, enabled=True)
     pacer.wait()  # first call only arms the deadline
 
-    start = time.monotonic()
     slept = pacer.wait()
-    elapsed = time.monotonic() - start
 
-    assert slept > 0.0
-    # Tolerant bound: this asserts pacing happens, not that sleep is exact.
-    assert elapsed >= 0.001
+    assert slept == VIRTUAL_PERIOD
+    assert clock.sleeps == [VIRTUAL_PERIOD]
     assert pacer.last_lag_s == 0.0
 
 
-def test_pacer_reports_lag_instead_of_skipping_frames() -> None:
-    pacer = FramePacer(1000.0, enabled=True)  # 1 ms per frame
+def test_the_schedule_does_not_drift_when_every_sleep_is_exact(
+    clock: VirtualClock,
+) -> None:
+    # 100 waits on a clock where ``sleep(d)`` advances exactly ``d``: the average
+    # interval must be the period itself, to the last bit, and nothing may be
+    # reported as lag.
+    pacer = FramePacer(VIRTUAL_FPS, enabled=True)
+    pacer.wait()  # arms the deadline without moving the clock
+    start = clock.now
+
+    for _ in range(100):
+        pacer.wait()
+
+    elapsed = clock.now - start
+    assert elapsed == 100 * VIRTUAL_PERIOD
+    assert elapsed / 100 == VIRTUAL_PERIOD
+    assert clock.sleeps == [VIRTUAL_PERIOD] * 100
+    assert pacer.total_lag_s == 0.0
+    assert pacer.last_lag_s == 0.0
+
+
+def test_an_overshooting_sleep_is_repaid_not_forgiven(clock: VirtualClock) -> None:
+    """One late step must not turn into a permanently slower rate.
+
+    Re-anchoring the deadline on ``now`` would forgive the overshoot and add it
+    to the period for good. Advancing the absolute schedule instead repays it by
+    skipping the next sleeps, so the *average* interval returns to the period.
+
+    The observed sequence, in periods, with the one sleep overshooting by 2.5
+    periods (the nine waits after the arming call)::
+
+        returned:  3.5  0.0  0.0  0.5  1.0  1.0  1.0  1.0  1.0
+        requested: 1.0   --   --  0.5  1.0  1.0  1.0  1.0  1.0
+        last_lag:  0.0  1.5  0.5  0.0  0.0  0.0  0.0  0.0  0.0
+
+    The first wait asked for one period and ``sleep`` took 3.5, and ``wait()``
+    returns the **measured** 3.5 rather than the 1.0 it requested -- that is the
+    whole difference between the two rows.
+
+    The two ``0.0`` sleeps are the outstanding deficit being repaid: those
+    wake-ups happen with no sleep at all while the schedule is still behind.
+    Skipping those sleeps skips no game frame -- ``step()`` still executes
+    exactly one frame per call either way.
+    """
+    clock.overshoots = [2.5 * VIRTUAL_PERIOD]
+    pacer = FramePacer(VIRTUAL_FPS, enabled=True)
+    pacer.wait()  # arms the deadline
+    start = clock.now
+
+    slept = [pacer.wait() for _ in range(9)]
+
+    assert slept == [
+        3.5 * VIRTUAL_PERIOD,
+        0.0,
+        0.0,
+        0.5 * VIRTUAL_PERIOD,
+        VIRTUAL_PERIOD,
+        VIRTUAL_PERIOD,
+        VIRTUAL_PERIOD,
+        VIRTUAL_PERIOD,
+        VIRTUAL_PERIOD,
+    ]
+    # The requested duration is still one period: the return value is measured
+    # around the sleep, and the schedule was still advanced by one period.
+    assert clock.sleeps[0] == VIRTUAL_PERIOD
+    # The property that matters: the average interval is the period again.
+    elapsed = clock.now - start
+    assert elapsed == 9 * VIRTUAL_PERIOD
+    assert elapsed / 9 == VIRTUAL_PERIOD
+    # And the lag stays visible rather than being smoothed away.
+    assert pacer.total_lag_s == 2.0 * VIRTUAL_PERIOD
+    assert pacer.last_lag_s == 0.0
+
+
+def test_the_deficit_stops_growing_once_it_passes_the_bound(
+    clock: VirtualClock,
+) -> None:
+    """A permanently slow machine must not drift arbitrarily far behind.
+
+    Every step here does 1.5 periods of work, so the pacer can never catch up.
+    The deficit is repaid one period at a time until it is further behind than
+    ``MAX_DEFICIT_PERIODS``, at which point the schedule re-anchors and the
+    deficit starts over. The observed ``last_lag_s`` sequence, in periods::
+
+        0.5  1.0  1.5  2.0  2.5  3.0  3.5  4.0  4.5  0.5  1.0  1.5  2.0  2.5
+
+    and the matching ``total_lag_s``, which only ever grows::
+
+        0.5  1.5  3.0  5.0  7.5  10.5  14.0  18.0  22.5  23.0  24.0  25.5 ...
+
+    The drop from 4.5 back to 0.5 is the bound doing its job: 4.5 > 4 periods, so
+    that step re-anchors. The lag it reported is still charged to the total.
+    """
+    work = 1.5 * VIRTUAL_PERIOD
+    pacer = FramePacer(VIRTUAL_FPS, enabled=True)
+    clock.advance(work)
+    pacer.wait()  # arms the deadline
+
+    lags: list[float] = []
+    totals: list[float] = []
+    for _ in range(14):
+        clock.advance(work)
+        pacer.wait()
+        lags.append(pacer.last_lag_s)
+        totals.append(pacer.total_lag_s)
+
+    in_periods = [lag / VIRTUAL_PERIOD for lag in lags]
+    assert in_periods == [
+        0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 0.5, 1.0, 1.5, 2.0, 2.5
+    ]
+    # (a) the machine's inability to keep up stays visible and keeps growing.
+    assert all(later > earlier for earlier, later in zip(totals, totals[1:]))
+    assert totals[-1] == 30.0 * VIRTUAL_PERIOD
+    # (b) the deficit re-anchors instead of running away: it never exceeds the
+    # bound plus the one step of work that discovered it.
+    assert max(lags) == 4.5 * VIRTUAL_PERIOD
+    assert max(lags) <= (MAX_DEFICIT_PERIODS + 1) * VIRTUAL_PERIOD
+    # (c) a machine this far behind never sleeps at all, so no pacer sleep can
+    # delay one of its steps.
+    assert clock.sleeps == []
+
+    # And when the work stops, the outstanding deficit is repaid with skipped and
+    # shortened sleeps -- never with a sleep longer than one period, which is what
+    # would delay a later step.
+    clock.sleeps.clear()
+    tail = [pacer.wait() for _ in range(5)]
+    assert tail == [
+        0.0,
+        0.0,
+        0.5 * VIRTUAL_PERIOD,
+        VIRTUAL_PERIOD,
+        VIRTUAL_PERIOD,
+    ]
+    assert all(slept <= VIRTUAL_PERIOD for slept in clock.sleeps)
+
+
+def test_a_step_that_overran_the_period_reports_how_late_it_was(
+    clock: VirtualClock,
+) -> None:
+    # ``wait()`` called 2.5 periods after the deadline was armed: the step's own
+    # work already ate 2.5 periods, so the step is 1.5 periods late and must say
+    # so instead of reporting zero.
+    pacer = FramePacer(VIRTUAL_FPS, enabled=True)
+    pacer.wait()  # arms the deadline
+    clock.advance(2.5 * VIRTUAL_PERIOD)
+
+    assert pacer.wait() == 0.0
+    assert pacer.last_lag_s == 1.5 * VIRTUAL_PERIOD
+
+    # The remaining 0.5 period of deficit is still outstanding, which is how the
+    # repayment is visible: the next wake-up is also sleep-free and still late.
+    assert pacer.wait() == 0.0
+    assert pacer.last_lag_s == 0.5 * VIRTUAL_PERIOD
+    assert pacer.total_lag_s == 2.0 * VIRTUAL_PERIOD
+    assert clock.sleeps == []
+
+
+def test_pacer_reports_lag_instead_of_hiding_it(clock: VirtualClock) -> None:
+    pacer = FramePacer(VIRTUAL_FPS, enabled=True)
     pacer.wait()
-    time.sleep(0.02)  # fall far behind the 1 ms deadline
+    clock.advance(20 * VIRTUAL_PERIOD)  # fall far behind the deadline
 
     slept = pacer.wait()
 
     assert slept == 0.0
     assert pacer.last_lag_s > 0.0
     assert pacer.total_lag_s >= pacer.last_lag_s
+
+
+def test_wait_returns_the_measured_sleep_and_charges_an_oversleep_once(
+    clock: VirtualClock,
+) -> None:
+    """The four facts about an oversleep, in one place.
+
+    ``time.sleep`` guarantees *at least* the requested duration, so a wait can ask
+    for one period and be gone for 2.5. This pins what the pacer says about that:
+
+    (a) ``wait()`` returns the measured sleep, not the request;
+    (b) ``last_lag_s`` is ``0.0`` on the wait whose sleep overshot -- it read the
+        clock before sleeping, so nothing was late when it looked;
+    (c) the *next* wait reports exactly the resulting deficit as its own
+        ``last_lag_s``;
+    (d) that deficit is charged to ``total_lag_s`` exactly once, by the wait that
+        discovered it, and by no other wait.
+
+    Be exact about (c), because the obvious reading is wrong: the deficit is not
+    the overshoot, it is ``overshoot - period``. The sleep was entitled to consume
+    one period, so a 2.5-period sleep against a 1-period request lands 1.5 periods
+    past the *next* deadline. An overshoot under one period is absorbed by the next
+    (shorter) sleep and is correctly reported as no lag at all.
+    """
+    clock.overshoots = [2.5 * VIRTUAL_PERIOD]
+    pacer = FramePacer(VIRTUAL_FPS, enabled=True)
+    pacer.wait()  # arms the deadline
+
+    # (a) one period was requested; 3.5 periods were actually spent.
+    returned = pacer.wait()
+    assert clock.sleeps == [VIRTUAL_PERIOD]
+    assert returned == 3.5 * VIRTUAL_PERIOD
+    assert returned != clock.sleeps[0]
+
+    # (b) that wait reports no lag: it slept, and it measured before sleeping.
+    assert pacer.last_lag_s == 0.0
+    assert pacer.total_lag_s == 0.0
+
+    # (c) the deficit surfaces on the following wait, to the exact amount, and
+    # (d) it is charged there and nowhere else: the wait that overslept charged
+    # nothing at all, and the discovering wait's charge equals what it observed.
+    assert pacer.wait() == 0.0
+    assert pacer.last_lag_s == 1.5 * VIRTUAL_PERIOD
+    assert pacer.total_lag_s == 1.5 * VIRTUAL_PERIOD
+
+    # The repayment is not a second charge of the 1.5: the schedule advanced one
+    # period, so what is still outstanding is 0.5, and that is what this wait
+    # observes and adds. ``total_lag_s`` is the integral of observed lateness, and
+    # it is the round-A arithmetic this fix deliberately did not move.
+    assert pacer.wait() == 0.0
+    assert pacer.last_lag_s == 0.5 * VIRTUAL_PERIOD
+    assert pacer.total_lag_s == 2.0 * VIRTUAL_PERIOD
+
+    # Repaid in full: the next waits sleep again, and nothing further is charged.
+    assert pacer.wait() == 0.5 * VIRTUAL_PERIOD
+    assert pacer.wait() == VIRTUAL_PERIOD
+    assert pacer.last_lag_s == 0.0
+    assert pacer.total_lag_s == 2.0 * VIRTUAL_PERIOD
+
+
+def test_an_oversleep_under_one_period_is_absorbed_not_reported(
+    clock: VirtualClock,
+) -> None:
+    # The negative case for the rule above: the sleep took 1.5 periods, which is
+    # still short of the next deadline at 2.0, so the next sleep is simply shorter
+    # and no lag is reported. Reporting one here would make every ordinary
+    # scheduling jitter look like a machine that cannot keep up.
+    #
+    # 0.5 rather than a friendlier-looking 0.4: only multiples of 1/64 are exact in
+    # binary floating point, and this file asserts exact equalities on purpose.
+    clock.overshoots = [0.5 * VIRTUAL_PERIOD]
+    pacer = FramePacer(VIRTUAL_FPS, enabled=True)
+    pacer.wait()  # arms the deadline
+
+    assert pacer.wait() == 1.5 * VIRTUAL_PERIOD
+    assert pacer.wait() == 0.5 * VIRTUAL_PERIOD
+    assert clock.sleeps == [VIRTUAL_PERIOD, 0.5 * VIRTUAL_PERIOD]
+    assert pacer.last_lag_s == 0.0
+    assert pacer.total_lag_s == 0.0
 
 
 def test_pacer_rejects_a_non_positive_rate() -> None:
@@ -321,24 +623,15 @@ def test_pacer_rejects_a_non_positive_rate() -> None:
 
 
 @pytest.fixture
-def sleep_calls(monkeypatch) -> list[float]:
-    """Count the pacer's sleeps instead of performing them.
-
-    ``env`` imports the ``time`` module and calls ``time.sleep`` through it, so
-    replacing that attribute counts every sleep the pacer asks for while keeping
-    the test instant. The clock behind ``time.monotonic`` is left alone.
-    """
-    import mario_jev.emulator.env as env_module
-
-    calls: list[float] = []
-    monkeypatch.setattr(env_module.time, "sleep", calls.append)
-    return calls
+def sleep_calls(clock: VirtualClock) -> list[float]:
+    """Every sleep the pacer asked for, recorded on the virtual clock."""
+    return clock.sleeps
 
 
 def test_suspension_suppresses_sleeps_and_resumes_on_a_fresh_schedule(
     sleep_calls: list[float],
 ) -> None:
-    pacer = FramePacer(200.0, enabled=True)  # 5 ms per frame
+    pacer = FramePacer(VIRTUAL_FPS, enabled=True)
     pacer.wait()  # arm the deadline
 
     with pacer.suspended():
@@ -352,20 +645,36 @@ def test_suspension_suppresses_sleeps_and_resumes_on_a_fresh_schedule(
     assert sleep_calls == []
 
 
+def test_a_suspended_step_leaves_the_schedule_untouched(clock: VirtualClock) -> None:
+    # A suspended step is a simulated future: it must neither sleep nor move the
+    # deadline, even when real time passes while the sweep runs.
+    pacer = FramePacer(VIRTUAL_FPS, enabled=True)
+    pacer.wait()  # arms the deadline
+    armed = pacer._next_deadline
+
+    with pacer.suspended():
+        clock.advance(10 * VIRTUAL_PERIOD)
+        pacer.wait()
+        pacer.wait()
+        assert pacer._next_deadline == armed
+        assert pacer.last_lag_s == 0.0
+        assert clock.sleeps == []
+
+
 def test_pacing_still_sleeps_outside_a_suspension(sleep_calls: list[float]) -> None:
-    pacer = FramePacer(200.0, enabled=True)  # 5 ms per frame
+    pacer = FramePacer(VIRTUAL_FPS, enabled=True)
     pacer.wait()  # arm the deadline
 
     slept = pacer.wait()
 
-    assert slept > 0.0
-    assert len(sleep_calls) == 1
+    assert slept == VIRTUAL_PERIOD
+    assert sleep_calls == [VIRTUAL_PERIOD]
 
 
 def test_an_inner_suspension_exit_does_not_re_enable_pacing(
     sleep_calls: list[float],
 ) -> None:
-    pacer = FramePacer(200.0, enabled=True)
+    pacer = FramePacer(VIRTUAL_FPS, enabled=True)
     pacer.wait()  # arm the deadline
 
     with pacer.suspended():
@@ -397,10 +706,10 @@ def test_enabled_stays_a_read_only_property() -> None:
         pacer.enabled = False  # type: ignore[misc]
 
 
-def test_reset_still_clears_the_schedule_and_the_lag() -> None:
-    pacer = FramePacer(1000.0, enabled=True)  # 1 ms per frame
+def test_reset_still_clears_the_schedule_and_the_lag(clock: VirtualClock) -> None:
+    pacer = FramePacer(VIRTUAL_FPS, enabled=True)
     pacer.wait()
-    time.sleep(0.02)  # fall far behind, so there is lag to clear
+    clock.advance(20 * VIRTUAL_PERIOD)  # fall far behind, so there is lag to clear
     pacer.wait()
     assert pacer.last_lag_s > 0.0
 
