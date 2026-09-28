@@ -12,7 +12,8 @@ every default collaborator, to pin that the defaults are wired up.
 from __future__ import annotations
 
 import json
-from dataclasses import fields
+from dataclasses import fields, replace
+from typing import Callable
 
 import numpy as np
 import pytest
@@ -50,6 +51,10 @@ from mario_jev.policy import (
     select_action,
 )
 from mario_jev.perception import detect
+
+# From the modules rather than the packages: the stall constants are new, and the
+# curated package ``__all__``s do not re-export them.
+from mario_jev.policy.loop import STALL_ESCALATION, STALL_FRAMES
 from mario_jev.state import (
     HAZARD_OUTCOMES,
     MarioState,
@@ -60,6 +65,7 @@ from mario_jev.state import (
     TerminalOutcome,
 )
 from mario_jev.trajectory import CandidateRollout, CostSource, RolloutTable
+from mario_jev.trajectory.planner import STALL_MIN_HORIZON
 
 #: A synthetic credential. A real key is never used, and never printed by a test.
 SENTINEL_KEY = "apikey_SENTINEL_policy_do_not_leak"
@@ -182,7 +188,7 @@ def make_settings(
     )
 
 
-def make_state(tick: int = 0) -> MarioState:
+def make_state(tick: int = 0, *, x_max: int = 40) -> MarioState:
     return MarioState(
         tick=tick,
         player=PlayerFeatures(
@@ -197,7 +203,7 @@ def make_state(tick: int = 0) -> MarioState:
             vertical_clearance=0,
             lookahead_px=64,
         ),
-        progress=Progress(world="1-1", x_max=40, lives=3, time_left=400),
+        progress=Progress(world="1-1", x_max=x_max, lives=3, time_left=400),
         speed_px_per_tick=2.0,
     )
 
@@ -356,6 +362,67 @@ class InflatingPlanner:
         return self.table
 
 
+class ProgressBuilder:
+    """A builder whose ``x_max`` follows a script, so the loop has a real history.
+
+    The stall is a property of the run over time, not of one frame, so the only
+    way to exercise it is to hand the loop a sequence of states that does or does
+    not advance. Everything else about the state is what :func:`make_state`
+    builds.
+    """
+
+    def __init__(self, x_max_at: Callable[[int], int]) -> None:
+        self._x_max_at = x_max_at
+        self.observed: list[int] = []
+
+    def observe(self, perception: object, ram: object, info: object) -> MarioState:
+        tick = int(perception.tick)  # type: ignore[attr-defined]
+        x_max = self._x_max_at(tick)
+        self.observed.append(x_max)
+        return make_state(tick=tick, x_max=x_max)
+
+
+class StallPlanner:
+    """Records what floor each tick asked for, and answers the way the real planner does.
+
+    ``budget_horizon`` stands in for what the measured cost model would have
+    chosen on its own; a floor above it raises the horizon and is an escalation,
+    a floor below it changes nothing and is not one.
+    """
+
+    def __init__(self, *, budget_horizon: int = 8) -> None:
+        self.budget_horizon = budget_horizon
+        self.asked: list[int | None] = []
+
+    def plan(self, emulator: object, *, min_horizon: int | None = None) -> RolloutTable:
+        self.asked.append(min_horizon)
+        horizon = self.budget_horizon
+        if min_horizon is not None:
+            horizon = max(horizon, min_horizon)
+        return replace(
+            all_safe_table(),
+            horizon=horizon,
+            escalated=horizon > self.budget_horizon,
+        )
+
+
+class EmptyTablePlanner:
+    """A planner that answers with no candidates at all.
+
+    Stands in for a caller-injected planner whose action set is empty -- the only way
+    to reach a candidate-less table through the real path is an emulator with no
+    actions, which the action sets never produce. The loop must still behave: the
+    ticket recounts no escalation and degrades to ``fallback_no_candidates``.
+    """
+
+    def __init__(self) -> None:
+        self.asked: list[int | None] = []
+
+    def plan(self, emulator: object, *, min_horizon: int | None = None) -> RolloutTable:
+        self.asked.append(min_horizon)
+        return replace(all_safe_table(), candidates=())
+
+
 class FakeClient:
     """A queued-response client, so cadence and summary tests never build a real one."""
 
@@ -430,6 +497,7 @@ def loop_with(
     emulator: FakeEmulator | None = None,
     planner: object | None = None,
     advisor: object | None = None,
+    builder: object | None = None,
 ) -> tuple[ExecutionLoop, FakeEmulator, object]:
     emulator = emulator if emulator is not None else FakeEmulator()
     planner = planner if planner is not None else FakePlanner(table or all_safe_table())
@@ -438,7 +506,7 @@ def loop_with(
         emulator=emulator,
         planner=planner,
         client=client,  # type: ignore[arg-type]
-        builder=FakeBuilder(),
+        builder=builder if builder is not None else FakeBuilder(),
         advisor=advisor,  # type: ignore[arg-type]
     )
     return loop, emulator, planner
@@ -1164,3 +1232,108 @@ def test_a_disabled_advisor_records_no_measured_absence() -> None:
     assert advisor.calls == 0
     assert record.advisor is None
     assert record.advisor_absence is None
+
+
+# -- 10. the stall escalation -------------------------------------------------------
+#
+# Only the loop can see a stall: the planner is handed one savestate and cannot
+# know whether the last thirty frames went anywhere. The measured case is the
+# recorded 1-1 run, where x_max stopped at 724 and stayed there for 600 frames
+# while every candidate at the budget's horizon came back `no_progress` at one
+# identical risk. These tests pin the rule that gives the loop a way out of that,
+# and the rule that it stops the moment it is no longer needed.
+
+
+def stalled_loop(
+    x_max_at: Callable[[int], int], *, budget_horizon: int = 8
+) -> tuple[ExecutionLoop, StallPlanner]:
+    planner = StallPlanner(budget_horizon=budget_horizon)
+    loop, _, _ = loop_with(
+        settings=make_settings(key=None),
+        planner=planner,
+        builder=ProgressBuilder(x_max_at),
+    )
+    return loop, planner
+
+
+def test_a_stall_escalates_the_horizon_and_the_tick_records_that_it_did() -> None:
+    loop, planner = stalled_loop(lambda tick: 724)
+    records: list[TickRecord] = []
+
+    loop.run(max_ticks=STALL_FRAMES + 2, observer=records.append)
+
+    # Before the stall is measured, nothing changes: the loop asks for no floor,
+    # the planner plans on its budget, and the tick records no degradation.
+    for record in records[:STALL_FRAMES]:
+        assert record.rollout.escalated is False
+        assert STALL_ESCALATION not in record.degradations
+    assert planner.asked[:STALL_FRAMES] == [None] * STALL_FRAMES
+
+    # From the STALL_FRAMES'th frame without progress, every tick escalates, and
+    # says so.
+    for record in records[STALL_FRAMES:]:
+        assert record.rollout.escalated is True
+        assert record.rollout.horizon == STALL_MIN_HORIZON
+        assert STALL_ESCALATION in record.degradations
+    assert planner.asked[STALL_FRAMES:] == [STALL_MIN_HORIZON] * 2
+
+
+def test_a_stalled_tick_with_no_candidates_claims_no_escalation() -> None:
+    """No candidates is no horizon to lengthen, so nothing may be claimed.
+
+    The loop measures the stall before it plans, so ``plan()`` still receives the
+    floor -- it cannot know the table will be empty. What it must not do is record an
+    escalation on a tick where no cost could have been paid, when
+    ``fallback_no_candidates`` already says what happened.
+    """
+    planner = EmptyTablePlanner()
+    loop, _, _ = loop_with(
+        settings=make_settings(key=None),
+        planner=planner,
+        builder=ProgressBuilder(lambda tick: 724),
+    )
+    records: list[TickRecord] = []
+
+    loop.run(max_ticks=STALL_FRAMES + 1, observer=records.append)
+
+    stalled = records[-1]
+    # The stall was measured and the floor was asked for ...
+    assert planner.asked[-1] == STALL_MIN_HORIZON
+    assert stalled.rollout.candidates == ()
+    # ... but the tick claims no escalation, and points at the reason instead.
+    assert STALL_ESCALATION not in stalled.degradations
+    assert stalled.decision.source is DecisionSource.FALLBACK_NO_CANDIDATES
+
+
+def test_escalation_stops_on_the_first_tick_that_moves_again() -> None:
+    # Stalled through the escalating tick, then advancing one pixel per frame.
+    resumed = STALL_FRAMES + 1
+    loop, planner = stalled_loop(
+        lambda tick: 724 if tick < resumed else 724 + (tick - resumed) + 1
+    )
+    records: list[TickRecord] = []
+
+    loop.run(max_ticks=resumed + 2, observer=records.append)
+
+    assert records[STALL_FRAMES].rollout.escalated is True
+    assert STALL_ESCALATION in records[STALL_FRAMES].degradations
+    # The counter is reset by the progress itself, not decayed: the very next
+    # tick plans on its budget again, and so does the one after it.
+    for record in records[resumed:]:
+        assert record.rollout.escalated is False
+        assert record.rollout.horizon == planner.budget_horizon
+        assert STALL_ESCALATION not in record.degradations
+    assert planner.asked[resumed:] == [None, None]
+
+
+def test_a_tick_with_no_stall_plans_on_the_budget_alone() -> None:
+    loop, planner = stalled_loop(lambda tick: 724 + 4 * tick, budget_horizon=8)
+    records: list[TickRecord] = []
+
+    loop.run(max_ticks=STALL_FRAMES + 2, observer=records.append)
+
+    assert planner.asked == [None] * (STALL_FRAMES + 2)
+    for record in records:
+        assert record.rollout.escalated is False
+        assert record.rollout.horizon == 8
+        assert STALL_ESCALATION not in record.degradations

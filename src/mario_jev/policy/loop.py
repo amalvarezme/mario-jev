@@ -27,6 +27,15 @@ Timing is **recorded, never repaired**: ``timing_overrun`` is appended when the
 rollout's own ``elapsed_ms`` exceeds ``rollout_budget_ms * OVERSHOOT_FACTOR``. The
 loop holds one planner across ticks; the limit stays visible in the journal.
 
+The one exception is the measured stall, and it is recorded too. The loop counts
+consecutive frames in which the state's ``x_max`` does not advance, and after
+``STALL_FRAMES`` of them it asks the planner for a horizon of at least
+``STALL_MIN_HORIZON``, appending ``STALL_ESCALATION`` to that tick's
+``degradations``. The counter resets the moment progress resumes, so the
+escalation lasts exactly as long as the blindness does. It is not a repair of the
+timing: the tick knowingly spends past the budget, and both the horizon it used
+and what it cost are on the recorded table.
+
 What can fail, and what is allowed to
 -------------------------------------
 
@@ -83,6 +92,10 @@ from mario_jev.perception import FramePerception, detect
 from mario_jev.state import MarioState, MarioStateBuilder
 from mario_jev.trajectory import RolloutTable, TrajectoryPlanner
 
+# Imported from the module rather than the package: the horizon constants belong
+# to the planner, and the package's curated ``__all__`` does not re-export them.
+from mario_jev.trajectory.planner import STALL_MIN_HORIZON
+
 from .decision import (
     DecisionCadence,
     DecisionSource,
@@ -95,8 +108,22 @@ from .decision import (
 #: overrunning. The loop does not try to repair the overrun; it records it.
 OVERSHOOT_FACTOR = 3.0
 
+#: How many consecutive frames without ``x_max`` advancing count as a stall.
+#: Measured from the recorded 1-1 run: the agent reached ``x_max = 724`` by frame
+#: 271 and then stood still for 600 consecutive frames against a 48 px wall, so
+#: anything that lasts half a second of game time here is not a pause in the
+#: play, it is the loop having nothing to see.
+STALL_FRAMES = 30
+
+#: The degradation recorded on a tick that escalated its horizon because of a
+#: stall. It is a degradation and not a feature: the tick knowingly spent past
+#: the budget it was given, and the journal has to show that it did.
+STALL_ESCALATION = "stall_escalation"
+
 __all__ = [
     "OVERSHOOT_FACTOR",
+    "STALL_ESCALATION",
+    "STALL_FRAMES",
     "ExecutionLoop",
     "RunSummary",
     "TickRecord",
@@ -214,8 +241,10 @@ class ExecutionLoop:
         "_ended",
         "_frame_index",
         "_last_action",
+        "_last_x_max",
         "_planner",
         "_settings",
+        "_stall_frames",
         "_tick",
     )
 
@@ -258,6 +287,12 @@ class ExecutionLoop:
         # executed frame, independent of the emulator counter the planner inflates.
         self._frame_index = 0
         self._last_action = "NOOP"
+        # Stall detection lives here because only the loop sees the history: the
+        # planner is handed one savestate and cannot know whether the last thirty
+        # frames went anywhere. ``None`` means nothing has been observed yet, and
+        # a first observation is not a stalled one.
+        self._last_x_max: int | None = None
+        self._stall_frames = 0
         self._ended = False
 
     def step(self) -> TickRecord:
@@ -293,15 +328,36 @@ class ExecutionLoop:
         state = self._builder.observe(perception, emulator.ram(), emulator.info)
 
         # 3. The sweep runs every tick; the trajectories are local, and the state
-        #    must carry them before anything asks the model about them.
+        #    must carry them before anything asks the model about them. A measured
+        #    stall -- ``STALL_FRAMES`` frames in which the state's own ``x_max``
+        #    never advanced -- puts a floor under the horizon for this tick only:
+        #    at a wall the budget's horizon shows every candidate as
+        #    ``no_progress`` at one identical risk, and a table with no signal in
+        #    it is decided by the tie-break rather than by the measurement.
+        stalled = self._observe_progress(state.progress.x_max)
         rollout_started = time.perf_counter()
-        table = self._planner.plan(emulator)
+        if stalled:
+            table = self._planner.plan(emulator, min_horizon=STALL_MIN_HORIZON)
+        else:
+            table = self._planner.plan(emulator)
         latencies["rollout"] = _elapsed_ms(rollout_started)
         state = state.with_candidates(table.assessments)
 
         degradations: list[str] = []
         if table.elapsed_ms > settings.rollout_budget_ms * OVERSHOOT_FACTOR:
             degradations.append("timing_overrun")
+        # Recorded on the loop's own measurement, not on the planner's answer:
+        # this tick asked for more frames than the budget allotted. Whether those
+        # frames cost anything beyond the budget's own choice is the planner's
+        # fact, and it is on ``table.escalated``.
+        #
+        # Only when there was something to plan. The loop cannot know the table is
+        # empty before asking, so ``plan()`` still receives the floor -- but a table
+        # with no candidates has no horizon to lengthen, and claiming an escalation
+        # would describe a cost that could not have been paid. On that tick
+        # ``fallback_no_candidates`` already says what happened.
+        if stalled and table.candidates:
+            degradations.append(STALL_ESCALATION)
 
         # The advisor is optional input, never an authority, and never on the
         # critical path: absent or failing, the tick proceeds unchanged.
@@ -379,6 +435,25 @@ class ExecutionLoop:
         )
         self._tick += 1
         return record
+
+    def _observe_progress(self, x_max: int) -> bool:
+        """Record this tick's ``x_max`` and answer whether the run has stalled.
+
+        ``x_max`` comes from the state the tick already built, which reads it from
+        ``info['x_pos_max']`` -- the same source, so the loop cannot disagree with
+        its own record about whether Mario advanced. The first tick observes
+        without judging: there is no earlier frame to compare it to.
+
+        One rule, one place. There is no second escalation path and no retry: when
+        progress resumes the counter resets and the next tick plans on its budget
+        again, and while it does not, every tick escalates the same way.
+        """
+        if self._last_x_max is not None and x_max <= self._last_x_max:
+            self._stall_frames += 1
+        else:
+            self._stall_frames = 0
+        self._last_x_max = x_max
+        return self._stall_frames >= STALL_FRAMES
 
     def run(
         self,

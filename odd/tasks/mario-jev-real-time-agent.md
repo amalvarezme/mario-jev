@@ -855,6 +855,18 @@ evaluation run (120 frames, identical parameters) went from **157 s to 18 s**, d
 rollout) and #5 (the pacer's own rate: 28.12 ms/step against 16.67 configured) remain open, and
 `docs/EVALUATION.md` now says so in each case rather than leaving the fixed one reading as open.
 
+**Follow-up on the report's finding #4, same day**: the stall had a measured cause — replaying the
+frozen savestate at fixed horizons shows the escape first appears at **24 frames** while the agent's
+horizon was 8, i.e. it was **blind by budget**, with the budget set by a cost model that had ratcheted
+down over 270 ticks. `TrajectoryPlanner.plan()` gained an optional `min_horizon` floor clamped into
+`[rollout_min_frames, 96]`, `RolloutTable.escalated` records whether the horizon really exceeded the
+budget's own choice, and `ExecutionLoop` counts frames without `x_max` advancing and asks for 24 once
+that reaches 30. Measured on a fresh 900-frame live run, same stage and seed: `x_max` **724 → 1363**,
+still advancing on the last frame instead of dead since frame 271, `NOOP` ticks 700 → 472, 101
+recorded escalations. **The ratchet itself is untouched** — the horizon still sits at its floor of 6
+for 696 of 900 ticks — so this is a safety net, not the cure; relaxing the cost model is the real
+repair and remains open.
+
 ## 5. Review workload forecast
 
 | Field | Value |

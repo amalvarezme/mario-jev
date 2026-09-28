@@ -77,6 +77,24 @@ MIN_PER_FRAME_MS: float = 0.001
 #: can still fit.
 MAX_SWEEP_PASSES: int = 2
 
+#: The horizon at which the escape from a wall becomes visible, measured rather
+#: than chosen. Replaying the recorded 1-1 run to its stalled state (x=722,
+#: emulator tick 420) and re-planning from that exact savestate at fixed horizons
+#: gives: at 8, 12 and 16 frames every candidate is ``no_progress`` at a single
+#: risk of 0.6, so the table carries no signal at all and ``best`` falls to the
+#: ``dx`` tie-break; at 24 frames ``right+A`` and ``right+A+B`` come back
+#: ``lands_safe`` with dx=+2 at risk 0.2; at 32 and 48 the same two candidates
+#: report dx of +12/+13 and +40/+55. Below 24 the running jump has begun but has
+#: not moved Mario yet, which is why a shorter horizon cannot see it.
+STALL_MIN_HORIZON: int = 24
+
+#: The hard cap on an escalated horizon: a stall may buy more frames than the
+#: budget chose, but never more than this. Escalation is an admission that the
+#: budget bought blindness, not a licence to plan without one. It bounds only the
+#: escalated floor; a ``plan()`` with no ``min_horizon`` is untouched by it and
+#: keeps sizing itself from the measured cost model alone.
+STALL_MAX_HORIZON: int = 96
+
 
 class CostSource(StrEnum):
     """Where the cost model that sized one sweep came from.
@@ -280,6 +298,12 @@ class RolloutTable:
     #: moves by exactly this much.
     steps_taken: int
     candidates: tuple[CandidateRollout, ...]
+    #: Whether the horizon actually used exceeded what the budget alone would have
+    #: chosen. ``False`` when a caller asked for a floor the budget had already
+    #: bought, because nothing was then spent beyond the budget's own choice. The
+    #: overspend stays measurable next to it: ``horizon`` is the horizon used and
+    #: ``elapsed_ms`` is what it really cost.
+    escalated: bool = False
 
     @property
     def assessments(self) -> tuple[CandidateAssessment, ...]:
@@ -313,6 +337,7 @@ class RolloutTable:
             "passes": int(self.passes),
             "cost_source": str(self.cost_source),
             "steps_taken": int(self.steps_taken),
+            "escalated": bool(self.escalated),
             "candidates": [candidate.as_dict() for candidate in self.candidates],
         }
 
@@ -410,8 +435,25 @@ class TrajectoryPlanner:
 
     # -- the sweep ---------------------------------------------------------------
 
-    def plan(self, emulator: MarioEmulator) -> RolloutTable:
-        """Roll every candidate action forward and leave the emulator unmoved."""
+    def plan(
+        self, emulator: MarioEmulator, *, min_horizon: int | None = None
+    ) -> RolloutTable:
+        """Roll every candidate action forward and leave the emulator unmoved.
+
+        ``min_horizon`` is a floor a caller may put under the horizon the measured
+        cost model chose, clamped into ``[min_frames, STALL_MAX_HORIZON]``. It
+        exists for exactly one caller: the loop, once it has measured a stall. The
+        default of ``None`` leaves every frame of this method as it was, so an
+        escalation reads in the journal as a deliberate departure from the budget
+        rather than as a new baseline.
+
+        Why a longer horizon rather than a heuristic fallback: at a wall, planning
+        further produces *information* -- the measurement quoted on
+        :data:`STALL_MIN_HORIZON` shows two candidates turning ``lands_safe`` at
+        24 frames -- while "repeat the last action that moved us" produces a
+        guess. If even :data:`STALL_MAX_HORIZON` frames show no way out, the
+        honest answer is that there is no measured way out, and the table says so.
+        """
         started = time.perf_counter()
         snapshot = emulator.dump_state()
         tick = int(emulator.tick)
@@ -442,7 +484,7 @@ class TrajectoryPlanner:
             # one it inherited.
             self._remembered = cost
 
-            horizon = choose_horizon(
+            budget_horizon = choose_horizon(
                 budget_ms=self._budget_ms,
                 candidate_count=len(self._actions),
                 base_ms=cost.base_ms,
@@ -450,6 +492,19 @@ class TrajectoryPlanner:
                 min_frames=self._min_frames,
                 max_frames=self._max_frames,
             )
+            # The floor an escalating caller asked for, clamped at both ends. With
+            # no `min_horizon` it is the planner's own minimum, which is what makes
+            # every line below identical to the unescalated path.
+            floor = self._min_frames
+            if min_horizon is not None:
+                floor = max(
+                    self._min_frames, min(int(min_horizon), STALL_MAX_HORIZON)
+                )
+            horizon = max(budget_horizon, floor)
+            # True only when those frames were bought *beyond* the budget's own
+            # choice. A floor the budget had already cleared costs nothing extra
+            # and is not recorded as an escalation.
+            escalated = horizon > budget_horizon
 
             sweep_ms, candidates, sweep_steps = self._sweep(emulator, snapshot, horizon)
             steps_taken = calibration_frames + sweep_steps
@@ -460,14 +515,16 @@ class TrajectoryPlanner:
             # measured sweep overran the budget, re-run at the horizon the measurement
             # says fits, and let the fresh measurement replace the remembered model so
             # the next call does not repeat the mistake.
+            # The correction may not shrink past ``floor``: an escalated horizon
+            # was bought precisely because the budget's own choice was blind, and
+            # handing those frames straight back would undo the escalation while
+            # still charging for it.
             if (
                 passes < MAX_SWEEP_PASSES
                 and sweep_ms > self._budget_ms
-                and horizon > self._min_frames
+                and horizon > floor
             ):
-                tighter = max(
-                    self._min_frames, int(horizon * self._budget_ms / sweep_ms)
-                )
+                tighter = max(floor, int(horizon * self._budget_ms / sweep_ms))
                 if tighter < horizon:
                     overran_ms = sweep_ms
                     overran_horizon = horizon
@@ -504,6 +561,7 @@ class TrajectoryPlanner:
             cost_source=cost_source,
             steps_taken=steps_taken,
             candidates=tuple(candidates),
+            escalated=escalated,
         )
 
     def _learn_from_overrun(
@@ -670,6 +728,8 @@ __all__ = [
     "CALIBRATION_STEADY_STEPS",
     "MAX_SWEEP_PASSES",
     "MIN_PER_FRAME_MS",
+    "STALL_MAX_HORIZON",
+    "STALL_MIN_HORIZON",
     "CandidateRollout",
     "CostSource",
     "RolloutTable",

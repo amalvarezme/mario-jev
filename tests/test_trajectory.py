@@ -15,12 +15,14 @@ from __future__ import annotations
 
 import inspect
 import json
+from pathlib import Path
 
 import numpy as np
 import pytest
 
 from mario_jev.config import Settings
 from mario_jev.emulator import MarioEmulator, build_actions
+from mario_jev.journal import read_journal
 from mario_jev.perception import GROUND, GROUND_HIGHLIGHT, SKY, detect
 from mario_jev.state import (
     INFO_X_POS,
@@ -48,7 +50,11 @@ from mario_jev.trajectory import (
 )
 # The exact payload ``_calibrate`` returns, imported so a test can inject a cost
 # model the way the planner consumes one instead of making the machine lie.
-from mario_jev.trajectory.planner import _Calibration
+from mario_jev.trajectory.planner import (
+    STALL_MAX_HORIZON,
+    STALL_MIN_HORIZON,
+    _Calibration,
+)
 
 HEIGHT, WIDTH = 240, 256
 FLOOR_TOP = 208
@@ -64,6 +70,15 @@ GOOMBA_APPROACH_FRAMES = 60
 #: Measured: from there, ``right+B`` dies 46 frames later — inside a 48-frame
 #: horizon, which is the whole point of this scenario.
 DEATH_FRAME = 46
+
+#: The recorded live run, and the frame of it at which the agent stood still
+#: against the wall. ``artifacts/`` is gitignored, so the test that reads this
+#: says how to produce the file rather than skipping when it is absent.
+JOURNAL_NAME = "eval-1-1.jsonl"
+#: Measured: replaying the recorded actions for this many frames puts Mario at
+#: x=722, the state whose rollout carried no signal.
+STALL_TICK = 420
+STALL_X = 722
 
 
 # -- pure: horizon selection -------------------------------------------------------
@@ -801,3 +816,200 @@ def test_the_sweep_cost_does_not_depend_on_pacing(emulator_factory) -> None:
     unpaced = elapsed_ms(False)
 
     assert paced < unpaced * 2
+
+
+# -- the stall escalation ------------------------------------------------------------
+#
+# The defect these tests describe is measured, not hypothesised. In the recorded
+# 1-1 run the agent reached x_max=724 by frame 271 and then stood still for 600
+# frames against a 48 px wall: at its horizon of 8 frames every candidate came
+# back ``no_progress`` at an identical risk of 0.6, so ``table.best`` was decided
+# by the dx tie-break and landed on NOOP. Replaying that run to the stalled
+# savestate and re-planning at fixed horizons shows where the escape becomes
+# visible: nothing at 8, 12 or 16, two ``lands_safe`` candidates at 24, and the
+# same two at dx=+40/+55 by 48. The rollout was blind, and it was blind by budget.
+
+
+def test_min_horizon_none_reproduces_the_recorded_sweep_exactly(
+    emulator: MarioEmulator,
+) -> None:
+    # The regression requirement, stated as an assertion: passing ``min_horizon``
+    # explicitly as ``None`` must leave the sweep byte-for-byte what it was before
+    # the parameter existed. These are the numbers
+    # ``test_the_unpaced_sweep_is_pinned_to_the_recorded_result`` pins for the
+    # call with no keyword at all.
+    planner = TrajectoryPlanner(budget_ms=5000.0, min_frames=8, max_frames=8)
+
+    table = planner.plan(emulator, min_horizon=None)
+
+    assert table.horizon == 8
+    assert table.escalated is False
+    assert table.calibration_frames == 12
+    assert table.steps_taken == 68
+    assert table.passes == 1
+    assert table.start_x == 40
+    assert {
+        candidate.name: (candidate.outcome.value, candidate.dx, candidate.frames)
+        for candidate in table.candidates
+    } == {
+        "NOOP": ("no_progress", 0, 8),
+        "right": ("lands_safe", 2, 8),
+        "right+A": ("lands_safe", 2, 8),
+        "right+B": ("lands_safe", 3, 8),
+        "right+A+B": ("lands_safe", 2, 8),
+        "A": ("no_progress", 0, 8),
+        "left": ("no_progress", -3, 8),
+    }
+
+
+def test_a_floor_above_the_budgets_choice_raises_the_horizon_and_is_recorded(
+    emulator: MarioEmulator,
+) -> None:
+    # A budget this small buys the minimum horizon and nothing more, which is the
+    # blind end of the measured table.
+    planner = TrajectoryPlanner(budget_ms=0.1, min_frames=6, max_frames=48)
+
+    unescalated = planner.plan(emulator)
+    escalated = planner.plan(emulator, min_horizon=STALL_MIN_HORIZON)
+
+    assert unescalated.horizon == 6
+    assert unescalated.escalated is False
+    assert escalated.horizon == STALL_MIN_HORIZON
+    assert escalated.escalated is True
+    # The frames were really stepped, so the overspend is measurable and not just
+    # asserted: 7 candidates at 24 frames each.
+    assert escalated.steps_taken == 7 * STALL_MIN_HORIZON
+
+
+def test_a_floor_the_budget_had_already_cleared_is_not_an_escalation(
+    emulator: MarioEmulator,
+) -> None:
+    # Nothing was spent beyond what the budget itself chose, so nothing is
+    # recorded as spent beyond it — even though a floor was asked for.
+    planner = TrajectoryPlanner(budget_ms=5000.0, min_frames=32, max_frames=32)
+
+    table = planner.plan(emulator, min_horizon=STALL_MIN_HORIZON)
+
+    assert table.horizon == 32
+    assert table.escalated is False
+
+
+def test_the_escalated_horizon_stops_at_the_hard_cap(emulator: MarioEmulator) -> None:
+    # A floor is a request, not a mandate: escalation may buy frames the budget
+    # did not, but never more than STALL_MAX_HORIZON of them.
+    planner = TrajectoryPlanner(budget_ms=0.1, min_frames=6, max_frames=8)
+
+    table = planner.plan(emulator, min_horizon=1000)
+
+    assert STALL_MAX_HORIZON == 96
+    assert table.horizon == 96
+    assert table.escalated is True
+
+
+def test_a_floor_below_the_minimum_cannot_push_the_horizon_under_it(
+    emulator: MarioEmulator,
+) -> None:
+    # The clamp holds at the bottom too: `min_horizon` can only ever raise the
+    # horizon, never lower it past the planner's own minimum.
+    planner = TrajectoryPlanner(budget_ms=0.1, min_frames=12, max_frames=48)
+
+    table = planner.plan(emulator, min_horizon=3)
+
+    assert table.horizon == 12
+    assert table.escalated is False
+
+
+def test_as_dict_carries_escalated(emulator: MarioEmulator) -> None:
+    # The journal serialises the table through as_dict(), so a fact the table
+    # holds but the dict drops is a fact the evidence never gets.
+    planner = TrajectoryPlanner(budget_ms=0.1, min_frames=6, max_frames=48)
+
+    plain = planner.plan(emulator).as_dict()
+    escalated = planner.plan(emulator, min_horizon=STALL_MIN_HORIZON).as_dict()
+
+    assert plain["escalated"] is False
+    assert escalated["escalated"] is True
+    # It survives the trip through JSON, which is how the journal stores it.
+    assert json.loads(json.dumps(escalated))["escalated"] is True
+
+
+def test_the_escalated_plan_sees_the_escape_the_recorded_run_was_blind_to(
+    emulator_factory,
+) -> None:
+    """The behavioural proof, on the real emulator at the real stalled state.
+
+    The recorded run's own actions are replayed to the frame where it stalled,
+    and the two plans are run from that exact savestate: one at the horizon the
+    run actually used, one escalated to STALL_MIN_HORIZON.
+
+    The un-escalated side is pinned to the horizon the *journal* recorded at that
+    tick rather than to whatever the budget would buy here, and deliberately so:
+    on a machine fast enough, 120 ms buys 23-24 frames at this state and the
+    escape is already visible, so a default-bounds plan would assert nothing and
+    would assert it differently on every machine. The blindness being reproduced
+    is the recorded one.
+    """
+    journal_path = Path(__file__).resolve().parent.parent / "artifacts" / JOURNAL_NAME
+    if not journal_path.exists():
+        # Not a skip. The evidence is reproducible in one command, and a silent
+        # skip here would quietly retire the only test that proves the fix does
+        # anything at all.
+        pytest.fail(
+            f"the recorded run {journal_path} is missing (artifacts/ is gitignored). "
+            "Produce it with: "
+            "scripts/jev-env.sh .venv/bin/python -m mario_jev run --fast --max-ticks 900"
+        )
+
+    journal = read_journal(journal_path)
+    recorded = journal.ticks[STALL_TICK]
+    recorded_horizon = int(recorded["rollout"]["horizon"])
+    actions = [tick["decision"]["action"] for tick in journal.ticks]
+
+    emulator = emulator_factory()
+    emulator.reset(seed=0)
+    names = emulator.action_names
+    for action in actions[:STALL_TICK]:
+        emulator.step(names.index(action))
+    # The replay landed where the run recorded it landing; without this the two
+    # plans below would be assertions about some other state entirely.
+    assert emulator.info[INFO_X_POS] == STALL_X
+
+    blind = TrajectoryPlanner(
+        budget_ms=5000.0, min_frames=recorded_horizon, max_frames=recorded_horizon
+    ).plan(emulator)
+    escalated = TrajectoryPlanner(budget_ms=0.1, min_frames=6, max_frames=48).plan(
+        emulator, min_horizon=STALL_MIN_HORIZON
+    )
+
+    assert blind.horizon == recorded_horizon
+    assert escalated.horizon == STALL_MIN_HORIZON
+    assert escalated.escalated is True
+
+    blind_risks = {candidate.risk for candidate in blind.candidates}
+    assert all(
+        candidate.outcome is TerminalOutcome.NO_PROGRESS for candidate in blind.candidates
+    ), (
+        f"at horizon {blind.horizon} the recorded run saw no way out; this plan saw "
+        f"{[(c.name, c.outcome.value, c.dx) for c in blind.candidates]}"
+    )
+    assert len(blind_risks) == 1, (
+        f"at horizon {blind.horizon} every candidate carried the same risk, so "
+        f"`best` fell to the dx tie-break; this plan carried {sorted(blind_risks)}"
+    )
+
+    escapes = [
+        candidate
+        for candidate in escalated.candidates
+        if candidate.outcome is TerminalOutcome.LANDS_SAFE and candidate.dx > 0
+    ]
+    assert escapes, (
+        f"escalating from {blind.horizon} to {escalated.horizon} frames must make the "
+        "running jump visible; it showed "
+        f"{[(c.name, c.outcome.value, c.dx) for c in escalated.candidates]}"
+    )
+    assert min(candidate.risk for candidate in escapes) < min(blind_risks), (
+        f"the escape found at horizon {escalated.horizon} must be measurably safer "
+        f"than anything at horizon {blind.horizon}: "
+        f"{sorted({c.risk for c in escalated.candidates})} against {sorted(blind_risks)}"
+    )
+    assert escalated.best.dx > 0

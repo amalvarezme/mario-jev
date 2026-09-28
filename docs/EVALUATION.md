@@ -171,6 +171,45 @@ contributors are visible in the data and neither is proven alone:
   not hazardous, and the confidence gate passed Jev's `NOOP` at 0.74–0.79. Nothing in the policy can
   tell "waiting is correct" from "the rollout has gone blind".
 
+**The ratchet is the root cause, and it was measured.** Re-planning from the frozen stalled savestate
+at several fixed horizons settles which of the two contributors is doing the damage:
+
+| horizon | candidate `dx` | outcomes | risks | can the agent see the escape? |
+|---|---|---|---|---|
+| 8 | -1, 0, 0, 0, 0, 0, 0 | all `no_progress` | 0.6 only | **no** |
+| 12 | -4, 0, …, 0 | all `no_progress` | 0.6 only | no |
+| 16 | -7, 0, …, 0 | all `no_progress` | 0.6 only | no |
+| **24** | -17, 0, 0, 0, 0, **2**, **2** | 5 `no_progress`, **2 `lands_safe`** | **0.2** and 0.6 | **yes** |
+| 32 | -30, 0, …, **12**, **13** | 5 / 2 | 0.2 and 0.6 | clearly |
+| 48 | -58, 0, 0, 0, 0, **40**, **55** | 5 / 2 | 0.2 and 0.6 | unmistakably |
+
+The running jump that clears the wall needs about **24 frames** to show up as progress, and the
+horizon was 8. The agent was not choosing badly; it was **blind by budget**, with the budget set by a
+cost model that had ratcheted down over 270 ticks of overruns.
+
+**Fixed the same day — measured end to end.** `TrajectoryPlanner.plan()` gained an optional
+`min_horizon` floor (clamped into `[rollout_min_frames, 96]`), `RolloutTable.escalated` records
+whether the horizon actually exceeded what the budget chose, and `ExecutionLoop` counts consecutive
+frames without `x_max` advancing and asks for a 24-frame horizon once that count reaches 30. Scaling
+the horizon was chosen over a heuristic fallback ("retry the last action that moved us") because
+re-planning produces *real information* — two candidates become visibly safe — where the heuristic is
+a guess.
+
+| measured, 900 frames, same stage and seed | before | after |
+|---|---|---|
+| `x_max` reached | 40 → **724** | 40 → **1363** |
+| still advancing at the end | no — dead since frame 271 | **yes — maximum on the last frame** |
+| ticks that chose `NOOP` | 700 of 900 | **472** of 900 |
+| escalations | 0 | 101, the first at frame 292 |
+| horizon | 8 on 735 ticks | 6 on 696, **24 on 105**, 10 on 83 |
+| wall clock / decision rate | 184 s / 0.614 Hz | 154 s / 0.735 Hz |
+
+The agent now clears the wall and **nearly doubles its progress**, and it is still moving when the
+frames run out. Note what the horizon column says: it still spends 696 ticks at its floor of 6. **The
+ratchet itself is untouched** — this fix is a safety net that fires 101 times, not a cure. Relaxing
+the cost model so a transient stall does not permanently shrink the horizon remains open, and is the
+real repair for §3.
+
 ### 4. A 21-second stall left no trace in the journal
 
 One tick in run 1 took **21 272 ms** of wall clock. The journal's own `degradations` list for that
@@ -228,9 +267,11 @@ In the order I would act on them, each with the evidence above:
    horizon recovered from its floor of 6, and the fallback rate fell from 40 % to 27 %.
 3. **Record the retry, and the timeout.** A 20 s timeout that ends in success currently leaves an
    empty `degradations` list and an unexplained 21 s latency. **Still open.**
-4. **Give the agent a way out of a blind rollout.** When every candidate is identical, the agent
-   stands still forever. A longer horizon for a stalled tick, or treating "all candidates equal and
-   `no_progress`" as its own degraded source, would make the stall visible and survivable.
-   **Still open** — and §2's fix does not help here: the stall happened in an unpaced run.
+4. ~~**Give the agent a way out of a blind rollout.**~~ **Fixed and measured end to end** — see §3. A
+   measured stall (30 frames without `x_max` advancing) escalates the horizon to 24, and the agent now
+   reaches `x_max` **1363** instead of 724, still moving at the end of the run. The escalation fires
+   101 times and is recorded on every one of those ticks. **The ratchet that caused the stall is
+   untouched** — relaxing the cost model so a transient stall does not permanently shrink the horizon
+   is still open, and is the real repair.
 5. **Fix the pacer's own rate.** 28.12 ms per step against a configured 16.67 ms is **1.69×** the
    configured period. **Still open.**
