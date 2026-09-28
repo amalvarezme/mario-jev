@@ -370,8 +370,9 @@ is not reviewable.
 - [x] 4.3 `src/mario_jev/advisor/` — optional PlayJev-0.8B advisor, lazily loaded, that
       contributes its move distribution as a state feature and **degrades to absent** when torch
       or the weights are unavailable. Never on the critical path.
-      **Implemented and verified; four writer rounds, five independent verifications.** See
-      "WU4 slice B — verification record" below for what the rounds found and what stayed open.
+      **Implemented and verified; four writer rounds, five independent verifications. Landed
+      `4070381`.** See "WU4 slice B — verification record" below for what the rounds found and what
+      stayed open.
 - [ ] 4.4 `src/mario_jev/policy/` — cadence (K frames), confidence threshold, safety guardrails,
       degradation recording, and the execution loop.
 - [ ] 4.5 Tests: mocked Jev transport (deterministic), live test gated on `JEV_API_KEY`,
@@ -644,20 +645,63 @@ nit, none affecting the loop):
 **policy**, not the state layer, appends the optional advisor block:
 `{**state.to_jev_state(), "advisor": {...}}`.
 
+**Three things the original contract left ambiguous and that are now pinned**, because each would
+otherwise have been invented while coding:
+
+1. **`select_action`'s real signature.** The contract's `select_action(table, decision, settings)`
+   did not say what `decision` was or how the between-cadence case ("the last decided action")
+   reaches a *pure* function. Pinned:
+   `select_action(table, jev, settings, *, cadence_due=True, last_action="NOOP", degraded_reason=None)`
+   where `jev` is a `JevResponse` or `None`. Pure: no emulator, no network, no clock, every branch
+   testable without one.
+2. **What actually goes to Jev when the advisor is on.** `JevClient.ask(questions, state)` takes a
+   `MarioState` and projects it itself, and that client is a committed, separately verified slice.
+   Pinned: the payload sent is exactly `state.to_jev_state()` with its frozen five keys, and the
+   advisor block is an input to the **recorded** tick state (journal and dashboard), which is what
+   "a state feature" means here. Reopening the verified client to accept a state override is out of
+   scope for this unit, and the module docstring must say so rather than leave it looking like an
+   oversight.
+3. **What counts as "a decision".** `RunSummary.decisions` counts ticks where `jev_called` is True,
+   and `decision_rate_hz = decisions / elapsed_s`. Counting cadence ticks instead would overstate
+   the rate on a run that never consulted Jev.
+
+**`frame_index` is the loop's own counter, and the plan had this wrong.** The first version pinned
+`frame_index = emulator.tick`, which is not a game-frame count: `TrajectoryPlanner.plan(emulator)`
+steps the same emulator object while enumerating candidates, so `emulator.tick` jumps by the whole
+rollout cost on every tick. Measured on this machine at `real_time=False`: `30 -> 217`,
+`217 -> 392`, `392 -> 567`, `567 -> 910` (`steps_taken` 187, 175, 175, 343). With `cadence_frames=8`
+the cadence therefore fired on an arbitrary subset of ticks — 1 of those 4, by accident — so the
+configured "every 8 game frames, 7.5 Hz" was not the cadence that ran. The loop now owns a counter
+that advances by exactly one per executed game frame, and the raw `emulator.tick` is recorded
+separately as `emulator_tick` so the planner's inflation stays **visible** in the journal instead of
+silently corrupting the cadence.
+
+**The journal records the questions the policy built, not a reconstructed request.** `TickRecord`
+carries `jev_questions` — the four questions exactly as `build_questions(state)` produced them — and
+not a fabricated `{url, headers, json_body, timeout_s}` mirror. The committed client exposes no
+request handle, so such a mirror could only drift from what is actually sent, and a redacted
+`Authorization` placeholder in it would invite a reader to believe a header was captured. The state
+that accompanied the questions is already on the record.
+
 ```python
+OVERSHOOT_FACTOR = 3.0
 DecisionSource(StrEnum): "jev" | "hold" | "guardrail_lethal" | "fallback_no_key" |
                          "fallback_degraded" | "fallback_below_confidence" |
                          "fallback_no_candidates"
 TickDecision(action, source, confidence, risk, reason, jev_called)
 DecisionCadence(cadence_frames)                 # .due(frame_index) -> frame_index % K == 0
-select_action(table, decision, settings) -> TickDecision
-TickRecord(tick, frame_index, state, rollout, jev_request, jev_response, decision, advisor,
-           latencies_ms, degradations)
+select_action(table, jev, settings, *, cadence_due=True, last_action="NOOP", degraded_reason=None)
+TickRecord(tick, frame_index, emulator_tick, state, rollout, jev_questions, jev_response,
+           decision, advisor, latencies_ms, degradations)
 RunSummary(ticks, frames, decisions, sources, degradations, elapsed_s, decision_rate_hz)
 ExecutionLoop(settings, *, emulator=None, planner=None, client=None, builder=None, advisor=None)
   .step() -> TickRecord
   .run(*, max_ticks=None, observer=None) -> RunSummary
 ```
+
+**A name the client accepted but the table does not know raises `ValueError`** — it cannot happen
+(the client rejects a choice outside the criteria, which are the candidate names in order), so it is
+a bug and must be loud rather than degraded into a silent fallback.
 
 Selection is deterministic and exhaustive, evaluated in this order:
 
