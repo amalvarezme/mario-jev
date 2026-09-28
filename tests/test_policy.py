@@ -12,11 +12,17 @@ every default collaborator, to pin that the defaults are wired up.
 from __future__ import annotations
 
 import json
+from dataclasses import fields
 
 import numpy as np
 import pytest
 
-from mario_jev.advisor import AdvisorAdvice, AdvisorMove
+from mario_jev.advisor import (
+    REASON_TORCH_MISSING,
+    AdvisorAbsence,
+    AdvisorAdvice,
+    AdvisorMove,
+)
 from mario_jev.config import Settings
 from mario_jev.emulator import StepResult, build_actions
 from mario_jev.jev import (
@@ -37,10 +43,13 @@ from mario_jev.policy import (
     DecisionCadence,
     DecisionSource,
     ExecutionLoop,
+    TickDecision,
+    TickRecord,
     advisor_view,
     journal_state,
     select_action,
 )
+from mario_jev.perception import detect
 from mario_jev.state import (
     HAZARD_OUTCOMES,
     MarioState,
@@ -365,9 +374,16 @@ class FakeClient:
 
 
 class FakeAdvisor:
-    def __init__(self, answer: AdvisorAdvice | None, *, available: bool = True) -> None:
+    def __init__(
+        self,
+        answer: AdvisorAdvice | None,
+        *,
+        available: bool = True,
+        absence: AdvisorAbsence | None = None,
+    ) -> None:
         self.answer = answer
         self.available = available
+        self.absence = absence
         self.calls = 0
 
     def advise(self, frame: object, action_names: object) -> AdvisorAdvice | None:
@@ -1034,3 +1050,117 @@ def test_one_real_tick_runs_with_the_default_collaborators(emulator) -> None:
     assert set(record.state.to_jev_state()) == FROZEN_STATE_KEYS
     assert record.jev_questions is None
     assert set(record.latencies_ms) >= {"rollout", "jev", "advisor", "total"}
+
+
+# -- 12. the record carries its own evidence ----------------------------------------
+
+
+def tick_record_with_frame(frame: np.ndarray) -> TickRecord:
+    """A hand-built record with fixed non-array fields, so equality is the only variable."""
+    return TickRecord(
+        tick=0,
+        frame_index=0,
+        emulator_tick=0,
+        frame=frame,
+        perception=detect(frame, tick=0),
+        state=make_state(tick=0),
+        rollout=all_safe_table(),
+        jev_questions=None,
+        jev_response=None,
+        decision=TickDecision(
+            action="right",
+            source=DecisionSource.FALLBACK_NO_KEY,
+            confidence=None,
+            risk=None,
+            reason="no_credential",
+            jev_called=False,
+        ),
+        advisor=None,
+        advisor_absence=None,
+        latencies_ms={"rollout": 1.0, "jev": 0.0, "advisor": 0.0, "total": 2.0},
+        degradations=(),
+    )
+
+
+def test_two_structurally_identical_records_compare_without_numpy_ambiguity() -> None:
+    # Two distinct arrays with the same contents. Before compare=False this comparison
+    # raised "the truth value of an array with more than one element is ambiguous".
+    first = tick_record_with_frame(np.zeros(SCREEN, dtype=np.uint8))
+    second = tick_record_with_frame(np.zeros(SCREEN, dtype=np.uint8))
+
+    by_name = {spec.name: spec for spec in fields(TickRecord)}
+    for name in ("frame", "perception", "advisor_absence"):
+        assert by_name[name].compare is False, name
+
+    assert first is not second
+    assert first.frame is not second.frame
+    assert first == second
+
+
+def test_a_real_tick_carries_its_own_frame_and_perception(emulator) -> None:
+    loop = ExecutionLoop(make_settings(key=None, cadence=8), emulator=emulator)
+
+    record = loop.step()
+
+    assert isinstance(record.frame, np.ndarray)
+    assert record.frame.shape == (240, 256, 3)
+    assert record.frame.dtype == np.uint8
+    # The perception is exactly what detect() saw in that frame, and its tick is the
+    # record's own frame index: the two cannot drift apart.
+    assert record.perception == detect(record.frame, tick=record.frame_index)
+    assert record.perception.tick == record.frame_index
+
+
+def test_a_recorded_frame_is_a_copy_and_not_the_live_screen(emulator) -> None:
+    """The record must hold pixels that survive later steps.
+
+    ``MarioEmulator.frame()`` returns a fresh copy; ``screen_view()`` is the buffer
+    every step mutates in place. A record holding the live buffer would show the
+    *last* frame of the run in every tick, and the annotated artifact would be drawn
+    from a frame that tick never saw -- silently, with no exception anywhere. This
+    asserts the copy directly, against the real emulator, rather than relying on a
+    fake that simply lacks the method.
+    """
+    loop = ExecutionLoop(make_settings(key=None, cadence=8), emulator=emulator)
+
+    record = loop.step()
+    captured = record.frame.copy()
+    live = emulator.screen_view()
+
+    assert not np.shares_memory(record.frame, live)
+    assert record.frame is not live
+
+    # Scribble on the live buffer. If the record aliased it, this would change the
+    # recorded pixels; a copy cannot be reached this way.
+    live[:] = 255
+
+    assert not np.shares_memory(record.frame, live)
+    assert np.array_equal(record.frame, captured)
+    assert not np.array_equal(live, captured)
+
+
+def test_an_enabled_but_absent_advisor_records_its_measured_absence() -> None:
+    absence = AdvisorAbsence(model_id="OmniJev/PlayJev-0.8B", reason=REASON_TORCH_MISSING)
+    advisor = FakeAdvisor(None, available=False, absence=absence)
+    loop, _, _ = loop_with(
+        settings=make_settings(key=None, advisor_enabled=True), advisor=advisor
+    )
+
+    record = loop.step()
+
+    assert advisor.calls == 0
+    assert record.advisor is None
+    assert record.advisor_absence is absence
+
+
+def test_a_disabled_advisor_records_no_measured_absence() -> None:
+    advisor = FakeAdvisor(None)
+    loop, _, _ = loop_with(
+        settings=make_settings(key=None, advisor_enabled=False), advisor=advisor
+    )
+
+    record = loop.step()
+
+    assert advisor.calls == 0
+    assert record.advisor is None
+    assert record.advisor_absence is None

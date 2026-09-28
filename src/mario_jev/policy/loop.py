@@ -33,7 +33,9 @@ What can fail, and what is allowed to
 Two tick conditions degrade to a recorded source: no Jev credential, recorded as
 ``FALLBACK_NO_KEY``, and a transient client failure, recorded as
 ``FALLBACK_DEGRADED``. An absent advisor is not a decision source at all: it is
-recorded as ``advisor=None`` and the tick proceeds unchanged. ``JevClient`` holds
+recorded as ``advisor=None`` alongside the measured ``advisor_absence`` it holds
+(when the advisor was enabled; a disabled advisor has no measurement), and the
+tick proceeds unchanged. ``JevClient`` holds
 no session, so ``close()`` releases nothing and a closed client still serves; the
 client cannot be absent either, because ``__init__`` substitutes a default. In this
 module, exactly one exception is caught, and only around the client call:
@@ -68,14 +70,16 @@ from __future__ import annotations
 
 import time
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Mapping
 
-from mario_jev.advisor import AdvisorAdvice, PlayJevAdvisor
+import numpy as np
+
+from mario_jev.advisor import AdvisorAbsence, AdvisorAdvice, PlayJevAdvisor
 from mario_jev.config import Settings
 from mario_jev.emulator import MarioEmulator, StepResult
 from mario_jev.jev import JevClient, JevUnavailable, build_questions
-from mario_jev.perception import detect
+from mario_jev.perception import FramePerception, detect
 from mario_jev.state import MarioState, MarioStateBuilder
 from mario_jev.trajectory import RolloutTable, TrajectoryPlanner
 
@@ -115,6 +119,19 @@ class TickRecord:
     rollout cost while ``frame_index`` does not. The ``DecisionCadence`` is keyed
     off ``frame_index``, never ``emulator_tick``.
 
+    ``frame`` is the tick's own frame, read **before** the rollout sweep, and
+    ``perception`` is exactly what :func:`~mario_jev.perception.detect` concluded
+    from it. Both are carried here rather than re-derived downstream, because the
+    observer runs after the action was executed and the emulator's *current* frame
+    is then one frame past the one the tick described; reconstructing the
+    association after the fact would be a guess. Holding the pixels is safe:
+    :meth:`MarioEmulator.frame` returns a fresh C-contiguous copy whose memory is
+    not shared with the emulator, so a later step cannot mutate what this record
+    holds. Both fields are ``compare=False``; a ``TickRecord`` is a frozen
+    ``eq=True`` dataclass, and comparing two records must not reach for numpy's
+    ambiguous array truth value. Being ``compare=False`` also keeps them out of
+    ``__hash__``.
+
     ``jev_questions`` is what this tick asked Jev, exactly as
     :func:`~mario_jev.jev.build_questions` built it and handed it to the client, or
     ``None`` when no call was made. It is a reconstruction of the ask, not a capture
@@ -124,17 +141,27 @@ class TickRecord:
     frozen projection that was sent; ``JevResponse.as_dict()`` remains the
     sanctioned record of the reply in ``jev_response``. ``latencies_ms`` always
     holds at least ``rollout``, ``jev``, ``advisor`` and ``total``.
+
+    ``advisor`` is the advice that reached the tick, or ``None``. When it is
+    ``None``, ``advisor_absence`` tells the journal *why*: the advisor was enabled
+    and measured itself absent (the reason is the advisor's own, from its closed
+    set), or the advisor was disabled and no measurement exists at all. It is only
+    set while the advisor is enabled, and it is ``compare=False`` for the same
+    reason the pixels are.
     """
 
     tick: int
     frame_index: int
     emulator_tick: int
+    frame: np.ndarray = field(compare=False)
+    perception: FramePerception = field(compare=False)
     state: MarioState
     rollout: RolloutTable
     jev_questions: dict[str, object] | None
     jev_response: dict[str, object] | None
     decision: TickDecision
     advisor: AdvisorAdvice | None
+    advisor_absence: AdvisorAbsence | None = field(compare=False)
     latencies_ms: Mapping[str, float]
     degradations: tuple[str, ...]
 
@@ -283,6 +310,14 @@ class ExecutionLoop:
         if settings.advisor_enabled and self._advisor is not None and self._advisor.available:
             advice = self._advisor.advise(frame, emulator.action_names)
         latencies["advisor"] = _elapsed_ms(advisor_started)
+        # The measured absence, when there is one. It is carried only while the
+        # advisor is enabled: a disabled advisor was never measured, and writing
+        # its absence as a measured reason would state a fact nobody observed.
+        advisor_absence = (
+            self._advisor.absence
+            if settings.advisor_enabled and self._advisor is not None
+            else None
+        )
 
         # 4. Jev, only on a cadence tick with a credential and something to ask
         #    about. ``build_questions`` refuses an empty candidate set, so the
@@ -330,12 +365,15 @@ class ExecutionLoop:
             tick=self._tick,
             frame_index=frame_index,
             emulator_tick=emulator_tick,
+            frame=frame,
+            perception=perception,
             state=state,
             rollout=table,
             jev_questions=jev_questions,
             jev_response=None if response is None else response.as_dict(),
             decision=decision,
             advisor=advice,
+            advisor_absence=advisor_absence,
             latencies_ms=latencies,
             degradations=tuple(degradations),
         )

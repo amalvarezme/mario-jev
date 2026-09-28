@@ -736,16 +736,85 @@ each protocol violation; advisor absence for real plus the injected-loader prese
 `live_jev`-marked test against the real API, which the **parent runs during verification** so the
 evidence is real rather than deferred.
 
-### WU5 — Evidence journal, visualization, entrypoints
-- [ ] 5.1 `src/mario_jev/journal/` — JSONL trace with, per decision tick: frame index, perceived
+### WU5 — Evidence journal, visualization, entrypoints — **DONE**
+- [x] 5.1 `src/mario_jev/journal/` — JSONL trace with, per decision tick: frame index, perceived
       state, the trajectory table, the Jev question payload, the raw Jev answer with
       probabilities/confidence, the executed action, and the measured latency.
-- [ ] 5.2 Per-tick artifacts: annotated frame PNG (detection overlay), trajectory overlay plot.
-- [ ] 5.3 `src/mario_jev/dashboard/` — live view showing the frame with detections, the candidate
+- [x] 5.2 Per-tick artifacts: annotated frame PNG (detection overlay), trajectory overlay plot.
+- [x] 5.3 `src/mario_jev/dashboard/` — live view showing the frame with detections, the candidate
       trajectories, the Jev decision-score table, and the confidence/latency evolution over time.
-- [ ] 5.4 `src/mario_jev/cli.py` — `run`, `replay`, `dashboard`, `doctor` (environment and
+- [x] 5.4 `src/mario_jev/cli.py` — `run`, `replay`, `dashboard`, `doctor` (environment and
       dependency readiness report).
-- [ ] 5.5 Tests for journal schema, replay determinism, and the doctor report.
+- [x] 5.5 Tests for journal schema, replay determinism, and the doctor report.
+
+**As landed.** The journal is JSONL: one `run` header, one `tick` line per tick, one `summary`
+trailer, **every line flushed**, so a crash mid-run still leaves a readable file. `read_journal`
+refuses to skip anything and names the 1-based line number of the first thing it cannot read —
+including a line that is not UTF-8, which the first implementation let escape as a
+`UnicodeDecodeError` (found by WU5-B's consumer, not by the journal's own 32 tests). Artifacts are
+Pillow-only (there is **no matplotlib** in the venv) and best-effort: a failed write degrades the
+tick instead of failing the run. The dashboard is a self-contained static HTML file with inline SVG
+— no server, no JavaScript build, no new dependency — and `build_html` is a pure function, so the
+same journal twice is byte-identical. `replay` builds no client, no emulator and no planner and
+touches no network. `doctor` reports `JEV_API_KEY` as a boolean, never the value.
+
+**Three decisions pinned before delegating**, each of which would otherwise have been invented:
+
+1. A tick that made **no** Jev call is shown as "no call" and as a **gap** in the series, never as a
+   zero confidence or a zero latency: a zero reads as a measurement, and an absence is not one.
+2. A missing or unreadable frame PNG is reported in **words** ("not recorded"). No placeholder is
+   ever drawn that could be mistaken for a frame.
+3. The source, fallback and decision counts are derived from the recorded `source`/`jev_called`
+   values. The recorded summary is printed verbatim under its own heading, so a journal whose
+   summary disagrees with its ticks shows the disagreement instead of hiding it.
+
+**Two defects found by the writer in its own handoff, both closed:**
+
+* **The record did not carry the evidence its docstring claimed.** `TickRecord` calls itself
+  "everything one tick produced", but the loop built the frame and the `FramePerception` and then
+  discarded them, so the annotated artifact had nothing to annotate and the writer had invented a
+  `frame_source` seam that reconstructed the tick/frame association by arguing about call order.
+  Fixed by carrying `frame`, `perception` and `advisor_absence` **on the record** (all
+  `compare=False`: a frozen `eq=True` dataclass holding numpy arrays would otherwise hit "truth value
+  of an array is ambiguous"). `MarioEmulator.frame()` returns a fresh C-contiguous copy, verified
+  before the change, so holding pixels is safe — and that is now **pinned against the real emulator**
+  by a test that scribbles on the live screen buffer and shows the recorded pixels do not move.
+  A kill-test that swapped in `screen_view()` previously failed only with `AttributeError` on a fake
+  emulator; it now fails on the semantic assertion.
+* **The journal stated a reason it never measured.** `advisor_record(advice=None)` returned
+  `reason: "disabled"` unconditionally, so an advisor that was **enabled and absent** (no torch, no
+  weights, a load failure, no matching moves) was journalled as disabled. There are now three
+  distinguishable shapes, tagged `measured` true/false, and the measured case is reproduced for real
+  on this machine: `{"available": false, "reason": "torch_missing", "measured": true}`.
+
+#### WU5 — verification record (2026-09-28)
+
+One consolidated independent verification over the whole unit, chosen by the user over per-round
+verification to save a round. **No falsification found on any of the eight checks**: the
+abort-vs-degrade crux still holds after the policy delta (401/403/422/drifted-2xx raise the exact
+`JevAuthError`/`JevRequestError`/`JevProtocolError` with no `RunSummary`; exhausted 429/503 degrade),
+the cadence is still keyed on executed game frames (17 ticks, calls at 0/8/16), the reader reported
+the **correct** line number on 13/13 malformed shapes, the sentinel key survived a raw-byte scan
+plus all 153 substrings of length ≥ 5 in the journal, `doctor` output and the dashboard HTML, the
+dashboard rendered a no-call tick as a gap and a missing frame in words with zero `<img>` tags, and
+`replay` stayed network-free with raising constructors and byte-identical output. The two prior
+verification attempts on this unit **timed out or stalled**, which is why this one was scoped to
+small single-purpose probes.
+
+**Accepted residuals, recorded rather than fixed:**
+
+* **nit** — `dashboard/build.py` computes a tick-level `sources` dict that is never rendered. The
+displayed counts come from the recorded summary under an honest heading; the dead value is left as
+recorded here rather than fixed after verification.
+* **disclosed, not a defect** — `latencies_ms["jev"]` is written on no-call ticks as the elapsed of
+the skipped branch (about 0.0). A raw-journal consumer could misread it as a fast call; the dashboard
+gates on `jev_called` and the module docstring says so explicitly.
+* **nit** — `cli.py`'s ROM lookup catches `Exception` broadly, for a doctor display path only.
+* **nit** — module constants (`NOT_RECORDED`, `NO_CALL`) are interpolated into HTML unescaped; they
+are safe only because they are constants.
+* **unverified** — `iter_journal`'s line numbers per case (same core as `read_journal`, exercised
+only through `read_journal`), and dashboard/`doctor` network-touch behaviour (not required).
+
 
 ### WU6 — Live evaluation (gated on the user's ROM and key)
 - [ ] 6.1 Run world 1-1 live; record progress (`x` reached), deaths, `flag_get`, measured
