@@ -863,9 +863,27 @@ down over 270 ticks. `TrajectoryPlanner.plan()` gained an optional `min_horizon`
 budget's own choice, and `ExecutionLoop` counts frames without `x_max` advancing and asks for 24 once
 that reaches 30. Measured on a fresh 900-frame live run, same stage and seed: `x_max` **724 → 1363**,
 still advancing on the last frame instead of dead since frame 271, `NOOP` ticks 700 → 472, 101
-recorded escalations. **The ratchet itself is untouched** — the horizon still sits at its floor of 6
-for 696 of 900 ticks — so this is a safety net, not the cure; relaxing the cost model is the real
-repair and remains open.
+recorded escalations.
+
+**Follow-up on the ratchet — the root cause of finding #4 — same day**: the journals showed the
+remembered cost pinned at **2.92** ms/frame for **796 of 900 ticks** while the sweeps' own real cost
+(`elapsed_ms / steps_taken`, p50) was **1.30** — 2.24× too pessimistic, and the second run 2.09 against
+1.24, 1.69×, pinned for 734 ticks. Nothing lowered it: `remeasured_per_frame_ms` existed and was
+called **only on the overrun path**, so a sweep that fitted never re-measured. `COST_RECOVERY = 0.97`
+plus `_relax_towards_measurement(...)` let a fitting sweep pull the model at most one step toward what
+it measured, floored by that measurement and never raised (raising belongs to the overrun path).
+Measured on a fresh live run: `per_frame_ms` **1.51 → 0.86** (p50 1.38 against a real 1.11),
+horizon **6 → 8–24**, escalations **101 → 46**, `x_max` **1363 → 1438**. The escalation is reduced from
+mechanism to exception, not eliminated.
+
+The same run added a **new open finding**: it stopped after 805 of 900 ticks and **the journal cannot
+say why**. The termination signal sets an internal flag that is written nowhere, the final record's
+`state` is the pre-step world (so `lives` reads 2 in all 805 lines), and `RunSummary` has no
+termination field — a reader cannot distinguish a death from the flag from a manual stop, and cannot
+even settle *that* a death occurred. Two rounds of independent verification on this work also
+corrected **seven false claims in the parent's own `docs/EVALUATION.md`** (a backwards execution
+ordering, a death asserted as fact, a horizon range read off a top-3, ~13 where the real cost pays 15,
+and three over-qualifications), which is why the report's every figure is now derived by command.
 
 ## 5. Review workload forecast
 

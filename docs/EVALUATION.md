@@ -205,10 +205,40 @@ a guess.
 | wall clock / decision rate | 184 s / 0.614 Hz | 154 s / 0.735 Hz |
 
 The agent now clears the wall and **nearly doubles its progress**, and it is still moving when the
-frames run out. Note what the horizon column says: it still spends 696 ticks at its floor of 6. **The
-ratchet itself is untouched** — this fix is a safety net that fires 101 times, not a cure. Relaxing
-the cost model so a transient stall does not permanently shrink the horizon remains open, and is the
-real repair for §3.
+frames run out.
+
+**The ratchet itself is now fixed too — and the fix was measured the same way.** What the journals
+recorded is the defect: `per_frame_ms` began at **0.69** ms and climbed to **2.92**, where it stayed
+for **796 of the run's 900 ticks**, while the cost the sweeps actually demonstrated
+(`elapsed_ms / steps_taken`, p50) was **1.30** — the memory settled at **2.24× the truth** and never
+came back. It never came back because nothing lowered it: `remeasured_per_frame_ms` existed and was
+called **only on the overrun path**, so a sweep that fitted the budget never re-measured anything.
+The second live run shows the same shape at 2.09 against 1.24, a factor of 1.69, pinned for 734 ticks.
+
+`COST_RECOVERY = 0.97` and `_relax_towards_measurement(...)` make a fitting sweep pull the model one
+step back toward what it just measured. The value is **chosen**, not measured — the problem is what
+was measured; the recovery takes `ceil(log(1.3048/2.9191)/log(0.97)) = 27` fitting ticks, which is
+the same order as the loop's own 30-frame stall threshold, so a transient spike now heals itself in
+about the time it takes to declare a stall. A measurement *above* the remembered cost leaves the
+model untouched: only an overrun is a refutation.
+
+| measured, same stage and seed | before (900 ticks) | with the ratchet relaxed (805 ticks) |
+|---|---|---|
+| `per_frame_ms` | 0.69 → **2.92**, p50 2.92 | 1.51 → **0.86**, p50 1.38 |
+| real cost implied by the journal (p50) | 1.30 | 1.11 |
+| **horizon** | **6** on 696 ticks | **8 to 24**, most often 10–14, with 46 at the escalation floor |
+| recorded escalations | 101 | **46** |
+| `x_max` reached | 1363 | **1438** |
+
+The three things the change was for are all visible: the memory now tracks the machine instead of a
+worst moment, the horizon moves back toward what the machine is demonstrating — its real cost
+(p50 1.11 ms/frame) pays for **15** frames where the inflated memory paid for 6 — and **the escalation
+drops
+from the mechanism to the exception** — 101 uses to 46. It is still needed; it was reduced, not
+replaced.
+
+Note the run length: this one stopped at **tick 805**, not 900, and §5 is about why the journal
+cannot tell you that.
 
 ### 4. A 21-second stall left no trace in the journal
 
@@ -225,7 +255,34 @@ Two gaps in the evidence, both fixable:
 * a retry that consumed seconds is an event worth recording as a degradation, not merely a latency;
 * the run header should carry the timeout and attempt budget, since they define what "slow" means.
 
-## What the journal recorded honestly, and one thing it cannot say
+### 5. The journal cannot say why a run stopped
+
+Added by the ratchet run, and it is the sharpest evidence gap in the file. That run stopped after
+**805** tick records against a 900-tick budget, and the journal cannot state why. Two code facts, both
+confirmed against `policy/loop.py`:
+
+* **The record's `state` is the state observed *before* the action.** `step()` builds it early, then
+executes, then assembles the `TickRecord` around the pre-step state. So the final step has a record,
+but that record shows the world before it: `lives` reads `[2]` in all 805 lines, including the last.
+* **The termination itself is known and then discarded.** `StepResult.terminated`/`truncated` sets an
+internal `_ended` flag and is never written anywhere: not on the record, not in a degradation, not in
+`RunSummary`, whose seven fields are exactly `ticks`, `frames`, `decisions`, `sources`, `degradations`,
+`elapsed_s` and `decision_rate_hz`. (The journal's own summary line carries those seven plus `kind`,
+and nothing else.) A reader sees `ticks: 805 < 900` and cannot distinguish a death from
+reaching the flag from a run someone stopped by hand.
+
+**What the file does suggest, and why that is only a suggestion.** The last recorded tick has all
+seven candidates at `hits_enemy` and 360 in-game seconds still on the timer, which rules out a
+timeout. It does **not** settle that Mario died: there is no goal coordinate in this repository to
+rule the flag pole in or out, and no recorded signal either way. The honest reading is that the run
+ended early, probably by death, and that the journal does not say.
+
+The two runs tabulated earlier never died, which is why this went unnoticed until the agent started
+progressing far enough to meet an enemy. So the file records the agent's best run yet and cannot say
+how it ended. The fix is small and unbuilt: a termination reason on the summary, plus the post-step
+outcome on the final record.
+
+## What the journal recorded honestly, and what it cannot say
 
 The advisor was **disabled** for both runs (`{"available": false, "reason": "disabled",
 "measured": false}` on all 1 020 ticks) because `torch` is not installed on this machine. The journal
@@ -242,10 +299,12 @@ zero, and no frame artifact is drawn for a tick whose PNG is absent.
 * **The PlayJev advisor is entirely unexercised.** The 2.2 GB weights are deliberately not
   downloaded and `torch` is absent, so every claim about its distribution is untested here. Its
   contribution to the agent is unknown, not zero.
-* **No death occurred.** Lives stayed at 2 for all 900 frames and the episode never terminated, so
-  the death path — `falls_in_gap`, `hits_enemy`, and the lethal guardrail that acts on them — was not
-  exercised live. `falls_in_gap` and `reaches_goal` have synthetic unit coverage only; the flag was
-  never reached.
+* **No death occurred *in the two runs tabulated in the results section*.** Lives stayed at 2 for all
+  900 frames and neither episode terminated, so the death path — `falls_in_gap`, `hits_enemy`, and the
+  lethal guardrail that acts on them — was not exercised in those runs. **The later ratchet run ended
+  early, probably by death** (see §5), so the path was very likely exercised live exactly once — and
+  the journal cannot say so, because the termination is recorded nowhere. `falls_in_gap` and
+  `reaches_goal` still have synthetic unit coverage only; no run reached the flag.
 * **The horizon is a sample, never a constant.** Per-frame rollout cost ranged 0.645–2.349 ms within
   a single process in earlier measurements, and the cost model ratchets one way, so the horizons
   above (14 → 8, and 6 under pacing) are what happened on this machine under this load.
@@ -270,8 +329,16 @@ In the order I would act on them, each with the evidence above:
 4. ~~**Give the agent a way out of a blind rollout.**~~ **Fixed and measured end to end** — see §3. A
    measured stall (30 frames without `x_max` advancing) escalates the horizon to 24, and the agent now
    reaches `x_max` **1363** instead of 724, still moving at the end of the run. The escalation fires
-   101 times and is recorded on every one of those ticks. **The ratchet that caused the stall is
-   untouched** — relaxing the cost model so a transient stall does not permanently shrink the horizon
-   is still open, and is the real repair.
-5. **Fix the pacer's own rate.** 28.12 ms per step against a configured 16.67 ms is **1.69×** the
+   101 times and is recorded on every one of those ticks.
+5. ~~**Relax the cost model.**~~ **Fixed and measured end to end** — see §3. A fitting sweep now
+   relaxes the remembered cost one `COST_RECOVERY` step toward what it measured, with only an overrun
+   able to raise it. `per_frame_ms` tracks the machine instead of pinning at its worst value, the
+   horizon goes from 6 to 8–24, the escalation falls from 101 uses to 46, and `x_max` reaches
+   **1438**.
+6. **Record why a run stopped.** A run that ended after 805 of its 900 ticks records no reason:
+   the termination signal is discarded, the final record's `state` is the pre-step world, and
+   `RunSummary` has no termination field. The journal therefore cannot distinguish a death from
+   reaching the flag from a manual stop, and it cannot even settle *that* a death occurred. **Open,
+   and new** — see §5.
+7. **Fix the pacer's own rate.** 28.12 ms per step against a configured 16.67 ms is **1.69×** the
    configured period. **Still open.**

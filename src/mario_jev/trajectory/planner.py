@@ -15,10 +15,15 @@ plausible.
 The cost of the sweep is measured, not assumed, but it is measured *once*: the
 first :meth:`TrajectoryPlanner.plan` on an instance calibrates the machine, and
 every later call reuses that measurement to pick a horizon without paying for a
-calibration pass it does not need. The remembered measurement is not sticky — a
-sweep that overruns the budget runs the bounded correction pass and the fresh
-measurement replaces the remembered one, so the model can only ever be corrected
-towards the machine's real behaviour.
+calibration pass it does not need. The remembered measurement is not stuck high
+— a sweep that overruns the budget runs the bounded correction pass and the
+fresh measurement replaces the remembered one, and a sweep that fits *and
+measures lower* relaxes the remembered one one :data:`COST_RECOVERY` step back
+towards what it just measured. A fitting sweep that measures *higher* leaves the
+memory exactly where it was: raising the model belongs to the overrun path
+alone. A single slow moment therefore cannot hold the horizon down once sweeps
+start measuring lower again — but it does hold it for as long as they do not,
+and each of those sweeps leaves it untouched.
 
 Four measured behaviours shape this module, and each one has a test:
 
@@ -88,6 +93,31 @@ MAX_SWEEP_PASSES: int = 2
 #: not moved Mario yet, which is why a shorter horizon cannot see it.
 STALL_MIN_HORIZON: int = 24
 
+#: How much of the remembered per-frame cost survives one sweep that *fitted* the
+#: budget. The problem is measured; this value is chosen. In the two recorded
+#: 900-tick runs the memory only ever went up and stayed there: ``eval-after4``
+#: climbed 0.6896 -> 0.855 -> 1.71 -> 1.9 -> 2.1375 -> 2.4429 and then sat at its
+#: maximum of 2.9191 ms for 796 of its 900 ticks, and ``eval-1-1`` climbed
+#: 0.693 -> 1.1954 -> 1.3946 -> 1.5214 -> 1.8595 and sat at its maximum of
+#: 2.0919 ms for 734 of its 900. The same journals' own ``elapsed_ms /
+#: steps_taken`` puts the machine's real cost at a p50 of 1.3048 and 1.2408 ms, so
+#: the two memories ended at 2.24x and 1.69x the truth — two different ratios, not
+#: one shared one. At the 120 ms budget over 7 candidates those memories bought
+#: the horizons the journals actually record, 6 and 8 frames, where the real p50
+#: pays for 13: the recorded runs planned 54% and 38% shorter than the machine
+#: could afford.
+#:
+#: 0.97 itself is *chosen*, and chosen for its recovery *time* rather than for
+#: smoothness — no journal contains it. What is derived from it are the tick
+#: counts: undoing ``eval-after4``'s inflation takes
+#: ``ceil(log(1.3048 / 2.9191) / log(0.97))`` = 27 fitting ticks, and
+#: ``eval-1-1``'s takes 18 — the same order as the loop's own
+#: ``STALL_FRAMES = 30``. That is what the choice buys: the horizon recovers by
+#: itself in about the time it takes a stall to even be declared, so the stall
+#: escalation stays the exception rather than becoming the mechanism that keeps
+#: the agent able to see.
+COST_RECOVERY: float = 0.97
+
 #: The hard cap on an escalated horizon: a stall may buy more frames than the
 #: budget chose, but never more than this. Escalation is an admission that the
 #: budget bought blindness, not a licence to plan without one. It bounds only the
@@ -100,13 +130,18 @@ class CostSource(StrEnum):
     """Where the cost model that sized one sweep came from.
 
     A closed two-value set, because the journal has to record a fact rather than
-    an inference: either this call measured the machine itself, or it reused the
-    measurement its predecessor on the same planner left behind.
+    an inference: either this call ran the calibration pass itself, or it sized
+    itself from the model its predecessor on the same planner left behind.
     """
 
     #: This call ran the calibration pass and sized the sweep from it.
     CALIBRATED = "calibrated"
-    #: This call skipped the calibration pass and reused the remembered cost.
+    #: This call skipped the calibration pass and sized the sweep from the model
+    #: the previous call left behind. That model is carried *and corrected*, never
+    #: frozen: an overrun replaces it with the fresh measurement, and every sweep
+    #: that fits *and measures lower* relaxes it one :data:`COST_RECOVERY` step
+    #: back towards what that sweep measured. "Reused" means "not calibrated on
+    #: this call", not "the same numbers as last time".
     REUSED = "reused"
 
 
@@ -291,8 +326,10 @@ class RolloutTable:
     calibration_frames: int
     #: 1 normally; 2 when the measured sweep forced a smaller horizon.
     passes: int
-    #: Whether the cost model above was measured on this call or remembered from
-    #: the previous one on the same planner instance. Recorded, never inferred.
+    #: Whether the cost model above was calibrated on this call or inherited from
+    #: the previous one on the same planner instance — inherited as the previous
+    #: call left it, which is after that call's own overrun correction or fitting
+    #: relaxation. Recorded, never inferred.
     cost_source: CostSource
     #: Total emulator steps issued by the whole ``plan()`` call. The frame counter
     #: moves by exactly this much.
@@ -540,6 +577,23 @@ class TrajectoryPlanner:
                         refuted_horizon=tighter,
                         base_ms=cost.base_ms,
                     )
+            elif sweep_ms <= self._budget_ms:
+                # The fitting path's only lowering step -- and deliberately not
+                # described as the model's only one: an overrun at a long horizon
+                # can measure a lower per-frame cost than the model remembers and
+                # lower it too, so "lowering" is not exclusive to this branch. What
+                # this branch adds is a lowering step on a sweep that *fitted*, and
+                # only when the cost it demonstrated is below the one already
+                # remembered. Deliberately an `elif` on the overrun branch rather than
+                # a second look at `sweep_ms`: a corrected second pass is structurally
+                # unable to reach here at all, whether or not it ends up fitting, and
+                # letting it relax would hand back the frames the overrun just refused.
+                self._remembered = self._relax_towards_measurement(
+                    sweep_ms=sweep_ms,
+                    horizon=horizon,
+                    base_ms=cost.base_ms,
+                    remembered=cost,
+                )
 
         # Put the emulator back exactly where it was found. The frame counter is
         # deliberately *not* rewound: `load_state` does not rewind it, and a
@@ -590,6 +644,56 @@ class TrajectoryPlanner:
         if per_candidate_ms > base_ms:
             per_frame = max(per_frame, (per_candidate_ms - base_ms) / refuted_horizon)
         return _CostModel(base_ms=base_ms, per_frame_ms=per_frame)
+
+    def _relax_towards_measurement(
+        self,
+        *,
+        sweep_ms: float,
+        horizon: int,
+        base_ms: float,
+        remembered: _CostModel,
+    ) -> _CostModel:
+        """The cost model a sweep that *fitted* the budget leaves behind.
+
+        Symmetric to :meth:`_learn_from_overrun`, and deliberately slower than it:
+        an overrun is a refutation and is applied in one step, while a sweep that
+        fitted proves only that this one tick was cheap. When that measurement
+        comes in *below* the memory, the memory moves at most one
+        :data:`COST_RECOVERY` step towards it, and lands exactly *on* it when the
+        measurement is already within that step — the two are the same case only
+        when the memory is far from reality, so "at most one step" is the honest
+        bound and "not a jump" is not.
+
+        One rule, carried out with the same pure helper the overrun path uses so
+        the arithmetic cannot fork: **relaxation only ever lowers or holds.** The
+        remembered value is a ceiling, because raising the model belongs to the
+        overrun path alone — which is why a measurement *above* the remembered
+        cost leaves the model untouched rather than pushing it up on a sweep that
+        fitted the budget. In that case the model deliberately ends up *below*
+        the cost this sweep measured.
+
+        Inside that rule, and only while the model is relaxing downward, the
+        measurement is the floor the fall stops at: the model does not slide past
+        the per-frame cost this sweep just demonstrated, so one lucky tick cannot
+        model a genuinely slower machine as fast. That floor describes the
+        downward case alone; it is not a claim about where the model ends up when
+        the measurement comes in high.
+
+        The fixed term is carried over rather than re-derived, for the reason
+        :func:`remeasured_per_frame_ms` already gives: one sweep cannot separate
+        ``base`` from ``per_frame``.
+        """
+        measured = remeasured_per_frame_ms(
+            sweep_ms=sweep_ms,
+            horizon=horizon,
+            candidate_count=len(self._actions),
+            base_ms=base_ms,
+        )
+        per_frame = max(measured, remembered.per_frame_ms * COST_RECOVERY)
+        return _CostModel(
+            base_ms=base_ms,
+            per_frame_ms=min(remembered.per_frame_ms, per_frame),
+        )
 
     def _calibrate(self, emulator: MarioEmulator, snapshot: object) -> _Calibration:
         """Measure what a savestate load and a candidate frame cost on this machine.
@@ -726,6 +830,7 @@ class TrajectoryPlanner:
 __all__ = [
     "CALIBRATION_LOADS",
     "CALIBRATION_STEADY_STEPS",
+    "COST_RECOVERY",
     "MAX_SWEEP_PASSES",
     "MIN_PER_FRAME_MS",
     "STALL_MAX_HORIZON",

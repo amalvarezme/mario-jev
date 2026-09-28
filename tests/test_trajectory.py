@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import math
 from pathlib import Path
 
 import numpy as np
@@ -49,8 +50,12 @@ from mario_jev.trajectory import (
     risk_cost,
 )
 # The exact payload ``_calibrate`` returns, imported so a test can inject a cost
-# model the way the planner consumes one instead of making the machine lie.
+# model the way the planner consumes one instead of making the machine lie. The
+# module itself is imported too, so the recovery test can replace the pure helper
+# where the planner looks it up and prove the relaxation really calls it.
+from mario_jev.trajectory import planner as planner_module
 from mario_jev.trajectory.planner import (
+    COST_RECOVERY,
     STALL_MAX_HORIZON,
     STALL_MIN_HORIZON,
     _Calibration,
@@ -620,12 +625,22 @@ def test_the_first_plan_calibrates_and_the_second_reuses_that_measurement(
     assert first.cost_source is CostSource.CALIBRATED
     assert first.calibration_frames == CALIBRATION_LOADS * (1 + CALIBRATION_STEADY_STEPS)
 
-    # The second call skipped it: no calibration frames, the same measured cost,
-    # and the honest source value rather than an inference.
+    # The second call skipped it: no calibration frames, the cost model the first
+    # call left behind, and the honest source value rather than an inference.
     assert second.cost_source is CostSource.REUSED
     assert second.calibration_frames == 0
     assert second.base_ms == first.base_ms
-    assert second.per_frame_ms == first.per_frame_ms
+    # Not necessarily the same number, and deliberately so: a reused model is
+    # carried *and* relaxed one COST_RECOVERY step towards what the sweep measured
+    # on every sweep that fits the budget, which the first call's sweep did. It can
+    # only ever be lower, never higher — raising belongs to the overrun path.
+    # "Reused" records that this call did not calibrate, not that the numbers are
+    # frozen, which is why the source is recorded rather than inferred from them.
+    assert (
+        first.per_frame_ms * COST_RECOVERY
+        <= second.per_frame_ms
+        <= first.per_frame_ms
+    )
     assert second.horizon == first.horizon == 10
 
     # The frame counter moves by exactly the sweep steps, so nothing was measured
@@ -703,11 +718,21 @@ def test_a_horizon_that_overran_the_budget_is_not_sticky(
     assert after.cost_source is CostSource.REUSED
     assert after.horizon <= overran.horizon
 
-    # And it stays bounded on later calls rather than drifting back up.
-    for _ in range(3):
+    # And it stays bounded on later calls rather than jumping back to a cost the
+    # machine already contradicted. Bounded is not frozen: every sweep that fits
+    # relaxes the model one COST_RECOVERY step back towards what that sweep just
+    # measured, so the horizon does recover — at a rate, never in a jump. The
+    # bound below *is* that rate: after k relaxations the model is still at least
+    # COST_RECOVERY**k of the one the overrun left behind (raising can only push
+    # it back up), so the frames it buys are at most that much more than the
+    # corrected call itself chose. The 48 the machine refused stay out of reach.
+    for relaxations in range(1, 4):
         later = planner.plan(emulator)
         assert later.cost_source is CostSource.REUSED
-        assert later.horizon <= overran.horizon
+        assert later.horizon < 48
+        assert later.horizon <= math.floor(
+            (after.horizon + 1) / COST_RECOVERY**relaxations
+        )
 
 
 def test_steady_state_reuses_the_cost_and_keeps_each_sweep_inside_the_budget(
@@ -1013,3 +1038,272 @@ def test_the_escalated_plan_sees_the_escape_the_recorded_run_was_blind_to(
         f"{sorted({c.risk for c in escalated.candidates})} against {sorted(blind_risks)}"
     )
     assert escalated.best.dx > 0
+
+
+# -- the cost model recovers ---------------------------------------------------------
+#
+# The defect these tests describe is measured, and it is measured in the runs'
+# own journals. The remembered cost only ever went up: ``eval-after4`` climbed
+# 0.6896 -> 0.855 -> 1.71 and settled at its maximum of 2.9191 ms/frame for the
+# rest of its 900 ticks, ``eval-1-1`` climbed 0.693 -> 1.1954 and settled at
+# 2.0919, and both spent 899 of 900 ticks on a reused model. The same journals'
+# ``elapsed_ms / steps_taken`` puts the machine's real cost at a p50 of 1.3048
+# and 1.2408 ms, so the memory sat at about 2.2x the truth. At 120 ms over 7
+# candidates that is a horizon of 6 and 7 frames where the real cost pays for 13:
+# the run was blind by budget, and the budget was set by a worst moment it never
+# recovered from.
+
+
+#: The recorded inflation, and the machine under it. Taken from ``eval-after4``'s
+#: last tick (``base_ms`` 0.0428, ``per_frame_ms`` 2.9191) and from that same
+#: journal's median ``elapsed_ms / steps_taken``.
+INFLATED_PER_FRAME_MS = 2.9191
+RECORDED_BASE_MS = 0.0428
+REAL_PER_FRAME_MS = 1.3048
+#: Measured from the trace below: 27 fitting ticks to undo the recorded
+#: inflation, which is the number ``COST_RECOVERY``'s docstring justifies itself
+#: with and the same order as the loop's own ``STALL_FRAMES = 30``.
+RECOVERY_TICKS = 27
+
+
+def _injected_calibration(
+    monkeypatch: pytest.MonkeyPatch, *, per_frame_ms: float, base_ms: float
+) -> None:
+    """Start the planner from a chosen cost model instead of from this machine."""
+    injected = _Calibration(base_ms=base_ms, per_frame_ms=per_frame_ms, frames=0)
+    monkeypatch.setattr(
+        TrajectoryPlanner, "_calibrate", lambda self, emulator, snapshot: injected
+    )
+
+
+def _simulated_machine(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    per_frame_ms: float,
+    base_ms: float,
+    candidate_count: int = 7,
+) -> None:
+    """Make the sweep's *cost* arithmetic instead of wall clock.
+
+    Everything else in ``plan()`` still runs against the real emulator: the
+    savestate is dumped and restored, the horizon is chosen from the remembered
+    model, the correction pass fires or does not, and the table is built. Only
+    the cost of the rollouts is simulated, and deliberately: a recovery trace
+    measured against this machine's load at this instant would be a different
+    trace on every run and would therefore pin nothing.
+    """
+
+    def sweep(self, emulator, snapshot, horizon):  # type: ignore[no-untyped-def]
+        sweep_ms = candidate_count * (base_ms + horizon * per_frame_ms)
+        return sweep_ms, (), candidate_count * horizon
+
+    monkeypatch.setattr(TrajectoryPlanner, "_sweep", sweep)
+
+
+def _recovery_trace(
+    emulator: MarioEmulator, monkeypatch: pytest.MonkeyPatch, *, ticks: int
+) -> list[tuple[float, int]]:
+    """The recorded inflation, put on a machine that really costs 1.3048 ms/frame."""
+    _injected_calibration(
+        monkeypatch, per_frame_ms=INFLATED_PER_FRAME_MS, base_ms=RECORDED_BASE_MS
+    )
+    _simulated_machine(
+        monkeypatch, per_frame_ms=REAL_PER_FRAME_MS, base_ms=RECORDED_BASE_MS
+    )
+    planner = TrajectoryPlanner(budget_ms=120.0, min_frames=6, max_frames=48)
+    tables = [planner.plan(emulator) for _ in range(ticks)]
+    # Nothing here may overrun: this is the fitting path, and the correction pass
+    # firing would mean the trace below is about the wrong mechanism.
+    assert all(table.passes == 1 for table in tables)
+    assert all(table.sweep_ms <= planner.budget_ms for table in tables)
+    return [(table.per_frame_ms, table.horizon) for table in tables]
+
+
+def test_a_fitting_sweep_pulls_the_remembered_cost_back_down(
+    emulator: MarioEmulator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trace = [per_frame for per_frame, _ in _recovery_trace(emulator, monkeypatch, ticks=40)]
+
+    # The first tick is sized by the model it inherited: the recorded inflation.
+    assert trace[0] == pytest.approx(INFLATED_PER_FRAME_MS)
+    # The second is exactly one COST_RECOVERY step below it, so the relaxation is
+    # the rate the constant names rather than some other rate that also falls.
+    assert trace[1] == pytest.approx(INFLATED_PER_FRAME_MS * COST_RECOVERY)
+    # It falls, tick after tick, and it stops at what the machine really costs.
+    assert all(later <= earlier for earlier, later in zip(trace, trace[1:]))
+    assert trace[-1] == pytest.approx(REAL_PER_FRAME_MS)
+    reached = next(
+        index
+        for index, value in enumerate(trace)
+        if value == pytest.approx(REAL_PER_FRAME_MS)
+    )
+    assert reached == RECOVERY_TICKS
+    # The floor is the measurement, so the recovery stops at the machine and does
+    # not carry on past it into a model that would overrun on the next tick.
+    assert min(trace) == pytest.approx(REAL_PER_FRAME_MS)
+
+
+def test_a_fitting_sweep_whose_measurement_is_higher_leaves_the_memory_alone(
+    emulator: MarioEmulator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Remembered 1.0 ms/frame on a machine that really costs 3.0, with a budget
+    # large enough that the slow sweep still fits inside it. The relaxation sees a
+    # measurement *above* the memory, and raising is not its job: the overrun path
+    # owns that, and it cannot fire here because nothing overran.
+    _injected_calibration(monkeypatch, per_frame_ms=1.0, base_ms=0.0)
+    _simulated_machine(monkeypatch, per_frame_ms=3.0, base_ms=0.0)
+    planner = TrajectoryPlanner(budget_ms=5000.0, min_frames=8, max_frames=8)
+
+    tables = [planner.plan(emulator) for _ in range(5)]
+
+    assert all(table.sweep_ms <= planner.budget_ms for table in tables)  # all fitted
+    assert all(table.passes == 1 for table in tables)  # so no correction ran
+    assert [table.per_frame_ms for table in tables] == [1.0] * 5
+    assert planner._remembered is not None
+    assert planner._remembered.per_frame_ms == 1.0
+    assert planner._remembered.base_ms == 0.0
+
+
+def test_the_relaxed_cost_converges_instead_of_drifting(
+    emulator: MarioEmulator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trace = _recovery_trace(emulator, monkeypatch, ticks=60)
+    costs = [per_frame for per_frame, _ in trace]
+    horizons = [horizon for _, horizon in trace]
+
+    steps = [earlier - later for earlier, later in zip(costs, costs[1:])]
+    # Every step is a fall, and each one is smaller than the last: the change is a
+    # fraction of a value that is itself shrinking, so it cannot oscillate.
+    assert all(step >= 0.0 for step in steps)
+    assert all(
+        later <= earlier + 1e-12 for earlier, later in zip(steps, steps[1:])
+    )
+    # And it is a fixed point, not a slow drift: the tail has zero total variation
+    # in both the cost and the horizon it buys.
+    tail = costs[RECOVERY_TICKS:]
+    assert sum(abs(later - earlier) for earlier, later in zip(tail, tail[1:])) == 0.0
+    assert len(set(horizons[RECOVERY_TICKS:])) == 1
+
+
+def test_an_overrun_raises_the_memory_before_any_relaxation_can_lower_it(
+    emulator: MarioEmulator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A model that claims a frame costs microseconds, on the machine the journals
+    # measured. The planner takes the maximum horizon, the sweep overruns, and the
+    # correction pass raises the memory in one step -- before any fitting sweep
+    # gets the chance to relax it.
+    _injected_calibration(
+        monkeypatch, per_frame_ms=MIN_PER_FRAME_MS, base_ms=RECORDED_BASE_MS
+    )
+    _simulated_machine(
+        monkeypatch, per_frame_ms=REAL_PER_FRAME_MS, base_ms=RECORDED_BASE_MS
+    )
+    planner = TrajectoryPlanner(budget_ms=120.0, min_frames=6, max_frames=48)
+
+    overran = planner.plan(emulator)
+
+    assert overran.passes == MAX_SWEEP_PASSES == 2
+    assert overran.horizon == 13  # 48 frames refuted, 13 is what the budget fits
+    assert overran.per_frame_ms == MIN_PER_FRAME_MS  # the model that sized it
+    assert planner._remembered is not None
+    raised = planner._remembered.per_frame_ms
+    # The raise happened, and the refuted_horizon floor still bites: the model is
+    # left slightly *above* the cost the sweep measured, which is what stops a
+    # rounding error handing back the 48 frames the machine just refused.
+    assert raised > MIN_PER_FRAME_MS
+    assert raised == pytest.approx((120.0 / 7 - RECORDED_BASE_MS) / 13)
+    assert raised > REAL_PER_FRAME_MS
+
+    # Only now may the fitting sweeps lower it, and only as far as the machine.
+    after = [planner.plan(emulator) for _ in range(5)]
+
+    assert all(table.passes == 1 for table in after)
+    assert after[0].per_frame_ms == pytest.approx(raised)  # sized by the raise
+    assert planner._remembered.per_frame_ms == pytest.approx(REAL_PER_FRAME_MS)
+    assert planner._remembered.per_frame_ms < raised  # the fall came after it
+    # The horizon the machine refused is not handed back by the recovery.
+    assert all(table.horizon <= overran.horizon for table in after)
+
+
+def test_the_relaxation_calls_the_pure_helper_rather_than_re_implementing_it(
+    emulator: MarioEmulator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A sentinel between one COST_RECOVERY step (2.8315) and the remembered value
+    # (2.9191), so the relaxation cannot produce it by accident: if a future edit
+    # forks the arithmetic instead of calling the pure helper, this number cannot
+    # come out.
+    sentinel_ms = 2.9
+    assert INFLATED_PER_FRAME_MS * COST_RECOVERY < sentinel_ms < INFLATED_PER_FRAME_MS
+    calls: list[dict[str, float | int]] = []
+
+    def sentinel(
+        *, sweep_ms: float, horizon: int, candidate_count: int, base_ms: float
+    ) -> float:
+        calls.append(
+            {
+                "sweep_ms": sweep_ms,
+                "horizon": horizon,
+                "candidate_count": candidate_count,
+                "base_ms": base_ms,
+            }
+        )
+        return sentinel_ms
+
+    _injected_calibration(
+        monkeypatch, per_frame_ms=INFLATED_PER_FRAME_MS, base_ms=RECORDED_BASE_MS
+    )
+    _simulated_machine(
+        monkeypatch, per_frame_ms=REAL_PER_FRAME_MS, base_ms=RECORDED_BASE_MS
+    )
+    monkeypatch.setattr(planner_module, "remeasured_per_frame_ms", sentinel)
+    planner = TrajectoryPlanner(budget_ms=120.0, min_frames=6, max_frames=48)
+
+    first = planner.plan(emulator)
+    second = planner.plan(emulator)
+
+    # The helper is what the relaxation calls — once per fitting sweep, with the
+    # sweep that just ran and the fixed term carried in rather than re-derived.
+    assert len(calls) == 2
+    assert calls[0] == {
+        "sweep_ms": 7 * (RECORDED_BASE_MS + first.horizon * REAL_PER_FRAME_MS),
+        "horizon": first.horizon,
+        "candidate_count": 7,
+        "base_ms": RECORDED_BASE_MS,
+    }
+    # And its answer is what the memory became, rather than the value the real
+    # arithmetic would have produced from the same sweep.
+    assert second.per_frame_ms == pytest.approx(sentinel_ms)
+    assert second.per_frame_ms != pytest.approx(INFLATED_PER_FRAME_MS * COST_RECOVERY)
+    # The fixed term is carried over, never re-derived from the one sweep.
+    assert second.base_ms == RECORDED_BASE_MS
+
+
+def test_the_recovered_horizon_climbs_back_towards_what_the_real_cost_pays_for(
+    emulator: MarioEmulator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The consequence the whole change exists for, in the units the run was blind
+    # in. At 120 ms over 7 candidates the recorded inflation buys 6 frames and the
+    # machine's real cost buys 13 -- the ~40% of horizon the run never got back.
+    def implied(per_frame_ms: float) -> int:
+        return choose_horizon(
+            budget_ms=120.0,
+            candidate_count=7,
+            base_ms=RECORDED_BASE_MS,
+            per_frame_ms=per_frame_ms,
+            min_frames=6,
+            max_frames=48,
+        )
+
+    assert implied(INFLATED_PER_FRAME_MS) == 6
+    assert implied(REAL_PER_FRAME_MS) == 13
+
+    horizons = [horizon for _, horizon in _recovery_trace(emulator, monkeypatch, ticks=40)]
+
+    assert horizons[0] == 6
+    assert horizons[-1] == 13
+    assert all(later >= earlier for earlier, later in zip(horizons, horizons[1:]))
+    assert horizons.index(13) == RECOVERY_TICKS
+    # Pinned rather than described: this is the measured climb, tick by tick.
+    assert horizons[:28] == (
+        [6] * 6 + [7] * 5 + [8] * 4 + [9] * 3 + [10] * 3 + [11] * 3 + [12] * 3 + [13]
+    )
