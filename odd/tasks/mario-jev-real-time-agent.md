@@ -357,15 +357,21 @@ is not reviewable.
    default and paces to 60 fps, which would silently make every timing assertion meaningless.
 
 ### WU4 — Jev decision layer, PlayJev advisor, execution policy
-- [ ] 4.1 `src/mario_jev/jev/` — real HTTP client for `POST /v1/systemone`: one request carrying
+- [x] 4.1 `src/mario_jev/jev/` — real HTTP client for `POST /v1/systemone`: one request carrying
       the tick's parallel questions (`best_action` choice, `risk` score, `lethal_ahead` noul,
       `gap_severity` score), typed response validation against the documented shape,
       exponential backoff on 429/529, and hard failure on 401/422.
+      **Landed `f537f9d`** after one corrective round: 192 tests, 0 xfails, and the live test
+      passing against the real API with the tightened parser. Two independent verifications; the
+      second could not falsify the fix. See "WU4 slice A — independent verification verdict" and
+      "corrective round" below.
 - [ ] 4.2 Deterministic fallback policy used when the key is absent, the call fails, or
       confidence is below threshold — so the loop always has a safe action.
-- [ ] 4.3 `src/mario_jev/advisor/` — optional PlayJev-0.8B advisor, lazily loaded, that
+- [x] 4.3 `src/mario_jev/advisor/` — optional PlayJev-0.8B advisor, lazily loaded, that
       contributes its move distribution as a state feature and **degrades to absent** when torch
       or the weights are unavailable. Never on the critical path.
+      **Implemented and verified; four writer rounds, five independent verifications.** See
+      "WU4 slice B — verification record" below for what the rounds found and what stayed open.
 - [ ] 4.4 `src/mario_jev/policy/` — cadence (K frames), confidence threshold, safety guardrails,
       degradation recording, and the execution loop.
 - [ ] 4.5 Tests: mocked Jev transport (deterministic), live test gated on `JEV_API_KEY`,
@@ -532,7 +538,9 @@ JevClient.from_settings(settings, *, transport=None, sleeper=None)
 AdvisorMove(name, probability)
 AdvisorAdvice(model_id, backend, moves, top, latency_ms)
 AdvisorAbsence(model_id, reason)   # "disabled"|"torch_missing"|"transformers_missing"|
-                                   # "weights_missing"|"load_failed"
+                                   # "weights_missing"|"load_failed"|"no_matching_moves"
+LoadedAdvisor(backend, predict)    # what a successful load yields
+AdvisorLoadError(reason)           # raised by the default loader; reason from the same set
 PlayJevAdvisor.from_settings(settings, *, loader=None)
 .available -> bool
 .absence -> AdvisorAbsence | None
@@ -545,6 +553,90 @@ recorded `AdvisorAbsence` and returns `None`. The policy touches it only when
 `settings.advisor_enabled`, so it is never on the critical path. The `loader` seam lets both the
 present and the absent path be tested **with no weights and no 2.2 GB download**, and the absent
 path is additionally tested for real because torch genuinely is not installed here.
+
+**Pinned here rather than left to the writer** — the original contract omitted three decisions, and
+each one would otherwise have been invented silently:
+
+1. **The load seam.** `loader: Callable[[str], LoadedAdvisor]`, default is the real one. A successful
+   load yields `LoadedAdvisor(backend: str, predict: Callable[[object], Mapping[str, float]])`, where
+   `predict` returns probabilities over the *model's own* move vocabulary — it is not given the
+   action names, so alignment is testable on its own. The default loader raises
+   `AdvisorLoadError(reason)` with a reason drawn from the closed set, which is what makes the
+   absent path structural instead of conventional.
+2. **Alignment and renormalisation.** `advise(frame, action_names)` reports probabilities **over
+   `action_names` only**: moves whose name is not offered are dropped, and the surviving
+   probabilities are renormalised to sum to 1. `top` is the single highest-probability
+   `AdvisorMove`, ties broken by name so the result is deterministic. `moves` is every surviving
+   move in descending probability order.
+3. **A degenerate distribution has an honest name.** If the model offers no move that matches any
+   offered name, `advise` returns `None` and records `"no_matching_moves"` — a sixth reason, added
+   because mapping that case onto `"load_failed"` would be a lie in the journal. The same applies
+   to a non-finite or non-positive probability mass: that is a backend failure, recorded as
+   `"load_failed"`.
+
+`AdvisorAbsence` is `None` while the advisor is usable, and records the first failure that made it
+unusable. The advisor contributes its distribution as a **state feature**; it is never the
+authority, and the policy must be able to run with it absent.
+
+#### WU4 slice B — verification record (2026-09-28)
+
+Four writer rounds and five independent verifications. Recorded because the *distribution* of what
+was found is the useful part, and because the earlier "this is the final round" claims in this
+session were wrong twice.
+
+**What the verifications found, by kind.** Five **behaviour** findings: the frame gate coerced
+dimensions with `int(size)` so `shape=("240","256","3")` passed as a real frame; `float(True)`
+returned a 1.0 "probability"; `AdvisorAbsence` did not enforce its own closed reason set;
+`AdvisorLoadError.reason` was writable after construction; and two **guard-asymmetry escapes** in
+`from_settings`/`advise` — the first being the blocking one. Eight **testimony** findings: a
+docstring claiming every asset disagreement "is absorbed and never reaches the loop" (false — only
+disagreements that *raise* are absorbed, and a runnable-but-wrong reading produces valid-looking
+advice), the same present-tense claim about a consumer left in the sibling file after being fixed in
+the other, a bare "never raises" that `BaseException` falsifies, a design intent written as wired
+behaviour, a test name promising a mechanism its body never observed, a parametrised case that
+could not discriminate its own fix, a duplicate test, and a title phrase.
+
+**The blocking finding, and why it matters more than its size.** `_reported_reason` guarded the
+*read* of the reason but returned the **caller's object**, which was then re-tested outside the
+guard — a `str` subclass passing membership once and raising on the second test escaped both
+`from_settings` and `advise`, because a raise in a handler *body* cannot be caught by a sibling
+`except`. **The parent's own verification of that round had passed while the defect was present.**
+The fix is an invariant rather than a guard: nothing leaving the reason helpers may be the caller's
+object — it is always one of the module's own plain-`str` constants, enforced once in
+`_canonical_reason` and verified **by identity** (`is REASON_*`), not by equality with a literal.
+
+**Two lessons that changed how this session works.** (1) *Behaviour findings are caught by tests;
+testimony findings cannot be* — no test reads a docstring, so all eight would have shipped as
+confident lies, and the only instrument that catches them is an independent reader. (2) *A kill-test
+is worthless unless the mutation faithfully reproduces the pre-fix code path.* The parent produced
+three non-faithful or non-discriminating mutations in this slice — the membership left inside the
+`try` so its own `except` absorbed the second collision; a hostile object the gate rejected before
+the route under test; a `return` searched at 8 spaces of indentation when it sits at 12, so the
+mutation silently did not apply and the "kill" passed green. All three looked like verdicts. The
+final verifier was therefore instructed to write its own mutation **and assert it had applied**
+before running anything, which it did.
+
+**Accepted residuals, recorded rather than fixed** (all classified by the verifier as boundary or
+nit, none affecting the loop):
+
+* **Boundary — private state.** `_absence`, `_reason` and `_canonical_reason`'s inputs are reachable
+  by in-process code, the same rule already accepted for slice A's `_authorization._value`. A
+  directly-constructed `AdvisorAbsence(model_id, hostile_value)` is the caller's own input, like
+  `AdvisorLoadError(...)` refusing at construction. No public or rendered path reaches either.
+* **Boundary — `settings` reads.** `from_settings` reads `settings.advisor_enabled`/`advisor_model_id`
+  outside every `try`, so a hostile `Settings` escapes. Caller-owned configuration, outside the load
+  seam that the fail-closed claim covers.
+* **Nit — the suite asserts reason equality and `type is str`, not `is`-identity with the module
+  constants.** Identity was proven by a probe in the verifying round, not pinned by a test.
+* **Nit — of the two seam-guard tests, only one is mutation-detecting**; the `BaseException`
+  propagation test passes under the mutation too, which is inherent to what it asserts.
+* **Nit — `isinstance(loaded, LoadedAdvisor)` implicitly reads `loaded.__class__` and can raise.**
+  Correctly covered by the guard, but the read is implicit rather than documented.
+* **Unverified, and disclosed in the code itself** — the real Hugging Face load and inference path
+  (`default_loader` → `_load_snapshot` → `_make_predict` → `_move_vocabulary`/`_label_token_ids`).
+  The 2.2 GB weights are deliberately absent, no test fakes it, and the module says so. The
+  load-time failure path *is* real: a missing local snapshot raises `weights_missing` **before any
+  import**, verified on this machine where `torch` is genuinely absent.
 
 **C — `src/mario_jev/policy/`**
 
