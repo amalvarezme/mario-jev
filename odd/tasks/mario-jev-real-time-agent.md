@@ -371,6 +371,235 @@ is not reviewable.
 - [ ] 4.5 Tests: mocked Jev transport (deterministic), live test gated on `JEV_API_KEY`,
       policy tests for threshold/fallback/cadence behaviour, advisor test that skips honestly.
 
+#### WU4 contract — decided here, not open to the writer
+
+WU4 lands in **three independently verified slices**, one commit each, because the three pieces
+have different failure modes and a single 1500-line change would not be reviewable:
+**A** `jev/` (the network boundary), **B** `advisor/` (an optional input that must never break
+the loop), **C** `policy/` (the decision that ties them together).
+
+**A — `src/mario_jev/jev/`**
+
+Error taxonomy, all subclassing `JevError`. No exception message may contain the key.
+
+| Exception | Trigger | Retried |
+|---|---|---|
+| `JevAuthError` | 401 or 403 | never |
+| `JevRequestError` | 422, and other non-retryable 4xx | never |
+| `JevProtocolError` | 2xx whose body violates the documented shape | never |
+| `JevUnavailable` | retries exhausted on 429/529/5xx/timeout/transport error | yes, then raised |
+
+The transport is a seam, so every branch is testable with no network:
+
+```python
+@dataclass(frozen=True, slots=True)
+class HttpResult:
+    status: int
+    body: str
+    elapsed_ms: float
+    error: str | None = None   # transport failure: timeout, DNS, refused
+```
+
+`transport(request: JevRequest) -> HttpResult`, with `JevRequest(url, headers, json_body,
+            timeout_s)`. The default transport uses `requests`; `sleeper` is injectable (default
+`time.sleep`) so backoff tests never sleep for real.
+
+Retry only when `HttpResult.error is not None` or status is in `{429, 500, 502, 503, 504, 529}`
+(exposed as `RETRYABLE_STATUSES`). Backoff `min(BACKOFF_BASE_S * 2**attempt, BACKOFF_CAP_S)`, up to
+`max_attempts`. **401/403/422 are never retried.**
+
+Headers: `Authorization: Bearer <key>`, `Content-Type: application/json`, and a realistic
+`User-Agent` from the module constant `USER_AGENT` — without one Cloudflare answers 403 with
+`error code: 1010` before the request reaches Jev.
+
+*Key-containment invariant, tested:* the key string never appears in `repr()` of any request,
+response or exception, nor in any `.as_dict()`. `Authorization` renders as `"Bearer <redacted>"`.
+
+**As landed, the invariant was made structural rather than conventional.** Verification found one
+path the contract did not cover: `dataclasses.asdict(request)` copies a field value verbatim, so a
+plain-string `Authorization` header would have been written straight into any journal that used
+`asdict` instead of the sanctioned `as_dict()`. The credential is therefore wrapped in a
+`RedactedHeader` value, and `JevRequest.__post_init__` **refuses** a plain string. Consequences:
+`repr`, `str`, f-strings, `%s` and `%.r` all render `Bearer <redacted>`; concatenation and `join`
+reject it, because it is not a `str`; `asdict` copies the wrapper, so `json.dumps` of that copy
+raises `TypeError` — loud, not silent; and `reveal()` is the single accessor, called only by
+`default_transport`. Equality against the raw string still holds, so a test can assert that the
+outgoing header carries the expected value without that value becoming printable. The wrapper is
+exported from `mario_jev.jev` so the policy and the journal can name it.
+
+#### WU4 slice A — independent verification verdict (2026-09-28)
+
+The first verifier run **failed with a runtime error, not a verdict**, and the parent session died
+before reading that failure. The verification was therefore re-run from scratch against the same
+slice, and it returned a real verdict. Recorded here because the plan would otherwise read as if
+slice A had already been verified when it had not.
+
+**Reproduced independently by the verifier**: 171 passed / 1 skipped; **0 xfails and no skips other
+than the one sanctioned `live_jev`**; the live test is a **genuine 0.63 s network round trip**
+against `api.typesafe.ai` and asserts real properties of the response, not merely that no exception
+was raised. All of claims A1–A5 (one request, four ids and types, criteria order, `ValueError` on
+no candidates, all three headers, instructions built from the state), B6–B9 (exact backoff
+`[0.5, 1.0, 2.0, 4.0]`, `max_attempts` calls, `max_attempts - 1` sleeps, 401/403/422 never retried,
+`None` key with zero transport calls), C11–C14 (`1.3` survives as a float through the full client
+path, `NoulAnswer` has no confidence field, all eight protocol rejections, booleans rejected as
+numbers) held under an independent probe of 54 checks, as did 69 credential-containment views.
+
+**Three findings, all confirmed, all now being fixed**:
+
+| # | Severity | Finding |
+|---|---|---|
+| F1 | important | `pickle.dumps(request)` emits the raw key: `__slots__` state is pickled verbatim. The docstring's "must never be rendered or serialised" was false for `pickle`. |
+| F2 | important | `JevClient` kept the plain key in `__dict__`, so `repr(vars(client))` and `pickle.dumps(client)` leaked it. |
+| F3 | **real defect** | A response missing `probabilities` (and `legend`) parsed successfully into `{}` with no signal. Evidence-integrity class, not safety class: `confidence` *is* required, so the gate cannot drift — but the journal contract promises the distribution, and `_float_map`/`_str_map` silently masked its absence. |
+
+F4 (minor): `RETRYABLE_STATUSES` was not pinned — the verifier removed `500/502/504` in memory and
+the whole test file still passed, because the test iterated the constant it was supposed to check.
+F5 (nit): `errors.py` said `JevUnavailable` means "retries exhausted", but a non-retryable 5xx such
+as 501 raises it after one call and zero sleeps.
+
+**Assessed and rejected as a defect**: a non-retryable 5xx mapping to `JevUnavailable` is the
+documented policy (degrade with a recorded cause naming `HTTP 501`), not a mislabelling; odd statuses
+418/408 → `JevRequestError` and 301/302 → `JevProtocolError` are both defensible.
+
+**Left unverified, stated as such**: the fixture's "kept verbatim" provenance (cannot be diffed
+offline), whether real `requests` exceptions can embed header values (structurally they do not), the
+Cloudflare-1010 rationale for the `User-Agent` (indirect support only: the live call succeeded), and
+the policy-side degrade-vs-abort behaviour (WU4 slice C is not written yet — only the contract text
+exists).
+
+#### WU4 slice A — corrective round and second verdict (2026-09-28)
+
+Because `assess` returns `risk: unassessable` (the files are untracked, so no native risk can be
+produced) the harness treats the candidate as high risk and requires a separate independent
+verifier. Both the writer round and its verification are recorded here.
+
+**The fix** (delegated writer, exactly the five allowed files, nothing else): `RedactedHeader`
+gains `__reduce__` refusing pickling and `__copy__`/`__deepcopy__` keeping copying safe and
+redacted; `JevClient` stores the credential only inside `RedactedHeader`; a missing **or empty**
+`probabilities`/`legend` is now a `JevProtocolError` through `_required_map`; `RETRYABLE_STATUSES`
+is pinned to its literal value with literal `500/502/504` coverage; the `JevUnavailable` docstring
+now matches behaviour (a non-retryable 5xx raises after one call and zero sleeps).
+
+**Parent verification** (own probe, not the writer's count): 12/12 checks, including a
+*every-substring-≥5-characters* scan of the sentinel. **192 passed, 1 skipped**, 0 xfails.
+
+**Second independent verdict: clean — the fix could not be falsified.** Pickling is closed across
+protocols 0–5, `cloudpickle`, and a `shelve`/dbm write whose 24 576 on-disk bytes contained zero
+fragments; every rendered view, 13 failure-path tracebacks, and the mocked-wire header are clean;
+the required-distribution rule rejects all ten missing/empty cases and **accepts** extra keys, a
+`legend` with 2 or 6 levels against 4 criteria, fractional `score=1.3`, and a confidence-free
+`noul` — i.e. no key-set or rubric-count validation was introduced, as ordered. The `F4` pin was
+proven by **kill runs**: removing each of `429/500/502/504/529` fails the suite on both the
+behavioural and the literal-pin axis, so the original "removal stays green" failure mode is dead.
+The decisive `F3` check passed against the real API: **the tightened parser accepts the live
+response** (0.47 s round trip).
+
+**Residual design boundary, recorded openly (all equivalent in privilege to calling `reveal()`):**
+`client._authorization._value` holds the raw value one level below `__dict__` — unavoidable for any
+wrapper, and reachable only by an in-process actor that could equally call `reveal()`; registering a
+`copyreg` reducer bypasses `__reduce__` (same privilege; unregistering restores the refusal); and
+`header.__getstate__()` exposes slot state when called directly (not on any pickle path). In the
+tests, the fragment-scanning helper is used by the two pickle tests; the parent's own probe scanned
+fragments across every containment view, which is why the gap is recorded rather than fixed.
+
+Questions: `build_questions(state)` returns exactly four ids — `best_action` (choice), `risk`
+(score), `lethal_ahead` (noul), `gap_severity` (score) — each `{type, instructions, criteria}`.
+`best_action.criteria` keys are **exactly** the state's candidate action names in planner order, so
+a returned choice is always executable; no candidates means `ValueError`.
+
+Responses are typed, never dicts passed around: `Usage(input_tokens, output_tokens)`,
+`ChoiceAnswer(type, choice, confidence, probabilities)`, `ScoreAnswer(type, score, confidence,
+legend, probabilities)`, `NoulAnswer(type, noul)`, `JevResponse(model, answers, usage,
+latency_ms)`. **`NoulAnswer` has no confidence**, which is why `lethal_ahead` can never share the
+choice/score gate. Validation rejects a missing id, an answer whose `type` differs from what was
+asked, a `choice` outside the criteria sent, a non-numeric `noul`, and a `score` that is not a
+number — **`score` may legitimately be fractional** (0.48 and 1.30 were both observed) and must not
+be coerced to `int`. Every violation raises `JevProtocolError`.
+
+```python
+JevClient(*, endpoint, model, api_key, timeout_s, max_attempts, transport=None, sleeper=None,
+          user_agent=USER_AGENT)
+JevClient.from_settings(settings, *, transport=None, sleeper=None)
+.ask(questions, state) -> JevResponse
+.decide(state: MarioState) -> JevResponse     # build_questions + ask, one HTTP request
+.redacted -> dict                             # safe diagnostics, no key material
+.close() and context-manager support
+```
+
+**B — `src/mario_jev/advisor/`**
+
+```python
+AdvisorMove(name, probability)
+AdvisorAdvice(model_id, backend, moves, top, latency_ms)
+AdvisorAbsence(model_id, reason)   # "disabled"|"torch_missing"|"transformers_missing"|
+                                   # "weights_missing"|"load_failed"
+PlayJevAdvisor.from_settings(settings, *, loader=None)
+.available -> bool
+.absence -> AdvisorAbsence | None
+.advise(frame, action_names) -> AdvisorAdvice | None
+```
+
+Availability is decided **without importing torch** (`importlib.util.find_spec`), so asking the
+question cannot cost seconds or fail. `advise()` **never raises**: any failure degrades to a
+recorded `AdvisorAbsence` and returns `None`. The policy touches it only when
+`settings.advisor_enabled`, so it is never on the critical path. The `loader` seam lets both the
+present and the absent path be tested **with no weights and no 2.2 GB download**, and the absent
+path is additionally tested for real because torch genuinely is not installed here.
+
+**C — `src/mario_jev/policy/`**
+
+**WU3's projection is frozen.** `to_jev_state()` keeps exactly its five keys and gains nothing. The
+**policy**, not the state layer, appends the optional advisor block:
+`{**state.to_jev_state(), "advisor": {...}}`.
+
+```python
+DecisionSource(StrEnum): "jev" | "hold" | "guardrail_lethal" | "fallback_no_key" |
+                         "fallback_degraded" | "fallback_below_confidence" |
+                         "fallback_no_candidates"
+TickDecision(action, source, confidence, risk, reason, jev_called)
+DecisionCadence(cadence_frames)                 # .due(frame_index) -> frame_index % K == 0
+select_action(table, decision, settings) -> TickDecision
+TickRecord(tick, frame_index, state, rollout, jev_request, jev_response, decision, advisor,
+           latencies_ms, degradations)
+RunSummary(ticks, frames, decisions, sources, degradations, elapsed_s, decision_rate_hz)
+ExecutionLoop(settings, *, emulator=None, planner=None, client=None, builder=None, advisor=None)
+  .step() -> TickRecord
+  .run(*, max_ticks=None, observer=None) -> RunSummary
+```
+
+Selection is deterministic and exhaustive, evaluated in this order:
+
+1. no candidates → `NOOP`, `fallback_no_candidates`.
+2. not a cadence tick → the last decided action, `hold`.
+3. no credential (`settings.jev_available` false) → `table.best`, `fallback_no_key`.
+4. `JevUnavailable` — timeouts, 5xx, and 429/529 once retries are exhausted — →
+   `table.best`, `fallback_degraded`, recording the cause.
+5. `JevAuthError`, `JevRequestError` or `JevProtocolError` → **propagate and abort
+   the run.** These are not transient: a bad key, a malformed payload or a drifted
+   contract must not be masked by an endless fallback that would make the run look
+   Jev-driven while it never once consulted Jev.
+6. confidence below `settings.confidence_threshold` → `table.best`,
+   `fallback_below_confidence`.
+7. the chosen candidate `died` and `best` did not → `best`, `guardrail_lethal`.
+8. otherwise the chosen candidate, `jev`.
+
+`fallback` is always `table.best` — lowest risk, ties broken by furthest `dx` — which WU3 already
+fixes, so the fallback needs no network and no new policy. It is the **current** tick's measured
+answer, never a memorised action: the rollouts are local and run every frame, so a fresher and
+strictly better answer than "repeat last time" always exists. `hold` therefore means only "no new
+decision was requested on this frame", which is exactly the between-cadence case.
+
+Timing is **recorded, never repaired**: the loop holds **one** `TrajectoryPlanner` instance across
+ticks (the WU3 requirement) and records `timing_overrun` when
+`table.elapsed_ms > settings.rollout_budget_ms * OVERSHOOT_FACTOR` (3.0). WU4 does not attempt to
+fix the overrun; the limit stays visible in the journal.
+
+**Test obligations (4.5) — 0 skips in the default suite:** every branch above with a fake transport
+and injected sleeper; the key-containment invariant; retry counts and the 401/403/422 no-retry rule;
+each protocol violation; advisor absence for real plus the injected-loader present path; and one
+`live_jev`-marked test against the real API, which the **parent runs during verification** so the
+evidence is real rather than deferred.
+
 ### WU5 — Evidence journal, visualization, entrypoints
 - [ ] 5.1 `src/mario_jev/journal/` — JSONL trace with, per decision tick: frame index, perceived
       state, the trajectory table, the Jev question payload, the raw Jev answer with

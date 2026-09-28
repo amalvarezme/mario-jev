@@ -171,12 +171,15 @@ object keyed by exactly these ids:
 | Question id | Type | Asks |
 |---|---|---|
 | `best_action` | `choice` | which candidate action to take, each option's `criteria` description carrying that candidate's rolled-out outcome and cost |
-| `risk` | `score` | 0–10 risk of losing Mario within the horizon |
+| `risk` | `score` | risk of losing Mario within the horizon, on a four-level rubric whose `score` is a probability-weighted **level index** (0..3), so it may be fractional — it is **not** a 0–10 scale (§3) |
 | `lethal_ahead` | `noul` | is the current trajectory lethal if unchanged |
 | `gap_severity` | `score` | how hard the terrain ahead is on an ordered rubric |
 
 The returned `choice` is the action, `probabilities` is the decision score across
-every candidate, and `confidence` is what the policy gates on.
+every candidate, and `confidence` is what the policy gates on — for `choice` and
+`score` only. **`lethal_ahead` returns no `confidence` at all**, so it cannot be
+gated by the same threshold; it is read as P(lethal) and used as evidence, never as
+a gated decision.
 
 ## 7. Real time
 
@@ -194,11 +197,22 @@ Degradation ladder, in order:
 1. **Inside budget, confidence ≥ threshold** → execute Jev's `choice`.
 2. **Confidence < threshold** → run the deterministic safe fallback and record
    the low-confidence event with its full probability distribution.
-3. **Over budget, or 429/529 after retries, or no credential** → hold the last
-   known-safe trajectory and record the degradation.
-4. **401, 403 or 422** → hard failure; a wrong or invalid key is not something to
-   route around silently. The published prose documents only 401, but the live API
-   answers an invalid key with 403 (§3).
+3. **Over budget, or 429/529 once retries are exhausted, or no credential** →
+   run the deterministic safe fallback and record the degradation, naming the
+   cause. The fallback is the **current tick's** rollout-verified safest candidate,
+   never a stale memorised action: the rollouts are local, cheap, and run every
+   single frame, so a fresher measured answer always exists and is strictly better
+   than repeating an older decision. `hold` is reserved for the frames *between* two
+   cadence ticks, where no new decision was requested at all.
+4. **401, 403 or 422, and any 2xx body we cannot parse** → **abort the run**. A
+   wrong key, a malformed payload or a drifted contract is not something to route
+   around silently: a loop that fell back forever would look like a Jev-driven run
+   that in fact never once consulted Jev. The published prose documents only 401,
+   but the live API answers an invalid key with 403 (§3).
+5. **Guardrail** → if Jev's chosen action rolls out to a death (`falls_in_gap` or
+   `hits_enemy`) while a surviving candidate exists, execute that candidate instead
+   and record `guardrail_lethal`. Jev's judgment is an input; the rollout is
+   measured truth about this exact savestate.
 
 Measured headroom: the emulator steps at **261 fps** unpaced, so 60 fps has about
 4× headroom before pacing pressure appears. Whether the *Jev* round trip fits
@@ -253,6 +267,22 @@ the Jev decision-score table, and the confidence and latency evolution over time
 - **The rollout horizon is a budget, not a guarantee.** Under load the horizon
   shrinks, so a decision taken under pressure is made with less foresight than the
   same decision taken on an idle machine.
+- **The cost model ratchets one way.** A measured overrun raises the remembered
+  per-frame cost, but an underrun never lowers it, so a single transient stall
+  permanently shrinks the horizon for that planner instance — observed settling at
+  14 → 13 → 9 and staying at 9. This is a persistent bias, not momentary pressure,
+  and it is visible in the journal as `per_frame_ms` and `cost_source`.
+- **The per-frame cost is not pinnable.** It ranged over `0.645 .. 2.349 ms`
+  *within a single process*, so the horizon chosen at a given budget is not
+  reproducible; observed horizons at `rollout_budget_ms = 120` were
+  `10, 20, 15, 18, 15` across five consecutive runs. Any number quoted for "the"
+  rollout cost is a sample, never a constant.
+- **A small budget cannot bound the sweep at all.** At 40 ms the horizon sits at
+  `rollout_min_frames`, so the sweep can still overrun and the budget stops
+  constraining anything.
+- **A fresh planner per tick gets no warm start.** The steady-state overhead near
+  0.1 ms depends on keeping one planner instance across ticks; rebuilding it every tick
+  restores the full calibration cost.
 - **No claim is made that this reaches the goal.** What is claimed is that the
   pipeline is real, measurable, and honest about its failures.
 

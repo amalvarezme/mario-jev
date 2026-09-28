@@ -13,3 +13,6 @@ artifacts/
 
 # ROMs are never redistributed through this repository
 *.nes
+
+# Local CodeGraph index (parent tooling state, not project source)
+/.codegraph/
