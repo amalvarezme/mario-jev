@@ -156,6 +156,16 @@ def tick_record(
     :meth:`JevResponse.as_dict`: the journal records what those produced, it does
     not re-render it. ``frame_png`` and ``trajectory_png`` are relative artifact
     paths, or ``None`` when no artifact was written for this tick.
+
+    ``terminated`` and ``truncated`` are the post-step facts the record carries.
+    They are the only fields on the line that describe the world *after* the
+    tick's action ran, which is what lets a reader find the tick that ended the
+    run instead of inferring it from the line count.
+
+    The keys are, in order: ``kind``, ``tick``, ``frame_index``,
+    ``emulator_tick``, ``state``, ``rollout``, ``questions``, ``response``,
+    ``decision``, ``advisor``, ``latencies_ms``, ``degradations``,
+    ``terminated``, ``truncated``, ``frame_png`` and ``trajectory_png``.
     """
     decision = record.decision
     return {
@@ -180,6 +190,8 @@ def tick_record(
             str(name): float(value) for name, value in record.latencies_ms.items()
         },
         "degradations": [str(item) for item in record.degradations],
+        "terminated": bool(record.terminated),
+        "truncated": bool(record.truncated),
         "frame_png": None if frame_png is None else str(frame_png),
         "trajectory_png": None if trajectory_png is None else str(trajectory_png),
     }
@@ -190,6 +202,13 @@ def summary_record(summary: RunSummary) -> dict[str, object]:
 
     ``sources`` and ``degradations`` are plain objects keyed by string names, so
     the counts are readable without importing the enum that produced them.
+    ``termination`` is the run's own classified reason for stopping, one member
+    of :data:`~mario_jev.policy.TERMINATIONS`, written verbatim: the summary was
+    refused at construction if it were anything else.
+
+    The keys are, in order: ``kind``, ``ticks``, ``frames``, ``decisions``,
+    ``sources``, ``degradations``, ``elapsed_s``, ``decision_rate_hz`` and
+    ``termination``.
     """
     return {
         "kind": KIND_SUMMARY,
@@ -204,6 +223,7 @@ def summary_record(summary: RunSummary) -> dict[str, object]:
         },
         "elapsed_s": float(summary.elapsed_s),
         "decision_rate_hz": float(summary.decision_rate_hz),
+        "termination": str(summary.termination),
     }
 
 

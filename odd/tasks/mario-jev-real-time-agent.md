@@ -692,8 +692,8 @@ TickDecision(action, source, confidence, risk, reason, jev_called)
 DecisionCadence(cadence_frames)                 # .due(frame_index) -> frame_index % K == 0
 select_action(table, jev, settings, *, cadence_due=True, last_action="NOOP", degraded_reason=None)
 TickRecord(tick, frame_index, emulator_tick, state, rollout, jev_questions, jev_response,
-           decision, advisor, latencies_ms, degradations)
-RunSummary(ticks, frames, decisions, sources, degradations, elapsed_s, decision_rate_hz)
+           decision, advisor, latencies_ms, degradations, terminated, truncated)
+RunSummary(ticks, frames, decisions, sources, degradations, elapsed_s, decision_rate_hz, termination)
 ExecutionLoop(settings, *, emulator=None, planner=None, client=None, builder=None, advisor=None)
   .step() -> TickRecord
   .run(*, max_ticks=None, observer=None) -> RunSummary
@@ -838,7 +838,7 @@ the report carries the numbers plus the exact commands that produced them. Headl
 * **the agent stalled for 600 of 900 frames** against a 48 px wall, because all seven candidates
   reported `dx <= 0` with identical risk — the rollout had no signal. Jev agreed with the rollout's
   own safest candidate on 112/113 calls, so this is not Jev's error.
-* **a 21 s tick left an empty `degradations` list** (a timeout followed by a successful retry) and the
+* **a tick whose Jev call took 21 s** left an empty `degradations` list (a timeout followed by a successful retry) and the
   header records neither `jev_timeout_s` nor `jev_max_attempts`, so that stall cannot be
   reconstructed from the journal.
 * live coverage gaps, stated in the report: no death occurred, `flag_get` never fired, and the
@@ -852,8 +852,9 @@ to 58 ms**, with `time.sleep` calls during the sweep from **67 per 68 steps to 0
 evaluation run (120 frames, identical parameters) went from **157 s to 18 s**, decision rate 0.095 →
 **0.850 Hz**, sweep p50 1 205 → **70 ms**, fallback 40 % → **27 %**, horizon floor 6 → 7–9. Findings
 #1 (decouple Jev from the tick), #3 (record the retry and the timeout), #4 (a way out of a blind
-rollout) and #5 (the pacer's own rate: 28.12 ms/step against 16.67 configured) remain open, and
-`docs/EVALUATION.md` now says so in each case rather than leaving the fixed one reading as open.
+rollout) and #5 (the pacer's own rate: 28.12 ms/step against 16.67 configured — **later corrected,
+see finding #7 below**) remain open, and `docs/EVALUATION.md` now says so in each case rather than
+leaving the fixed one reading as open.
 
 **Follow-up on the report's finding #4, same day**: the stall had a measured cause — replaying the
 frozen savestate at fixed horizons shows the escape first appears at **24 frames** while the agent's
@@ -884,6 +885,78 @@ even settle *that* a death occurred. Two rounds of independent verification on t
 corrected **seven false claims in the parent's own `docs/EVALUATION.md`** (a backwards execution
 ordering, a death asserted as fact, a horizon range read off a top-3, ~13 where the real cost pays 15,
 and three over-qualifications), which is why the report's every figure is now derived by command.
+
+**Follow-up on findings #6, #3 and #7, same day** — the last three open items, closed together:
+
+* **#6, record why a run stopped.** `TickRecord` carries the post-step `terminated`/`truncated` facts
+  copied from the `StepResult`, and `RunSummary.termination` names the reason from a closed set
+  (`max_ticks`, `goal`, `death`, `truncated`, `episode_ended`) with **no default**, refused at
+  construction. The classification reads the state layer's own `is_goal`/`is_death` rather than
+  re-deriving info keys, and `_end_info` is captured from the ending step, not sampled from the
+  emulator afterwards. The journal writes all three keys, `render_text` prints the reason beside the
+  counts, and the dashboard leads its summary with it. **Verified against a real death rather than a
+  fake**: driving the real emulator with `right` into the first Goomba terminates at **frame 160** with
+  `is_death(info)` true, and a test drives the real emulator through the real loop with a scripted
+  decision source until it dies, asserting that `termination` reads `"death"` and that the journal
+  writes it. That real-emulator check was the gap the round itself declared it could not close. (An
+  unscripted loop run made the same day also died and recorded `"death"` at tick 122 — but three
+  identical runs since survived to the 400-tick cap, so luck is not evidence; see below.)
+* **#3, record the retry and the timeout.** `Settings.redacted` carries `jev_timeout_s`,
+  `jev_max_attempts` and `rollout_min_frames`; `JevResponse.attempts` holds the transport calls the
+  returned result actually cost (measured against a scripted transport at 1, 2 and 3 attempts, equal
+  to the transport's own call count); and the loop appends `jev_retried` to a tick whose successful
+  response took more than one attempt. Measured on a scripted timeout-then-success run: header
+  `jev_timeout_s=20.0`, `jev_max_attempts=3`, `rollout_min_frames=6`; tick 0 `attempts=2` with
+  `latency_ms=577.0`; summary degradations `{'jev_retried': 1}` — the 20.7 s that the evaluation could
+  not explain is now reconstructible from a file. The pre-existing journal is **not** repaired, and the
+  report says so: no rewrite can add a measurement never taken.
+* **#7, the pacer's own rate — the finding was a misdiagnosis.** 28.12 ms per step was never the pacer:
+  a bare `time.sleep(1/60)` loop on this machine measures **101 ms** per step and a control of
+  `time.sleep(0.030)` measures **116 ms**, with a `pi` process at 99.7 % CPU; the pacer reported the
+  shortfall visibly in `total_lag_s` and cannot guarantee the platform's timer. The real
+  defect was the behind-schedule path re-anchoring its deadline to *now*, which forgave the deficit
+  forever and permanently added each slow step's work to the period. It now repays
+  (`self._next_deadline += self._period`) and writes off only past `MAX_DEFICIT_PERIODS = 4`
+  (a documented judgement — 66 ms at 60 fps — not a measurement). Verified on a **virtual clock**:
+  the average interval between steps is **1.000000 periods** after the fix and **1.136364** with the
+  old path restored, and every pacing test drives that clock rather than the real one.
+
+**Independent verification of the batch, and the follow-up round it forced.** The verifier confirmed
+the substance of all three rounds with its own probes and then **falsified six claims** — the useful
+outcome, and two of the six were in the parent's prose:
+
+* **In the documents:** the plan said "0 `skipif` anywhere in `tests/`" while the sanctioned `live_jev`
+  one exists (now "no marker was added", which is what is true); the report presented the lucky 122-tick
+  death as evidence (now stated as observed once and **not** reproducing — four runs since survived to
+  the cap — with a scripted test replacing the luck); and the 101 ms / 116 ms sleep controls were figures
+  from a machine that was loaded at that moment, now marked as properties of that load rather than of
+  the pacer.
+* **In the code:** one pacing test still reached the real clock (the virtual clock is now autouse for
+  the whole file, with the zero-real-clock property **instrumented** — 0 `monotonic`, 0 `sleep` across
+  every test in it — rather than asserted in prose); `wait()` returned the sleep it *requested* while its
+  docstring claimed the seconds actually slept (it now measures and returns the measurement, and the
+  `overshoot - period` attribution is documented); the `termination` refusal did not name the closed
+  set; `parse_response` accepted `attempts=0` and negative counts; and **a password embedded in an
+  endpoint's userinfo reached the journal header verbatim** — the same class of leak as a key in a log,
+  since a URL may legitimately carry `https://user:password@host`.
+
+All six are closed in the follow-up round, plus a seventh found by that round's own writer and fixed by
+the parent: `JevClient.redacted` and its `repr` emitted the endpoint verbatim (a narrower leak — nothing
+in `src/` reads it, so it needs a debugger or a traceback — but the same defect). Every place that
+writes or prints an endpoint now routes through one `redact_url_userinfo`, on read as well as on write,
+because a reader is handed a *file* and an older or edited header must not put a password on a page. Two
+honest limits are stated in the code rather than implied: redaction is a projection, so the raw endpoint
+is still an attribute of the client object, and journals written before the change are not migrated.
+
+Round totals: **480 passed, 1 skipped** (from 406 before the batch), the single skip being the
+pre-existing `live_jev` test gated on `JEV_API_KEY`. No `xfail`, `skipif` or `pytest.skip` was added
+anywhere in `tests/`; the only skip marker in the tree is that pre-existing sanctioned one at
+`tests/test_jev_client.py`. A new observation also reached the report: the **same seed does not
+reproduce the same run** — one headless run ended at tick 122 by death, and four identical runs since
+(three of them consecutive, made during verification) survived to the 400-tick cap — because the rollout
+horizon is chosen from a wall-clock measurement: the procedure replicates, the trajectory does not.
+**After this batch the only finding still open is #1**, decoupling the Jev call from the tick, which is
+a redesign rather than a fix.
 
 ## 5. Review workload forecast
 
@@ -924,5 +997,9 @@ None of these is `.`, the repo root, or an absolute path.
   rather than putting Keychain code in the library, so the package stays portable and
   `Settings.load()` keeps reading the environment only. The key must never be pasted into a
   prompt, a file, or a commit.
+- **Open: finding #1 from the live evaluation** — decouple the Jev call from the tick, or accept ~1 Hz
+  and say so. A 416 ms median round trip cannot fit inside a 16.7 ms frame, so this is a redesign rather
+  than a fix. **Every other evaluation finding is fixed, measured and recorded in the follow-up notes
+  above**, and finding #7's original diagnosis was corrected there rather than quietly dropped.
 - PlayJev's 2.2 GB weight download is deferred until the core loop is green; the advisor is
   optional by design precisely so this cannot block the critical path.

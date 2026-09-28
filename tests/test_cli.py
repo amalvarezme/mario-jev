@@ -31,6 +31,11 @@ from mario_jev.trajectory import CandidateRollout, CostSource, RolloutTable
 #: A synthetic credential. It is never a real key and is never printed.
 SENTINEL_KEY = "apikey_SENTINEL_cli_do_not_leak"
 
+#: A credential smuggled into the endpoint URL's userinfo instead of the key field.
+#: Both readers here print the endpoint, so both have to redact it.
+URL_PASSWORD = "url_pw_SENTINEL_cli_do_not_leak"
+ENDPOINT_WITH_USERINFO = f"https://alice:{URL_PASSWORD}@example.invalid/v1/systemone"
+
 
 # -- crafted journals --------------------------------------------------------------
 
@@ -68,12 +73,16 @@ def _tick(
     trajectory_png: object | None = None,
     probabilities: dict[str, float] | None = None,
     choice: str | None = None,
+    terminated: bool = False,
+    truncated: bool = False,
+    attempts: int = 1,
 ) -> dict[str, object]:
     response = None
     if probabilities is not None:
         response = {
             "model": "jev-latest",
             "latency_ms": jev_latency,
+            "attempts": attempts,
             "usage": {"input_tokens": 1, "output_tokens": 1},
             "answers": {
                 "best_action": {
@@ -104,12 +113,19 @@ def _tick(
         "advisor": {"available": False, "reason": "disabled", "measured": False},
         "latencies_ms": {"rollout": 1.0, "jev": jev_latency, "advisor": 0.0, "total": 2.0},
         "degradations": [],
+        "terminated": terminated,
+        "truncated": truncated,
         "frame_png": frame_png,
         "trajectory_png": trajectory_png,
     }
 
 
-def _summary_for(ticks: tuple[dict[str, object], ...], *, elapsed_s: float = 2.0) -> dict[str, object]:
+def _summary_for(
+    ticks: tuple[dict[str, object], ...],
+    *,
+    elapsed_s: float = 2.0,
+    termination: str = "max_ticks",
+) -> dict[str, object]:
     sources: dict[str, int] = {}
     decisions = 0
     for tick in ticks:
@@ -127,6 +143,7 @@ def _summary_for(ticks: tuple[dict[str, object], ...], *, elapsed_s: float = 2.0
         "degradations": {},
         "elapsed_s": elapsed_s,
         "decision_rate_hz": (decisions / elapsed_s) if elapsed_s > 0 else 0.0,
+        "termination": termination,
     }
 
 
@@ -135,11 +152,12 @@ def _journal(
     *,
     run: dict[str, object] | None = None,
     elapsed_s: float = 2.0,
+    termination: str = "max_ticks",
 ) -> Journal:
     return Journal(
         run=_run_header() if run is None else run,
         ticks=ticks,
-        summary=_summary_for(ticks, elapsed_s=elapsed_s),
+        summary=_summary_for(ticks, elapsed_s=elapsed_s, termination=termination),
     )
 
 
@@ -260,6 +278,40 @@ def test_doctor_is_ready_and_never_prints_the_key(monkeypatch, capsys) -> None:
     assert torch_lines
     if importlib.util.find_spec("torch") is None:
         assert "advisor unavailable" in torch_lines[0]
+
+
+def test_doctor_never_prints_a_credential_hidden_in_the_endpoint_url(
+    monkeypatch, capsys
+) -> None:
+    # The doctor report prints the endpoint. A URL may carry its own password, so
+    # "the key is a boolean here" is not enough on its own -- the endpoint is the
+    # other way a credential reaches this output.
+    monkeypatch.setenv("JEV_API_KEY", SENTINEL_KEY)
+    monkeypatch.setenv("JEV_ENDPOINT", ENDPOINT_WITH_USERINFO)
+
+    code = cli.main(["doctor"])
+    out = capsys.readouterr().out
+
+    assert code == 0
+    assert URL_PASSWORD not in out
+    assert "alice" not in out
+    assert "endpoint: https://example.invalid/v1/systemone" in out
+
+
+def test_the_doctor_report_value_itself_carries_no_userinfo() -> None:
+    # Redacted into the report rather than at print time: the report is a dict a
+    # caller may serialise, and a value that is only safe once formatted is not safe.
+    report = cli.collect_doctor(
+        importable=lambda name: True,
+        rom_path=lambda: str(Path(__file__)),
+        writable=lambda path: True,
+        settings=cli.Settings.load(
+            {"JEV_API_KEY": SENTINEL_KEY, "JEV_ENDPOINT": ENDPOINT_WITH_USERINFO}
+        ),
+    )
+
+    assert report["endpoint"] == "https://example.invalid/v1/systemone"
+    assert URL_PASSWORD not in json.dumps(report)
 
 
 def test_doctor_exits_one_when_a_core_dependency_is_missing(monkeypatch, capsys) -> None:
@@ -665,6 +717,135 @@ def test_render_text_says_so_when_no_tick_called_jev() -> None:
     text = render_text(_journal((_tick(0, source="fallback_no_key"),)))
 
     assert "no tick called Jev; not recorded" in text
+
+
+# -- the retry, in both readers -----------------------------------------------------
+# A tick whose wall clock reads 21 s and whose response reads 577 ms has ~20 s
+# nobody can account for unless the attempt count is on the page.
+
+
+def _retried_tick(number: int, *, jev_latency: float, attempts: int) -> dict[str, object]:
+    return _tick(
+        number,
+        source="jev",
+        action="right",
+        jev_called=True,
+        jev_latency=jev_latency,
+        confidence=0.9,
+        choice="right",
+        probabilities={"right": 1.0},
+        attempts=attempts,
+    )
+
+
+def test_render_text_names_the_retry_count_only_when_a_tick_retried() -> None:
+    retried = (
+        _retried_tick(0, jev_latency=577.0, attempts=2),
+        _retried_tick(1, jev_latency=5.0, attempts=1),
+    )
+
+    text = render_text(_journal(retried))
+
+    assert "retried jev calls: 1 of 2 called ticks" in text
+    # A journal with no retried tick says nothing about retries at all, rather
+    # than printing a zero a reader has to interpret.
+    assert "retr" not in render_text(_journal((retried[1],)))
+
+
+def test_the_dashboard_tick_row_shows_the_attempt_count() -> None:
+    ticks = (
+        _retried_tick(0, jev_latency=577.0, attempts=2),
+        _tick(1, source="fallback_no_key"),
+    )
+
+    html = build_html(_journal(ticks))
+
+    assert "<th>jev attempts</th>" in html
+    # Next to the latency it explains: 577 ms on the attempt that worked, two
+    # attempts in total.
+    assert "<td>577.000</td><td>2</td>" in html
+    # And a tick that made no call still reads as no call in both cells, never as 1.
+    assert "<td>no call</td><td>no call</td>" in html
+
+
+# -- why the run stopped, in both readers ------------------------------------------
+# A run that stopped at 805 of 900 ticks is not "finished": the counts alone
+# cannot separate a death from the flag from a hand on the keyboard.
+
+
+def _died_journal() -> Journal:
+    ticks = (
+        _tick(0, source="jev", jev_called=True, jev_latency=1.0, confidence=0.9),
+        _tick(1, source="jev", jev_called=True, jev_latency=1.0, confidence=0.9, terminated=True),
+    )
+    return _journal(ticks, termination="death")
+
+
+def test_render_text_names_the_termination_and_keeps_the_counts() -> None:
+    text = render_text(_died_journal())
+
+    assert "termination: death" in text
+    assert "ticks: 2" in text
+    assert "frames: 2" in text
+
+
+def test_render_text_reports_an_unrecorded_termination_as_not_recorded() -> None:
+    journal = _died_journal()
+    summary = dict(journal.summary)
+    del summary["termination"]
+
+    text = render_text(Journal(run=journal.run, ticks=journal.ticks, summary=summary))
+
+    assert "termination: not recorded" in text
+    assert "ticks: 2" in text
+
+
+def test_the_dashboard_summary_shows_the_termination_alongside_the_counts() -> None:
+    html = build_html(_died_journal())
+
+    assert "<th>termination</th><td>death</td>" in html
+    assert "<th>ticks</th><td>2</td>" in html
+
+
+def test_the_dashboard_shows_not_recorded_for_an_older_journal() -> None:
+    journal = _died_journal()
+    summary = dict(journal.summary)
+    del summary["termination"]
+
+    html = build_html(Journal(run=journal.run, ticks=journal.ticks, summary=summary))
+
+    assert "<th>termination</th><td>not recorded</td>" in html
+
+
+# -- a credential in a recorded endpoint, in both readers ---------------------------
+# ``Settings.redacted`` strips the userinfo before the header is written, so a
+# journal this package produced has nothing left to strip. The readers strip again
+# anyway: they are handed a *file*, and a header from an older build or an edited
+# one must not be able to put a password on the page.
+
+
+def _userinfo_journal() -> Journal:
+    run = _run_header()
+    settings = dict(run["settings"])  # type: ignore[arg-type]
+    settings["jev_endpoint"] = ENDPOINT_WITH_USERINFO
+    run["settings"] = settings
+    return _journal((_tick(0, source="fallback_no_key"),), run=run)
+
+
+def test_render_text_redacts_userinfo_from_a_recorded_endpoint() -> None:
+    text = render_text(_userinfo_journal())
+
+    assert URL_PASSWORD not in text
+    assert "alice" not in text
+    assert "endpoint: https://example.invalid/v1/systemone" in text
+
+
+def test_the_dashboard_redacts_userinfo_from_a_recorded_endpoint() -> None:
+    html = build_html(_userinfo_journal())
+
+    assert URL_PASSWORD not in html
+    assert "alice" not in html
+    assert "<td>https://example.invalid/v1/systemone</td>" in html
 
 
 def test_module_entry_point_delegates_to_main() -> None:

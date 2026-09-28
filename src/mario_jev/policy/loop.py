@@ -24,8 +24,10 @@ and counts *executed* frames, while the raw ``emulator.tick`` is recorded alongs
 it as ``emulator_tick`` so the planner's inflation stays visible.
 
 Timing is **recorded, never repaired**: ``timing_overrun`` is appended when the
-rollout's own ``elapsed_ms`` exceeds ``rollout_budget_ms * OVERSHOOT_FACTOR``. The
-loop holds one planner across ticks; the limit stays visible in the journal.
+rollout's own ``elapsed_ms`` exceeds ``rollout_budget_ms * OVERSHOOT_FACTOR``, and
+``JEV_RETRIED`` when the tick's successful response reports more than one
+transport attempt. The loop holds one planner across ticks; the limit stays
+visible in the journal.
 
 The one exception is the measured stall, and it is recorded too. The loop counts
 consecutive frames in which the state's ``x_max`` does not advance, and after
@@ -89,7 +91,7 @@ from mario_jev.config import Settings
 from mario_jev.emulator import MarioEmulator, StepResult
 from mario_jev.jev import JevClient, JevUnavailable, build_questions
 from mario_jev.perception import FramePerception, detect
-from mario_jev.state import MarioState, MarioStateBuilder
+from mario_jev.state import MarioState, MarioStateBuilder, is_death, is_goal
 from mario_jev.trajectory import RolloutTable, TrajectoryPlanner
 
 # Imported from the module rather than the package: the horizon constants belong
@@ -120,18 +122,67 @@ STALL_FRAMES = 30
 #: the budget it was given, and the journal has to show that it did.
 STALL_ESCALATION = "stall_escalation"
 
+#: The degradation recorded on a tick whose Jev call succeeded only after a retry.
+#: It is what makes a stalled tick readable after the fact. In the measured run a
+#: tick spent 21 272 ms of wall clock while its recorded response reported 577 ms,
+#: and its ``degradations`` list was empty because the tick did eventually
+#: succeed; ~20.7 s had no entry anywhere. Two recorded facts close that gap and
+#: only together: the run header's ``jev_timeout_s`` says a failed attempt could
+#: cost 20 s, and this tick's response says the call took two attempts. One
+#: timed-out attempt plus the 577 ms one that worked is the missing time.
+JEV_RETRIED = "jev_retried"
+
+#: The closed set of reasons a run can stop. It lives here because the loop is
+#: what observes the stop; the journal and the readers only copy the
+#: classification out. A value outside this set is a bug, not a new state, and
+#: :class:`RunSummary` refuses it at construction.
+TERMINATIONS: frozenset[str] = frozenset(
+    {"max_ticks", "goal", "death", "truncated", "episode_ended"}
+)
+
 __all__ = [
+    "JEV_RETRIED",
     "OVERSHOOT_FACTOR",
     "STALL_ESCALATION",
     "STALL_FRAMES",
+    "TERMINATIONS",
     "ExecutionLoop",
     "RunSummary",
     "TickRecord",
+    "classify_termination",
 ]
 
 
 def _elapsed_ms(started: float) -> float:
     return (time.perf_counter() - started) * 1000.0
+
+
+def classify_termination(
+    *, ended: bool, truncated: bool, info: Mapping[str, object]
+) -> str:
+    """Why a run stopped, as exactly one member of :data:`TERMINATIONS`.
+
+    The episode's own signals are read through :func:`~mario_jev.state.is_goal`
+    and :func:`~mario_jev.state.is_death`, never re-derived here: those two own
+    the info keys, and a second copy of the key names would be a second contract
+    to keep in step.
+
+    The order is part of the contract rather than an implementation detail. A
+    goal and a death cannot both be true, but a step may report ``truncated``
+    alongside either, so the concrete signals are asked first and the catch-alls
+    last: a death that also truncated is recorded as a death. ``episode_ended``
+    is the honest name for an episode that ended with neither signal set -- it
+    means "it ended and the info said nothing more", not "nobody looked".
+    """
+    if not ended:
+        return "max_ticks"
+    if is_goal(info):
+        return "goal"
+    if is_death(info):
+        return "death"
+    if truncated:
+        return "truncated"
+    return "episode_ended"
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,6 +226,16 @@ class TickRecord:
     set), or the advisor was disabled and no measurement exists at all. It is only
     set while the advisor is enabled, and it is ``compare=False`` for the same
     reason the pixels are.
+
+    ``terminated`` and ``truncated`` are the *post-step* facts, copied from the
+    :class:`~mario_jev.emulator.StepResult` this tick's action produced. Every
+    other field on this record describes the world the tick decided *from*, read
+    before the action ran; these two describe what the action did to it, which is
+    why a record whose ``state`` still shows two lives can nevertheless be the
+    tick that ended the episode. They default to ``False`` because that is the
+    honest reading for a tick on which the episode did not end, which is every
+    tick but at most one, and because the journal's own record builders construct
+    records that never ran an emulator at all.
     """
 
     tick: int
@@ -191,6 +252,8 @@ class TickRecord:
     advisor_absence: AdvisorAbsence | None = field(compare=False)
     latencies_ms: Mapping[str, float]
     degradations: tuple[str, ...]
+    terminated: bool = False
+    truncated: bool = False
 
     @property
     def journal_state(self) -> dict[str, object]:
@@ -211,6 +274,23 @@ class RunSummary:
     ``TickDecision.jev_called`` is true, so a run that never consulted Jev cannot
     overstate its rate. ``decision_rate_hz`` is ``decisions / elapsed_s``, or
     ``0.0`` when ``elapsed_s <= 0``.
+
+    ``termination`` says *why* the run stopped, as one member of
+    :data:`TERMINATIONS`, and it is what turns ``ticks: 805`` against a 900-tick
+    budget from a mystery into a fact. It is enforced at construction, the way
+    :class:`~mario_jev.advisor.AdvisorAbsence` enforces its own reason: a value
+    outside the set is a bug, and it must not survive to the journal. It has no
+    default on purpose -- a default would quietly label every construction that
+    forgot it, and a wrong reason in the evidence file is worse than none.
+
+    Be exact about what that check buys. :func:`classify_termination` is the single
+    producer of this field in the run path, and the check enforces **set
+    membership, not truth**: ``termination="goal"`` on a run that hit its tick cap
+    is a member of :data:`TERMINATIONS` and is accepted. This is a plain dataclass
+    and public construction is legitimate (the journal readers rebuild summaries),
+    so no validator here could tell a wrong-but-valid reason from a right one --
+    only the classifier that watched the run can. Read a ``termination`` as "what
+    the producer concluded", and trust it exactly as far as you trust the producer.
     """
 
     ticks: int
@@ -220,6 +300,17 @@ class RunSummary:
     degradations: Mapping[str, int]
     elapsed_s: float
     decision_rate_hz: float
+    termination: str
+
+    def __post_init__(self) -> None:
+        if self.termination not in TERMINATIONS:
+            # The message names the whole closed set: a caller who got this wrong
+            # needs to know what is allowed, and a reader of the traceback should
+            # not have to open this module to find out.
+            allowed = ", ".join(sorted(TERMINATIONS))
+            raise ValueError(
+                f"unknown termination: {self.termination!r}; must be one of: {allowed}"
+            )
 
 
 class ExecutionLoop:
@@ -238,6 +329,7 @@ class ExecutionLoop:
         "_cadence",
         "_client",
         "_emulator",
+        "_end_info",
         "_ended",
         "_frame_index",
         "_last_action",
@@ -294,6 +386,10 @@ class ExecutionLoop:
         self._last_x_max: int | None = None
         self._stall_frames = 0
         self._ended = False
+        # The info the ending step reported, kept so ``run`` can classify the
+        # stop through the state layer's own predicates. ``None`` means no step
+        # has ended the episode, which is a different thing from an empty info.
+        self._end_info: Mapping[str, object] | None = None
 
     def step(self) -> TickRecord:
         """Advance exactly one tick and return its record.
@@ -395,6 +491,14 @@ class ExecutionLoop:
                 # deliberately allowed to propagate and abort the run.
                 degraded_reason = str(exc)
         latencies["jev"] = _elapsed_ms(jev_started)
+        # A successful call that took more than one transport attempt paid for a
+        # failed one first, and the tick's own wall clock is the only place that
+        # cost otherwise shows up. A failed call has no response and is already
+        # recorded as ``FALLBACK_DEGRADED``; a tick that made no call has no
+        # attempt count at all, which is why this reads the response rather than
+        # defaulting to 1.
+        if response is not None and response.attempts > 1:
+            degradations.append(JEV_RETRIED)
 
         decision = select_action(
             table,
@@ -416,6 +520,9 @@ class ExecutionLoop:
         latencies["total"] = _elapsed_ms(started)
         if result.terminated or result.truncated:
             self._ended = True
+            # Kept as its own mapping: ``emulator.info`` may move on, and the
+            # classification must read the info of the step that actually ended.
+            self._end_info = dict(result.info)
 
         record = TickRecord(
             tick=self._tick,
@@ -432,6 +539,8 @@ class ExecutionLoop:
             advisor_absence=advisor_absence,
             latencies_ms=latencies,
             degradations=tuple(degradations),
+            terminated=bool(result.terminated),
+            truncated=bool(result.truncated),
         )
         self._tick += 1
         return record
@@ -467,16 +576,22 @@ class ExecutionLoop:
         means "until the episode ends". ``observer`` is called with every record,
         including the terminating one. The run stops on the first
         ``terminated``/``truncated`` step and never steps past it.
+
+        The summary says *why* it stopped, classified by
+        :func:`classify_termination` from the ending step's own info. Reaching
+        ``limit`` is ``"max_ticks"``; anything else is the episode's own signal.
         """
         limit = self._settings.max_ticks if max_ticks is None else max_ticks
         started = time.perf_counter()
         ticks = 0
         decisions = 0
+        last: TickRecord | None = None
         sources: Counter[DecisionSource] = Counter()
         degradations: Counter[str] = Counter()
 
         while limit is None or ticks < limit:
             record = self.step()
+            last = record
             ticks += 1
             sources[record.decision.source] += 1
             degradations.update(record.degradations)
@@ -489,6 +604,11 @@ class ExecutionLoop:
 
         elapsed_s = time.perf_counter() - started
         rate = 0.0 if elapsed_s <= 0 else decisions / elapsed_s
+        termination = classify_termination(
+            ended=self._ended,
+            truncated=last is not None and last.truncated,
+            info={} if self._end_info is None else self._end_info,
+        )
         return RunSummary(
             ticks=ticks,
             frames=ticks,
@@ -497,4 +617,5 @@ class ExecutionLoop:
             degradations=degradations,
             elapsed_s=elapsed_s,
             decision_rate_hz=rate,
+            termination=termination,
         )

@@ -35,6 +35,7 @@ import html
 from pathlib import Path
 from typing import Mapping, Sequence
 
+from mario_jev.config import redact_url_userinfo
 from mario_jev.journal import Journal
 
 __all__ = ["build_html", "render_text", "write_html"]
@@ -112,6 +113,21 @@ def _jev_latency_text(tick: Mapping[str, object]) -> str:
     return f"{float(value):.3f}"  # type: ignore[arg-type]
 
 
+def _attempts_text(tick: Mapping[str, object]) -> str:
+    """How many transport calls this tick's Jev answer cost, in words when unknown.
+
+    A tick that made no call reads as ``no call``, never as ``1``: one attempt and
+    no attempt are different facts, and a run's whole point can be that it never
+    asked.
+    """
+    if not _decision(tick).get("jev_called"):
+        return NO_CALL
+    value = _mapping(tick.get("response")).get("attempts")
+    if value is None:
+        return NOT_RECORDED
+    return str(_as_int(value, default=1))
+
+
 def _risk_text(tick: Mapping[str, object]) -> str:
     decision = _decision(tick)
     value = decision.get("risk")
@@ -158,6 +174,22 @@ def _derived(journal: Journal) -> dict[str, object]:
         "fallbacks": fallbacks,
         "fallback_rate": (fallbacks / total) if total else 0.0,
     }
+
+
+def _retried_ticks(journal: Journal) -> int:
+    """How many ticks recorded a Jev answer that took more than one attempt.
+
+    Counted over the ticks that actually called, for the same reason the latency
+    statistics are: a tick that made no call has no attempt count to compare.
+    """
+    retried = 0
+    for tick in journal.ticks:
+        if not _decision(tick).get("jev_called"):
+            continue
+        value = _mapping(tick.get("response")).get("attempts")
+        if value is not None and _as_int(value, default=1) > 1:
+            retried += 1
+    return retried
 
 
 def _latency_stats(journal: Journal) -> tuple[float, float, float] | None:
@@ -375,6 +407,22 @@ def _counts_table(counts: Mapping[str, object]) -> str:
     ) + "</tbody></table>"
 
 
+def _endpoint(settings: Mapping[str, object]) -> object:
+    """The recorded endpoint with any ``user:password@`` userinfo removed.
+
+    :attr:`~mario_jev.config.Settings.redacted` already strips the userinfo before
+    the header is written, so a journal this package produced carries nothing to
+    strip. This redacts again anyway, because a reader is handed a *file* and not
+    a guarantee: a header written by an older build, or edited by hand, must not
+    be able to put a password on the page. Same function, so the two can never
+    disagree about what a printed endpoint looks like.
+    """
+    recorded = settings.get("jev_endpoint")
+    if not isinstance(recorded, str):
+        return recorded
+    return redact_url_userinfo(recorded)
+
+
 def _run_facts(journal: Journal) -> str:
     run = journal.run
     settings = _mapping(run.get("settings"))
@@ -384,7 +432,7 @@ def _run_facts(journal: Journal) -> str:
         ("seed", run.get("seed")),
         ("started_at", run.get("started_at")),
         ("model", settings.get("jev_model")),
-        ("endpoint", settings.get("jev_endpoint")),
+        ("endpoint", _endpoint(settings)),
         ("credential configured", "configured" if credential else "not configured"),
         ("advisor enabled", "enabled" if settings.get("advisor_enabled") else "disabled"),
         ("artifacts_dir", run.get("artifacts_dir")),
@@ -397,7 +445,12 @@ def _run_facts(journal: Journal) -> str:
 
 def _summary_section(journal: Journal, derived: Mapping[str, object]) -> str:
     summary = _mapping(journal.summary)
+    # ``termination`` leads: a run that stopped at 805 of 900 ticks is read from
+    # the top of this table, and the tick count alone cannot say whether that was
+    # a death, the flag, or a hand on the keyboard. The counts stay where they
+    # were; the reason is added in front of them, not instead of them.
     recorded = [
+        ("termination", summary.get("termination", NOT_RECORDED)),
         ("ticks", summary.get("ticks")),
         ("frames", summary.get("frames")),
         ("decisions", summary.get("decisions")),
@@ -488,7 +541,7 @@ def _tick_table(journal: Journal) -> str:
     header = (
         "<tr><th>tick</th><th>frame</th><th>emulator tick</th><th>action</th>"
         "<th>source</th><th>confidence</th><th>risk</th><th>jev called</th>"
-        "<th>jev latency (ms)</th></tr>"
+        "<th>jev latency (ms)</th><th>jev attempts</th></tr>"
     )
     rows = []
     for tick in journal.ticks:
@@ -503,7 +556,10 @@ def _tick_table(journal: Journal) -> str:
             f"<td>{_escape(_confidence_text(tick))}</td>"
             f"<td>{_escape(_risk_text(tick))}</td>"
             f"<td>{_escape('yes' if decision.get('jev_called') else 'no')}</td>"
+            # Next to the latency, because the latency alone cannot explain a tick
+            # that spent 21 s to record a 577 ms answer.
             f"<td>{_escape(_jev_latency_text(tick))}</td>"
+            f"<td>{_escape(_attempts_text(tick))}</td>"
             "</tr>"
         )
     if not rows:
@@ -528,6 +584,7 @@ def _tick_sections(journal: Journal, base: Path | None) -> str:
             ("risk", _risk_text(tick)),
             ("jev called", "yes" if decision.get("jev_called") else "no"),
             ("jev latency (ms)", _jev_latency_text(tick)),
+            ("jev attempts", _attempts_text(tick)),
             ("reason", decision.get("reason")),
         ]
         degradations = tick.get("degradations")
@@ -639,6 +696,11 @@ def render_text(journal: Journal) -> str:
     A tick that made no Jev call prints ``no call`` for its confidence and its
     Jev latency; the Jev latency statistics cover only the ticks that actually
     called Jev, and say so when there were none.
+
+    The retry line is printed only when some tick's answer cost more than one
+    transport attempt. Read with the header's ``jev_timeout_s``, it is what turns
+    a tick that spent 21 s to record a 577 ms answer into two attempts against a
+    20 s deadline rather than unaccounted time.
     """
     run = journal.run
     settings = _mapping(run.get("settings"))
@@ -650,14 +712,21 @@ def render_text(journal: Journal) -> str:
     lines.append(f"  seed: {run.get('seed')}")
     lines.append(f"  started_at: {run.get('started_at')}")
     lines.append(f"  model: {settings.get('jev_model')}")
-    lines.append(f"  endpoint: {settings.get('jev_endpoint')}")
+    lines.append(f"  endpoint: {_endpoint(settings)}")
     credential = "configured" if settings.get("jev_available") else "not configured"
     lines.append(f"  credential configured: {credential}")
     recorded_dir = run.get("artifacts_dir")
     lines.append(f"  artifacts_dir: {recorded_dir if recorded_dir else NOT_RECORDED}")
 
     lines += ["", "summary (recorded):"]
-    for key in ("ticks", "frames", "decisions", "decision_rate_hz", "elapsed_s"):
+    for key in (
+        "termination",
+        "ticks",
+        "frames",
+        "decisions",
+        "decision_rate_hz",
+        "elapsed_s",
+    ):
         value = summary.get(key)
         lines.append(f"  {key}: {value if value is not None else NOT_RECORDED}")
     sources = _mapping(summary.get("sources"))
@@ -697,6 +766,16 @@ def render_text(journal: Journal) -> str:
             )
     else:
         lines.append("  none recorded")
+
+    retried = _retried_ticks(journal)
+    if retried:
+        # Printed only when there was one. A "0" here would be a number a reader
+        # has to interpret; silence is the same fact without the ambiguity.
+        lines.append("")
+        lines.append(
+            f"retried jev calls: {retried} of {derived['decisions']} called ticks "
+            "reported more than one transport attempt"
+        )
 
     stats = _latency_stats(journal)
     lines.append("")

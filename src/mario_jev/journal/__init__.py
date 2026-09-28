@@ -18,16 +18,23 @@ What each line carries, and why
 * **run** — ``started_at`` (aware UTC ISO-8601), ``stage``, ``seed`` and
   ``settings``. The settings are recorded through :attr:`Settings.redacted`, so
   the Jev credential cannot reach the file.
-* **tick** — the loop's own ``frame_index`` *and* the raw ``emulator_tick``
-  (they differ; conflating them is a silent bug the project already had), the
-  recorded ``state`` projection, the ``rollout`` table, the ``questions`` and
-  ``response`` exactly as the client produced them, the ``decision`` with its
-  ``source`` as a plain string, a typed ``advisor`` block that says whether an
-  advice was present and, when none was, whether its absence was *measured* or
-  the advisor was simply disabled, ``latencies_ms``,
-  ``degradations`` and the relative ``frame_png``/``trajectory_png`` paths.
-* **summary** — the counted run shape, with ``sources`` and ``degradations`` as
-  plain objects keyed by string names.
+* **tick** — its ``kind``, its own ``tick`` number, the loop's ``frame_index``
+  *and* the raw ``emulator_tick`` (they differ; conflating them is a silent bug
+  the project already had), the recorded ``state`` projection, the ``rollout``
+  table, the ``questions`` and ``response`` exactly as the client produced them,
+  the ``decision`` with its ``source`` as a plain string, a typed ``advisor``
+  block that says whether an advice was present and, when none was, whether its
+  absence was *measured* or the advisor was simply disabled, ``latencies_ms``,
+  ``degradations``, the post-step ``terminated``/``truncated`` flags, and the
+  relative ``frame_png``/``trajectory_png`` paths.
+* **summary** — its ``kind`` and the counted run shape: ``ticks``, ``frames``,
+  ``decisions``, ``sources`` and ``degradations`` as plain objects keyed by
+  string names, ``elapsed_s``, ``decision_rate_hz``, and the ``termination``
+  that says why the run stopped.
+
+Those two enumerations are the schema, and they are checked against the real
+key sets by ``tests/test_journal.py``: a stale enumeration is a false statement
+about the evidence file, so it fails the suite rather than the reader.
 
 See :mod:`mario_jev.journal.artifacts` for the two Pillow-only drawings.
 """

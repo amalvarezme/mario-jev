@@ -18,6 +18,7 @@ Two facts about the live API are load-bearing and easy to get wrong:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from numbers import Integral
 from typing import Mapping, Sequence
 
 from .errors import JevProtocolError
@@ -79,12 +80,50 @@ class NoulAnswer:
 
 @dataclass(frozen=True, slots=True)
 class JevResponse:
-    """One parsed response, keyed by the question ids that were asked."""
+    """One parsed response, keyed by the question ids that were asked.
+
+    ``latency_ms`` and ``attempts`` are transport facts rather than parsed ones.
+    ``latency_ms`` measures the attempt that produced this body; ``attempts``
+    counts every transport call the client made to get it, so a response that
+    reads 577 ms after one retried 20 s timeout says ``attempts == 2`` and the
+    missing 20 s stops being unaccounted for. It defaults to ``1`` because one
+    call is the only honest reading when nobody counted.
+
+    ``attempts`` is refused at construction unless it is a whole number of at least
+    ``1``: this response exists, so at least one transport call produced it, and
+    ``0``, a negative count, ``1.5`` or ``True`` is a caller bug rather than a new
+    reading. (``1.5`` truncating to ``1`` would be worse than refusing it: the
+    reading would look measured while being a guess.) There is deliberately **no
+    upper bound**. The ceiling on retries is
+    :attr:`~mario_jev.config.Settings.jev_max_attempts`, which is configuration
+    that a deployment may raise; it is not a property of this payload, and a limit
+    hard-coded here would reject a truthful count from a client configured to try
+    harder.
+    """
 
     model: str
     answers: Mapping[str, ChoiceAnswer | ScoreAnswer | NoulAnswer]
     usage: Usage
     latency_ms: float
+    attempts: int = 1
+
+    def __post_init__(self) -> None:
+        # An integer, and not a bool: ``True`` is an ``int`` in Python, and a boolean
+        # attempt count is a caller's bug rather than a count. ``Integral`` rather
+        # than ``int`` so a numpy integer is accepted, which is then normalised
+        # below -- it is integral but not serialisable, and ``as_dict`` feeds
+        # ``json.dumps``.
+        if isinstance(self.attempts, bool) or not isinstance(self.attempts, Integral):
+            raise ValueError(
+                f"attempts must be an integer, got {type(self.attempts).__name__} "
+                f"({self.attempts!r}): it counts transport calls, and calls are whole"
+            )
+        if self.attempts < 1:
+            raise ValueError(
+                f"attempts must be >= 1, got {self.attempts!r}: a response cost at "
+                "least one transport call"
+            )
+        object.__setattr__(self, "attempts", int(self.attempts))
 
     def _require(self, question_id: str, expected: type) -> object:
         try:
@@ -121,6 +160,7 @@ class JevResponse:
         return {
             "model": self.model,
             "latency_ms": self.latency_ms,
+            "attempts": self.attempts,
             "usage": {
                 "input_tokens": self.usage.input_tokens,
                 "output_tokens": self.usage.output_tokens,
@@ -308,6 +348,7 @@ def parse_response(
     requested: Mapping[str, str],
     latency_ms: float,
     allowed_choices: Mapping[str, Sequence[str]] | None = None,
+    attempts: int = 1,
 ) -> JevResponse:
     """Parse a response body against the question ids and types that were sent.
 
@@ -317,11 +358,22 @@ def parse_response(
         latency_ms: the measured round-trip time, carried straight into the result.
         allowed_choices: optional question id -> the candidate names that were
             offered, so a ``choice`` outside them is rejected as a protocol break.
+        attempts: how many transport calls produced this body, carried straight
+            into the result the way ``latency_ms`` is. It defaults to ``1`` so a
+            caller that does not count still records a truthful single attempt, and
+            anything that is not a whole number of at least ``1`` is refused -- see
+            :class:`JevResponse`, which owns that check and explains why there is no
+            upper bound.
 
     Raises:
         JevProtocolError: when the body is not an object, is missing an answer for
             a requested id, answers a different type, or carries a malformed value
             (including a missing or empty ``probabilities``/``legend``).
+        ValueError: when ``attempts`` is below ``1`` or is not an integer. It is a
+            ``ValueError`` and not
+            a ``JevProtocolError`` on purpose: ``attempts`` is a transport fact this
+            function was *told*, not something it parsed out of the body, so a bad
+            one is the caller's bug and not the server's contract break.
     """
     if not isinstance(payload, Mapping):
         raise JevProtocolError(
@@ -351,4 +403,5 @@ def parse_response(
         answers=answers,
         usage=usage,
         latency_ms=float(latency_ms),
+        attempts=attempts,
     )

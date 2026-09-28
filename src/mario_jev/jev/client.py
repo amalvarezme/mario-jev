@@ -6,7 +6,8 @@ about:
 * **the request shape** — one POST carrying the model, the projected state, and
   the four questions;
 * **the retry policy** — only retryable failures are retried, with capped
-  exponential backoff, and the credential failures never are;
+  exponential backoff, and the credential failures never are, and the returned
+  response carries the number of attempts it actually cost;
 * **key containment** — the API key is held only inside the ``Authorization``
   :class:`RedactedHeader` and never in a plain attribute, so it appears in no
   ``repr``, no ``vars()`` view, no ``.redacted`` view, no pickle, no journal
@@ -22,7 +23,7 @@ import json
 import time
 from typing import Callable, Mapping
 
-from mario_jev.config import Settings
+from mario_jev.config import Settings, redact_url_userinfo
 from mario_jev.state import MarioState
 
 from .errors import (
@@ -90,6 +91,15 @@ class JevClient:
     :class:`~mario_jev.jev.http.RedactedHeader` and never as a plain attribute, so
     it is absent from :meth:`redacted`, :func:`repr`, ``vars()`` and every
     serialiser; only the outgoing request reveals it.
+
+    A credential carried by the *endpoint* (``https://user:password@host``) is a
+    second, weaker case, and it is handled differently on purpose. It is absent
+    from :meth:`redacted` and therefore from :func:`repr`, because those are the
+    views that reach a log; it is present in ``vars()``, because redaction here is
+    a projection of the object rather than a scrub of it, and no projection can
+    make a stored attribute forget itself. Nothing in this package reads it, so the
+    leak needs a debugger or a traceback rather than a normal call path — but that
+    is still a narrower guarantee than the key's, and stating it beats implying it.
     """
 
     def __init__(
@@ -141,9 +151,16 @@ class JevClient:
 
     @property
     def redacted(self) -> dict[str, object]:
-        """A diagnostics-safe view: endpoint, model, user agent, availability. No key."""
+        """A diagnostics-safe view: endpoint, model, user agent, availability. No key.
+
+        The endpoint goes through :func:`~mario_jev.config.redact_url_userinfo` for
+        the same reason the journal header does. A key is not the only credential a
+        URL can carry: ``https://alice:hunter2@host/v1`` is a legitimate endpoint to
+        accept, and this view reaches a log through :func:`repr` or a traceback, so
+        emitting it verbatim would put a password there.
+        """
         return {
-            "endpoint": self._endpoint,
+            "endpoint": redact_url_userinfo(self._endpoint),
             "model": self._model,
             "user_agent": self._user_agent,
             "jev_available": self._authorization is not None,
@@ -177,8 +194,8 @@ class JevClient:
         if self._authorization is None:
             raise JevAuthError("no Jev API key is configured", status=0)
         request = self._build_request(questions, state)
-        result = self._send(request)
-        return self._handle(result, questions)
+        result, attempts = self._send(request)
+        return self._handle(result, questions, attempts)
 
     def decide(self, state: MarioState) -> JevResponse:
         """Build the four tick questions and ask them about ``state``."""
@@ -212,12 +229,19 @@ class JevClient:
             timeout_s=self._timeout_s,
         )
 
-    def _send(self, request: JevRequest) -> HttpResult:
+    def _send(self, request: JevRequest) -> tuple[HttpResult, int]:
+        """The result, and how many transport calls it took to get it.
+
+        The count is returned rather than stored because it belongs to one call,
+        not to the client, and because it is the only record that a tick paid for
+        a failed attempt before the one that worked. A call that exhausts its
+        attempts raises instead, and so has no count to carry.
+        """
         attempt = 0
         while True:
             result = self._transport(request)
             if result.error is None and result.status not in RETRYABLE_STATUSES:
-                return result
+                return result, attempt + 1
             if attempt + 1 >= self._max_attempts:
                 raise JevUnavailable(self._unavailable_message(result, attempt + 1))
             self._sleeper(_backoff_delay(attempt))
@@ -235,10 +259,11 @@ class JevClient:
         self,
         result: HttpResult,
         questions: Mapping[str, Mapping[str, object]],
+        attempts: int,
     ) -> JevResponse:
         status = result.status
         if 200 <= status < 300:
-            return self._parse(result, questions)
+            return self._parse(result, questions, attempts)
         if status in (401, 403):
             raise JevAuthError(f"Jev rejected the credential (HTTP {status})", status=status)
         if status == 422:
@@ -257,6 +282,7 @@ class JevClient:
         self,
         result: HttpResult,
         questions: Mapping[str, Mapping[str, object]],
+        attempts: int,
     ) -> JevResponse:
         try:
             payload = json.loads(result.body)
@@ -277,4 +303,5 @@ class JevClient:
             requested=requested,
             latency_ms=result.elapsed_ms,
             allowed_choices=allowed_choices,
+            attempts=attempts,
         )

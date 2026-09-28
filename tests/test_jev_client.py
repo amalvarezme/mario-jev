@@ -14,6 +14,7 @@ import dataclasses
 import json
 import pickle
 
+import numpy as np
 import pytest
 
 from mario_jev.config import Settings
@@ -51,6 +52,9 @@ from mario_jev.state import (
 
 #: A synthetic key. The tests never use a real credential.
 SENTINEL_KEY = "apikey_SENTINEL_do_not_leak"
+
+#: A synthetic password carried by a URL's userinfo, a different secret in the same class.
+URL_PASSWORD = "url_pw_this_must_never_be_rendered"
 ENDPOINT = "https://api.typesafe.ai/v1/systemone"
 MODEL = "jev-latest"
 TIMEOUT_S = 20.0
@@ -660,6 +664,149 @@ def test_each_retryable_status_is_retried_literally(status: int) -> None:
     assert sleeper.delays == expected_backoff(1)
 
 
+# -- 6b. the attempt count the call actually took ------------------------------------
+#
+# A retry that cost a timeout is invisible unless the response says how many
+# transport calls it took. Without it, a tick whose wall clock reads 21 s and
+# whose response reads 577 ms has ~20 s nobody can account for.
+
+
+def test_a_retried_call_reports_the_attempt_count_it_took():
+    transport = FakeTransport(status_response(429), ok_response())
+
+    response = make_client(transport).decide(make_state())
+
+    assert response.attempts == 2
+    assert transport.calls == 2
+
+
+def test_a_first_try_success_reports_one_attempt():
+    transport = FakeTransport(ok_response())
+
+    response = make_client(transport).decide(make_state())
+
+    assert response.attempts == 1
+    assert transport.calls == 1
+
+
+def test_the_attempt_count_survives_as_dict_and_json():
+    transport = FakeTransport(timeout_response(), timeout_response(), ok_response())
+
+    response = make_client(transport, max_attempts=4).decide(make_state())
+
+    assert response.attempts == 3
+    projected = response.as_dict()
+    assert projected["attempts"] == 3
+    # The journal writes the projection through json, so the count has to survive
+    # the round trip as a number rather than as whatever repr would leave behind.
+    assert json.loads(json.dumps(projected))["attempts"] == 3
+
+
+def test_parse_response_defaults_to_one_attempt():
+    # Pinned directly: the default is what keeps every existing call site of the
+    # pure parser unchanged, so a call that passes no count still reads as one.
+    parsed = parse_response(VERIFIED_RESPONSE, requested=REQUESTED_TYPES, latency_ms=1.0)
+
+    assert parsed.attempts == 1
+    assert parsed.as_dict()["attempts"] == 1
+
+
+@pytest.mark.parametrize("attempts", [0, -2, -1])
+def test_parse_response_refuses_an_impossible_attempt_count(attempts: int):
+    # The client's own path always passes a real count, but the contract was
+    # unenforced: 0 and -2 went straight through into the journal. A response that
+    # exists cost at least one transport call, so anything below 1 is a caller bug.
+    with pytest.raises(ValueError) as caught:
+        parse_response(
+            VERIFIED_RESPONSE,
+            requested=REQUESTED_TYPES,
+            latency_ms=1.0,
+            attempts=attempts,
+        )
+
+    message = str(caught.value)
+    assert "at least one transport call" in message
+    assert repr(attempts) in message
+
+
+@pytest.mark.parametrize("attempts", [1.5, True, False, "2", 2.0])
+def test_parse_response_refuses_a_non_integer_attempt_count(attempts: object):
+    """A count that is not a whole number is refused, not silently coerced.
+
+    The integer check used to be only ``< 1`` and ``int()`` did the rest, so
+    ``1.5`` was stored as ``1`` and ``'2'`` as ``2`` -- a reading that looked
+    measured while being a guess. ``True`` is an ``int`` in Python, and a boolean
+    attempt count is a caller bug for the same reason.
+    """
+    with pytest.raises(ValueError) as caught:
+        parse_response(
+            VERIFIED_RESPONSE,
+            requested=REQUESTED_TYPES,
+            latency_ms=1.0,
+            attempts=attempts,
+        )
+
+    assert "must be an integer" in str(caught.value)
+    assert type(attempts).__name__ in str(caught.value)
+
+
+def test_an_integral_non_int_attempt_count_is_normalised_for_serialisation():
+    """``Integral`` and not ``int``, because a numpy count must not reach json.
+
+    A plain import: ``numpy`` is a hard dependency of this package, so there is
+    nothing here that can silently skip.
+    """
+    response = parse_response(
+        VERIFIED_RESPONSE,
+        requested=REQUESTED_TYPES,
+        latency_ms=1.0,
+        attempts=np.int64(2),
+    )
+
+    assert response.attempts == 2
+    # Not a numpy scalar: as_dict() feeds json.dumps, which refuses one.
+    assert type(response.attempts) is int
+    assert json.loads(json.dumps(response.as_dict()))["attempts"] == 2
+
+
+@pytest.mark.parametrize("attempts", [1, 2, 3, 12, 10_000])
+def test_parse_response_accepts_any_count_from_one_upwards(attempts: int):
+    """No upper bound here, on purpose.
+
+    The ceiling on retries is ``Settings.jev_max_attempts``, which is configuration
+    a deployment may raise. A limit hard-coded in the payload's type would reject a
+    truthful count from a client that was told to try harder, which would be the
+    parser lying about the transport to enforce someone else's policy.
+    """
+    parsed = parse_response(
+        VERIFIED_RESPONSE,
+        requested=REQUESTED_TYPES,
+        latency_ms=1.0,
+        attempts=attempts,
+    )
+
+    assert parsed.attempts == attempts
+    assert parsed.as_dict()["attempts"] == attempts
+
+
+def test_an_exhausted_retry_raises_and_carries_no_attempt_count():
+    """A failed call has no response, so it gets no attempt count anywhere.
+
+    The exception path is untouched by this change: inventing a response for a
+    call that never produced one would put an answer in the journal that the
+    server never sent.
+    """
+    max_attempts = 3
+    transport = FakeTransport(*(status_response(429) for _ in range(max_attempts)))
+
+    with pytest.raises(JevUnavailable) as caught:
+        make_client(transport, max_attempts=max_attempts).decide(make_state())
+
+    assert not hasattr(caught.value, "attempts")
+    assert "attempts" not in vars(caught.value)
+    assert transport.calls == max_attempts
+
+
 # -- 7. no retry for credential and validation failures -----------------------------
 
 
@@ -781,6 +928,33 @@ def test_the_api_key_never_leaks_into_any_rendered_view():
             make_client(failing, RecordingSleeper()).decide(state)
         assert SENTINEL_KEY not in repr(excinfo.value)
         assert SENTINEL_KEY not in str(excinfo.value)
+
+
+def test_a_credential_in_the_endpoint_never_reaches_a_rendered_view():
+    """A password inside the endpoint is the same class of secret as the key.
+
+    It cannot be scrubbed out of the client object -- redaction here is a projection,
+    not a scrub -- so this pins both halves rather than only the comfortable one: the
+    rendered views must not carry it, and ``vars`` is documented to.
+    """
+    client = JevClient(
+        endpoint=f"https://alice:{URL_PASSWORD}@example.invalid/v1/systemone",
+        model=MODEL,
+        api_key=SENTINEL_KEY,
+        timeout_s=TIMEOUT_S,
+        max_attempts=3,
+        transport=FakeTransport(ok_response()),
+        sleeper=RecordingSleeper(),
+    )
+
+    assert client.redacted["endpoint"] == "https://example.invalid/v1/systemone"
+    assert URL_PASSWORD not in repr(client.redacted)
+    assert URL_PASSWORD not in repr(client)
+    assert URL_PASSWORD not in json.dumps(client.redacted)
+    assert_no_key_material(json.dumps(client.redacted))
+    # The documented limit, pinned so it cannot quietly become a surprise: the raw
+    # endpoint is still an attribute, visible to a debugger and not to a log.
+    assert URL_PASSWORD in vars(client)["_endpoint"]
 
 
 def test_a_redacted_request_view_keeps_the_other_headers():

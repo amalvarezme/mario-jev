@@ -24,6 +24,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+import mario_jev.journal
 import numpy as np
 import pytest
 from PIL import Image
@@ -37,7 +38,7 @@ from mario_jev.advisor import (
 )
 from mario_jev.config import Settings
 from mario_jev.emulator import MarioEmulator, build_actions
-from mario_jev.jev import HttpResult, JevClient
+from mario_jev.jev import ChoiceAnswer, HttpResult, JevClient, JevResponse, Usage
 from mario_jev.journal import (
     Journal,
     JournalFormatError,
@@ -182,6 +183,9 @@ def make_record(
     advisor: AdvisorAdvice | None = None,
     advisor_absence: AdvisorAbsence | None = None,
     frame: np.ndarray | None = None,
+    terminated: bool = False,
+    truncated: bool = False,
+    jev_response: dict[str, object] | None = None,
 ) -> TickRecord:
     pixels = np.zeros(SCREEN, dtype=np.uint8) if frame is None else frame
     return TickRecord(
@@ -193,7 +197,7 @@ def make_record(
         state=make_state(tick=tick),
         rollout=default_table(tick=tick),
         jev_questions=None,
-        jev_response=None,
+        jev_response=jev_response,
         decision=TickDecision(
             action="right",
             source=DecisionSource.FALLBACK_NO_KEY,
@@ -206,6 +210,8 @@ def make_record(
         advisor_absence=advisor_absence,
         latencies_ms={"rollout": 1.0, "jev": 0.0, "advisor": 0.0, "total": 2.0},
         degradations=(),
+        terminated=terminated,
+        truncated=truncated,
     )
 
 
@@ -218,6 +224,9 @@ def make_summary(**overrides: object) -> RunSummary:
         "degradations": {"timing_overrun": 1},
         "elapsed_s": 0.25,
         "decision_rate_hz": 4.0,
+        # No default on ``RunSummary.termination``: every construction has to
+        # say why the run stopped, and this builder is a construction.
+        "termination": "max_ticks",
     }
     values.update(overrides)
     return RunSummary(**values)  # type: ignore[arg-type]
@@ -303,6 +312,145 @@ def test_the_header_is_written_on_construction(tmp_path: Path) -> None:
     writer.close()
 
 
+# -- 1b. the end of the run reaches the file ----------------------------------------
+
+
+#: Every key a tick line carries, and every key a summary line carries. These are
+#: the schema, so they are written out here rather than read off the code under
+#: test: a key that appears without this list changing is an unreviewed schema
+#: change, and a reader of the journal has no way to notice one.
+TICK_LINE_KEYS = (
+    "kind",
+    "tick",
+    "frame_index",
+    "emulator_tick",
+    "state",
+    "rollout",
+    "questions",
+    "response",
+    "decision",
+    "advisor",
+    "latencies_ms",
+    "degradations",
+    "terminated",
+    "truncated",
+    "frame_png",
+    "trajectory_png",
+)
+SUMMARY_LINE_KEYS = (
+    "kind",
+    "ticks",
+    "frames",
+    "decisions",
+    "sources",
+    "degradations",
+    "elapsed_s",
+    "decision_rate_hz",
+    "termination",
+)
+
+
+def test_the_written_lines_say_the_run_died_and_which_tick_ended_it(tmp_path: Path) -> None:
+    path = tmp_path / "run.jsonl"
+    writer = JournalWriter(path, settings=make_settings(), clock=fixed_clock)
+    writer.observer()(make_record(tick=0))
+    writer.observer()(make_record(tick=1, frame_index=1, terminated=True))
+    writer.write_summary(make_summary(ticks=2, termination="death"))
+    writer.close()
+
+    journal = read_journal(path)
+
+    assert journal.summary["termination"] == "death"
+    assert [tick["terminated"] for tick in journal.ticks] == [False, True]
+    assert [tick["truncated"] for tick in journal.ticks] == [False, False]
+    # Read off the raw bytes too: the flags must survive JSON as booleans, not
+    # as the strings a careless serializer would leave behind.
+    lines = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert lines[2]["terminated"] is True
+    assert lines[3]["termination"] == "death"
+
+
+def test_a_truncated_run_is_written_as_truncated(tmp_path: Path) -> None:
+    path = tmp_path / "run.jsonl"
+    with JournalWriter(path, settings=make_settings(), clock=fixed_clock) as writer:
+        writer.observer()(make_record(truncated=True))
+        writer.write_summary(make_summary(ticks=1, termination="truncated"))
+
+    journal = read_journal(path)
+
+    assert journal.ticks[0]["truncated"] is True
+    assert journal.ticks[0]["terminated"] is False
+    assert journal.summary["termination"] == "truncated"
+
+
+def test_the_written_key_sets_are_exactly_the_documented_ones(tmp_path: Path) -> None:
+    """The schema docstrings enumerate the fields; a stale one is a false claim.
+
+    Two halves, because either alone can pass while the file lies: the key sets
+    on disk must be the pinned ones, and every pinned key must appear in the
+    enumerations a reader is pointed at.
+    """
+    path = tmp_path / "run.jsonl"
+    with JournalWriter(path, settings=make_settings(), clock=fixed_clock) as writer:
+        writer.observer()(make_record())
+        writer.write_summary(make_summary())
+
+    journal = read_journal(path)
+
+    assert tuple(journal.ticks[0]) == TICK_LINE_KEYS
+    assert tuple(journal.summary) == SUMMARY_LINE_KEYS
+
+    package_doc = mario_jev.journal.__doc__ or ""
+    tick_doc = tick_record.__doc__ or ""
+    summary_doc = summary_record.__doc__ or ""
+    for key in TICK_LINE_KEYS:
+        assert f"``{key}``" in package_doc, f"{key} is undocumented in the package"
+        assert f"``{key}``" in tick_doc, f"{key} is missing from tick_record's docstring"
+    for key in SUMMARY_LINE_KEYS:
+        assert f"``{key}``" in package_doc, f"{key} is undocumented in the package"
+        assert f"``{key}``" in summary_doc, f"{key} is missing from summary_record's"
+
+
+def test_a_written_tick_carries_the_attempt_count_and_the_header_the_budget(
+    tmp_path: Path,
+) -> None:
+    """Both halves of the reconstruction have to survive the file.
+
+    A 20 s stall is only reconstructible from the journal because the header says
+    the timeout was 20 s and the tick's response says the call took two attempts.
+    Read back off disk, not off the in-memory record.
+    """
+    settings = make_settings(jev_timeout_s=20.0, jev_max_attempts=3)
+    retried = JevResponse(
+        model="jev-test",
+        answers={
+            "best_action": ChoiceAnswer(
+                type="choice",
+                choice="right",
+                confidence=0.9,
+                probabilities={"right": 1.0},
+            )
+        },
+        usage=Usage(input_tokens=10, output_tokens=5),
+        latency_ms=577.0,
+        attempts=2,
+    )
+    path = tmp_path / "run.jsonl"
+    with JournalWriter(path, settings=settings, clock=fixed_clock) as writer:
+        writer.observer()(make_record(jev_response=retried.as_dict()))
+        writer.write_summary(make_summary())
+
+    journal = read_journal(path)
+
+    assert journal.run["settings"]["jev_timeout_s"] == 20.0
+    assert journal.run["settings"]["jev_max_attempts"] == 3
+    assert journal.ticks[0]["response"]["attempts"] == 2
+    assert journal.ticks[0]["response"]["latency_ms"] == 577.0
+    # Off the raw bytes too: the count must survive JSON as a number.
+    lines = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert lines[1]["response"]["attempts"] == 2
+
+
 # -- 2. no credential material ------------------------------------------------------
 
 
@@ -324,6 +472,36 @@ def test_no_credential_material_reaches_the_journal(tmp_path: Path) -> None:
             assert fragment not in text, fragment
     assert journal.run["settings"] == settings.redacted
     assert journal.run["settings"]["jev_available"] is True
+
+
+#: A credential smuggled into the endpoint URL's userinfo instead of the key field.
+URL_PASSWORD = "url_pw_this_must_never_reach_the_journal_0987654321"
+ENDPOINT_WITH_USERINFO = f"https://alice:{URL_PASSWORD}@example.invalid/v1/systemone"
+
+
+def test_no_credential_in_the_endpoint_url_reaches_the_header(tmp_path: Path) -> None:
+    """A password in the endpoint URL is a credential, and the header is a log.
+
+    The key field was already safe; this is the other place a credential can enter
+    a URL, and ``redacted`` used to emit the endpoint verbatim. The test writes a
+    real file and reads it back, because the claim is about the bytes on disk and
+    not about the value of a property.
+    """
+    settings = make_settings(jev_endpoint=ENDPOINT_WITH_USERINFO)
+    path = tmp_path / "run.jsonl"
+    writer = JournalWriter(path, settings=settings, clock=fixed_clock)
+    writer.observer()(make_record())
+    writer.write_summary(make_summary())
+    writer.close()
+
+    text = path.read_text(encoding="utf-8")
+    header = json.loads(text.splitlines()[0])
+
+    assert URL_PASSWORD not in text
+    assert "alice" not in text
+    assert header["settings"]["jev_endpoint"] == "https://example.invalid/v1/systemone"
+    # The host survives: a reader must still be able to tell where the run pointed.
+    assert "example.invalid" in text
 
 
 # -- 3. format errors name the line -------------------------------------------------

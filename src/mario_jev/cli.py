@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 from mario_jev.advisor import PlayJevAdvisor
-from mario_jev.config import Settings
+from mario_jev.config import Settings, redact_url_userinfo
 from mario_jev.dashboard import render_text, write_html
 from mario_jev.emulator import MarioEmulator
 from mario_jev.jev import JevClient, JevError
@@ -151,7 +151,9 @@ def collect_doctor(
         "rom_path": rom_file,
         "rom_present": rom_present,
         "key_configured": resolved.jev_available,
-        "endpoint": resolved.jev_endpoint,
+        # Redacted here, not at print time: the report itself is a value a caller
+        # may serialise, so the userinfo must never enter it in the first place.
+        "endpoint": redact_url_userinfo(resolved.jev_endpoint),
         "model": resolved.jev_model,
         "advisor_model": resolved.advisor_model_id,
         "advisor_enabled": resolved.advisor_enabled,

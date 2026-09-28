@@ -111,8 +111,18 @@ consequences compound:
 
 Separately, the pacer does not achieve its own configured rate even for bare stepping: 120 direct
 steps with `real_time=True` took 3.60 s (**30 ms per step ≈ 33 fps**), against a configured 60 fps.
-That defect is **untouched** by the fix below; re-measured afterwards it is 28.12 ms per step, i.e.
-**1.69× the configured 16.67 ms period**.
+That figure is **not a pacer defect and is not fixed here, because it is not fixable in this code**:
+re-measured afterwards it is 28.12 ms per step, i.e. **1.69× the configured 16.67 ms period**, and a
+bare `time.sleep(1/60)` loop on the same machine measures **101 ms** per step against a control of
+`time.sleep(0.030)` at **116 ms** — measured while a `pi` process sat at 99.7 % CPU with a load average
+above 3. Those two controls are properties of that loaded machine, not of the pacer: on an idle machine
+they will be faster, and today's load no longer shows that process. What they establish is that the
+pacer cannot guarantee its configured rate from inside Python, and it does not hide that: a shortfall
+shows up in `total_lag_s`. (Precisely: `last_lag_s` is observed at the head of each wait, so a
+`time.sleep` overshoot is charged to the **following** wait as `overshoot - period` — the sleep was
+entitled to one period — and `wait()` now returns the sleep it **measured** rather than the one it asked
+for. Both are documented in the class and pinned by tests.) What *was* a real defect sat on the
+behind-schedule path and is fixed — see finding 7.
 
 **Fixed and re-measured the same day.** `FramePacer` gained a nestable `suspended()` context manager
 (suppressing sleeps, resetting the schedule on the outermost exit, never touching `enabled`), and
@@ -240,38 +250,79 @@ replaced.
 Note the run length: this one stopped at **tick 805**, not 900, and §5 is about why the journal
 cannot tell you that.
 
-### 4. A 21-second stall left no trace in the journal
+### 4. A 21-second stall left no trace — now it does
 
-One tick in run 1 took **21 272 ms** of wall clock. The journal's own `degradations` list for that
+One tick in run 1 (tick 8) took **21 376 ms** of wall clock, of which **21 272 ms** was spent inside the
+Jev call — the tick's own `latencies_ms` splits it as `jev: 21 271.52`, `total: 21 375.84`, with 98 ms
+of rollout alongside. The journal's own `degradations` list for that
 tick is **empty**, because the tick ultimately succeeded: the recorded response reports the
-successful attempt at **577 ms**, and the remaining ~20.7 s is unaccounted for in the file. That
-figure is consistent with a first attempt hitting the client's **20 s timeout**, one backoff, and a
-successful retry — but the journal cannot prove it, because the run header does not record
-`jev_timeout_s` or `jev_max_attempts` at all. A reader of this journal can see that 21 seconds
-vanished and cannot see why.
+successful attempt at **577 ms**, and the remaining ~20.7 s is unaccounted for in the file. The figure
+is consistent with a first attempt hitting the client's **20 s timeout**, one backoff and a successful
+retry — but neither *this* file nor the code that wrote it could say so, because the header recorded
+neither the timeout nor the attempt budget, and nothing counted attempts.
 
-Two gaps in the evidence, both fixable:
+**Fixed and verified after the run.** `Settings.redacted` now carries `jev_timeout_s`,
+`jev_max_attempts` and `rollout_min_frames`, so a header says what "slow" meant; `JevResponse` carries
+`attempts` (the transport calls the returned result actually cost), recorded by the client from its own
+retry loop; and the loop appends `jev_retried` to a tick whose successful response took more than one
+attempt. Measured on a scripted timeout-then-success run:
 
-* a retry that consumed seconds is an event worth recording as a degradation, not merely a latency;
-* the run header should carry the timeout and attempt budget, since they define what "slow" means.
+```
+header:              jev_timeout_s=20.0  jev_max_attempts=3  rollout_min_frames=6
+tick 0 response:     attempts=2  latency_ms=577.0
+degradations:        {'jev_retried': 1}
+```
 
-### 5. The journal cannot say why a run stopped
+A reader of such a file can now reconstruct the 20.7 s: the header says the timeout was 20 s, the tick
+says the call took two attempts, and the successful one is the 577 ms in the same block.
+
+**What this does not do is explain the old file.** `artifacts/eval-1-1.jsonl` was written before the
+change, so its header still has no timeout and its ticks still carry no attempt count. The evidence for
+that stall remains a discrepancy in a 21-second latency, and no rewrite can add a measurement that was
+never taken. That is the difference between fixing a defect and fixing a record.
+
+### 5. The journal could not say why a run stopped — now it does
 
 Added by the ratchet run, and it is the sharpest evidence gap in the file. That run stopped after
-**805** tick records against a 900-tick budget, and the journal cannot state why. Two code facts, both
-confirmed against `policy/loop.py`:
+**805** tick records against a 900-tick budget, and **that file cannot state why** — nothing written
+before this evaluation can, because the facts were never recorded. Two code facts, both confirmed
+against `policy/loop.py` as it stood when the run was made:
 
 * **The record's `state` is the state observed *before* the action.** `step()` builds it early, then
 executes, then assembles the `TickRecord` around the pre-step state. So the final step has a record,
 but that record shows the world before it: `lives` reads `[2]` in all 805 lines, including the last.
-* **The termination itself is known and then discarded.** `StepResult.terminated`/`truncated` sets an
-internal `_ended` flag and is never written anywhere: not on the record, not in a degradation, not in
+* **The termination itself was known and then discarded.** `StepResult.terminated`/`truncated` set an
+internal `_ended` flag and were written nowhere: not on the record, not in a degradation, not in
 `RunSummary`, whose seven fields are exactly `ticks`, `frames`, `decisions`, `sources`, `degradations`,
-`elapsed_s` and `decision_rate_hz`. (The journal's own summary line carries those seven plus `kind`,
+`elapsed_s` and `decision_rate_hz`. (The journal's own summary line carried those seven plus `kind`,
 and nothing else.) A reader sees `ticks: 805 < 900` and cannot distinguish a death from
 reaching the flag from a run someone stopped by hand.
 
-**What the file does suggest, and why that is only a suggestion.** The last recorded tick has all
+**Fixed: a run now records why it stopped.** `TickRecord` carries the post-step `terminated` and
+`truncated` facts; `RunSummary.termination` is one of a closed five-member set (`max_ticks`, `goal`,
+`death`, `truncated`, `episode_ended`), refused at construction if it is anything else, and the
+classification reads the episode signals through the state layer's own `is_goal`/`is_death` predicates
+rather than re-deriving them. The journal writes all three, `render_text` prints the reason beside the
+counts, and the dashboard leads its summary with it.
+
+The mechanism is verified against a **real death**, not a fake: driving the emulator with `right` into
+the first Goomba terminates at **frame 160** with `is_death(info)` true — reproducibly, and a test
+drives the real emulator through the real loop with a scripted decision source until it dies, then
+asserts that `termination` reads `"death"` and that the journal writes it, with `terminated: true` on
+the final record and on no other.
+
+An earlier observation of the same thing, made by luck rather than by construction, is worth recording
+because it says more about this agent than about the classifier: **one** unscripted run of the same loop
+with no credential ended at **tick 122** by death and wrote `"termination": "death"`, and **four runs
+since — the identical code, seed and stage — all survived to the 400-tick cap.** The death path is real
+and the recording works; the agent reaching that death is a coin toss, because its horizon comes from a
+wall-clock measurement (see "What this evaluation does NOT establish"). That first run alone is not
+evidence a reader can reproduce, which is why the test above exists.
+
+**The old file still cannot say**: it was written before the field existed, and the readers report an
+absent termination as `not recorded` rather than guessing.
+
+**What the old file does suggest, and why that is only a suggestion.** The last recorded tick has all
 seven candidates at `hits_enemy` and 360 in-game seconds still on the timer, which rules out a
 timeout. It does **not** settle that Mario died: there is no goal coordinate in this repository to
 rule the flag pole in or out, and no recorded signal either way. The honest reading is that the run
@@ -279,8 +330,8 @@ ended early, probably by death, and that the journal does not say.
 
 The two runs tabulated earlier never died, which is why this went unnoticed until the agent started
 progressing far enough to meet an enemy. So the file records the agent's best run yet and cannot say
-how it ended. The fix is small and unbuilt: a termination reason on the summary, plus the post-step
-outcome on the final record.
+how it ended. The fix is the block above — a termination reason on the summary, plus the post-step
+outcome on the final record — and it applied to no file that already existed.
 
 ## What the journal recorded honestly, and what it cannot say
 
@@ -294,6 +345,16 @@ made a call and `null` on the rest, so a reader cannot mistake "no decision was 
 model had nothing to say". No-call ticks render in the dashboard as **a gap in the series**, not as a
 zero, and no frame artifact is drawn for a tick whose PNG is absent.
 
+**A credential in a URL cannot reach a log.** A URL key is not the only secret an endpoint can carry:
+`https://user:password@host/v1` is a legitimate endpoint to accept, and writing it verbatim into the
+header would have put a password in a journal, in the dashboard, in the doctor report and in the
+client's `repr`. Every one of those now emits the endpoint through a single `redact_url_userinfo`, so
+whole userinfo — username included — is dropped, on the way in and again on the way out when a reader
+displays a recorded one. The honest limits, both stated in code: redaction is a projection, so the raw
+endpoint is still an attribute of the client object (a debugger sees it, a log does not), and journals
+written before this change are not migrated — the stored bytes keep what they captured, while the
+dashboard redacts what it prints.
+
 ## What this evaluation does NOT establish
 
 * **The PlayJev advisor is entirely unexercised.** The 2.2 GB weights are deliberately not
@@ -303,13 +364,24 @@ zero, and no frame artifact is drawn for a tick whose PNG is absent.
   900 frames and neither episode terminated, so the death path — `falls_in_gap`, `hits_enemy`, and the
   lethal guardrail that acts on them — was not exercised in those runs. **The later ratchet run ended
   early, probably by death** (see §5), so the path was very likely exercised live exactly once — and
-  the journal cannot say so, because the termination is recorded nowhere. `falls_in_gap` and
-  `reaches_goal` still have synthetic unit coverage only; no run reached the flag.
+  that file cannot say so, because it was written before the termination was recorded anywhere. (A run
+  made now does say, and the classification is verified against a real death in §5; the old
+  journal is a record that cannot be repaired.) `falls_in_gap` and `reaches_goal` still have synthetic
+  unit coverage only; no run reached the flag.
+* **The same seed does not reproduce the same run.** With the seed fixed at 0 and the stage fixed at
+  1-1, one headless loop run against the real emulator ended at **tick 122** by death, and four
+  identical runs since (including three consecutive ones made while this report was being verified)
+  survived to the **400-tick** cap. The emulator is not the source: given the seed it is deterministic.
+  The cost model is, because the rollout horizon is chosen from a wall-clock measurement of per-frame
+  cost — under load the agent plans a different depth and therefore takes different actions. The
+  procedure replicates; the trajectory does not. Any number in this report that depended on the horizon
+  should be read the same way.
 * **The horizon is a sample, never a constant.** Per-frame rollout cost ranged 0.645–2.349 ms within
   a single process in earlier measurements, and the cost model ratchets one way, so the horizons
   above (14 → 8, and 6 under pacing) are what happened on this machine under this load.
-* **One machine, one seed, one stage.** Nothing here generalises to another machine's latency, and
-  1-1's first wall is not a benchmark for the level.
+* **One machine, one seed, one stage.** Nothing here generalises to another machine's latency or
+  another machine's rollout cost, and 1-1's first wall is not a benchmark for the level. Note too that
+  even a fixed seed does not fix the trajectory (see above): what replicates is the procedure.
 * **The live cadence claim is a measurement, not a design property.** 0.614 Hz is what this machine
   and this API latency produced; the design target of 7.5 Hz remains unreached and, at a 416 ms
   round trip, unreachable without decoupling the call from the tick.
@@ -324,8 +396,12 @@ In the order I would act on them, each with the evidence above:
 2. ~~**Do not pace the shared emulator.**~~ **Fixed and re-measured** — see §2. `FramePacer.suspended()`
    plus one `with` in `plan()`: the sweep sleeps zero times, the paced run went from 157 s to 18 s, the
    horizon recovered from its floor of 6, and the fallback rate fell from 40 % to 27 %.
-3. **Record the retry, and the timeout.** A 20 s timeout that ends in success currently leaves an
-   empty `degradations` list and an unexplained 21 s latency. **Still open.**
+3. ~~**Record the retry, and the timeout.**~~ **Fixed and verified** — see §4. The header carries
+   `jev_timeout_s`, `jev_max_attempts` and `rollout_min_frames`; a response carries `attempts`; a tick
+   whose call took more than one attempt records `jev_retried`, counted in the summary. A scripted
+   timeout-then-success run writes `attempts=2` beside `latency_ms=577.0` with a 20 s timeout in its
+   header — the 20.7 s gap is now reconstructible. The pre-existing journal still cannot explain its
+   own stall, and cannot be made to.
 4. ~~**Give the agent a way out of a blind rollout.**~~ **Fixed and measured end to end** — see §3. A
    measured stall (30 frames without `x_max` advancing) escalates the horizon to 24, and the agent now
    reaches `x_max` **1363** instead of 724, still moving at the end of the run. The escalation fires
@@ -335,10 +411,17 @@ In the order I would act on them, each with the evidence above:
    able to raise it. `per_frame_ms` tracks the machine instead of pinning at its worst value, the
    horizon goes from 6 to 8–24, the escalation falls from 101 uses to 46, and `x_max` reaches
    **1438**.
-6. **Record why a run stopped.** A run that ended after 805 of its 900 ticks records no reason:
-   the termination signal is discarded, the final record's `state` is the pre-step world, and
-   `RunSummary` has no termination field. The journal therefore cannot distinguish a death from
-   reaching the flag from a manual stop, and it cannot even settle *that* a death occurred. **Open,
-   and new** — see §5.
-7. **Fix the pacer's own rate.** 28.12 ms per step against a configured 16.67 ms is **1.69×** the
-   configured period. **Still open.**
+6. ~~**Record why a run stopped.**~~ **Fixed and verified against a real death** — see §5.
+   `RunSummary.termination` names the reason from a closed set, the final record carries `terminated`,
+   and the journal writes both. Older files report `not recorded`, which is the honest answer for them.
+7. ~~**Fix the pacer's own rate.**~~ **The figure was a misdiagnosis; the arithmetic defect behind it
+   is fixed.** 28.12 ms per step was never the pacer: on this machine a bare `time.sleep(1/60)` loop
+   achieves **101 ms** per step and a control of `time.sleep(0.030)` takes **116 ms**, with a `pi`
+   process at 99.7 % CPU. The pacer cannot beat the platform's timer, and it reported the shortfall
+   honestly in `last_lag_s`/`total_lag_s`. What *was* wrong is real: the behind-schedule path
+   re-anchored the deadline to *now*, forgiving the whole deficit and permanently adding each slow
+   step's work to the period. It now repays the deficit by skipping sleeps — never game frames — and
+   writes it off only past a documented bound. Verified on a **virtual clock**: the average interval
+   between steps is **1.000000 periods** after the fix and **1.136364** with the old path restored, and
+   every pacing test now drives that clock instead of the real one, so what the pacer does to its
+   schedule is asserted exactly rather than measured against the machine's load.

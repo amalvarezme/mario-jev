@@ -13,6 +13,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping
+from urllib.parse import urlsplit, urlunsplit
 
 DEFAULT_ENDPOINT = "https://api.typesafe.ai/v1/systemone"
 DEFAULT_MODEL = "jev-latest"
@@ -20,6 +21,34 @@ DEFAULT_PLAYJEV_MODEL = "OmniJev/PlayJev-0.8B"
 
 #: Environment variable holding the Jev API key. Never logged.
 JEV_API_KEY_ENV = "JEV_API_KEY"
+
+
+def redact_url_userinfo(url: str) -> str:
+    """The same URL with any ``user:password@`` userinfo removed.
+
+    ``https://alice:hunter2@host/v1`` is a legitimate endpoint to *accept* and an
+    unacceptable string to *write*: the password is credential material, and a
+    journal header, a dashboard or a doctor report is a log. Every reader that
+    prints an endpoint routes it through here, so there is one definition of what
+    a printed endpoint looks like rather than one per reader.
+
+    The whole userinfo goes, not just the password after the colon. A bare
+    ``https://alice@host/v1`` carries no secret, but keeping the username would
+    mean the redaction depended on whether a colon happened to be present, and a
+    rule that holds only sometimes is not a guarantee.
+
+    A string that is not a URL (no ``netloc``, or no userinfo in it) is returned
+    unchanged, so a misconfigured endpoint is still printed as what it is.
+    """
+    parts = urlsplit(url)
+    if "@" not in parts.netloc:
+        return url
+    host = parts.hostname or ""
+    if ":" in host:
+        # An IPv6 literal loses its brackets to ``hostname``; put them back.
+        host = f"[{host}]"
+    netloc = host if parts.port is None else f"{host}:{parts.port}"
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
 
 
 def _int_env(env: Mapping[str, str], name: str, default: int) -> int:
@@ -162,15 +191,36 @@ class Settings:
 
     @property
     def redacted(self) -> dict[str, object]:
-        """A diagnostics-safe view of the settings, with no credential material."""
+        """A diagnostics-safe view of the settings, with no credential material.
+
+        ``jev_timeout_s`` and ``jev_max_attempts`` are here because they are what
+        "slow" meant for the run. A tick whose wall clock read 21 s while its
+        recorded response read 577 ms is only reconstructible from the file when
+        the header says the timeout was 20 s and the budget was 3 attempts, and
+        the response says the call took 2 of them: one failed 20 s attempt plus
+        one that worked accounts for the gap, and neither number alone does.
+
+        ``rollout_min_frames`` joins ``rollout_max_frames`` because the horizon
+        bounds only mean anything as a pair.
+
+        ``jev_endpoint`` is emitted through :func:`redact_url_userinfo`, not
+        verbatim. An endpoint may legitimately carry ``user:password@`` userinfo
+        and :class:`Settings` deliberately stays permissive about accepting one,
+        but this view is written into the journal header and printed by the
+        dashboard, so emitting it verbatim would put a password in a log. The
+        guarantee is about what gets **written**, not about what is accepted.
+        """
         return {
-            "jev_endpoint": self.jev_endpoint,
+            "jev_endpoint": redact_url_userinfo(self.jev_endpoint),
             "jev_model": self.jev_model,
             "jev_available": self.jev_available,
+            "jev_timeout_s": self.jev_timeout_s,
+            "jev_max_attempts": self.jev_max_attempts,
             "decision_cadence_frames": self.decision_cadence_frames,
             "confidence_threshold": self.confidence_threshold,
             "rollout_budget_ms": self.rollout_budget_ms,
             "rollout_max_frames": self.rollout_max_frames,
+            "rollout_min_frames": self.rollout_min_frames,
             "real_time": self.real_time,
             "target_fps": self.target_fps,
             "max_ticks": self.max_ticks,

@@ -7,7 +7,8 @@ optional PlayJev advisor together into one deterministic tick:
 * :func:`select_action` decides *what* runs, in a fixed, exhaustive order;
 * :class:`ExecutionLoop` runs the tick and records every branch it took;
 * :class:`RunSummary` counts the run by :class:`DecisionSource` rather than
-  claiming a rate.
+  claiming a rate, and names why the run stopped with one member of
+  :data:`TERMINATIONS`.
 
 Boundaries this package keeps
 -----------------------------
@@ -36,13 +37,16 @@ from .decision import (
 )
 from .loop import (
     OVERSHOOT_FACTOR,
+    TERMINATIONS,
     ExecutionLoop,
     RunSummary,
     TickRecord,
+    classify_termination,
 )
 
 __all__ = [
     "OVERSHOOT_FACTOR",
+    "TERMINATIONS",
     "DecisionCadence",
     "DecisionSource",
     "ExecutionLoop",
@@ -50,6 +54,7 @@ __all__ = [
     "TickDecision",
     "TickRecord",
     "advisor_view",
+    "classify_termination",
     "journal_state",
     "select_action",
 ]

@@ -5,14 +5,17 @@ constructed tables and responses; the loop is exercised with a fake emulator, a
 constructed rollout table, fakes for the client/planner/advisor, and — for the one
 behaviour that must abort rather than degrade — a *real* ``JevClient`` driving a
 scripted transport, so the exception the loop must not catch is the real one the
-client raises. One extra test runs a single real tick on the real emulator with
-every default collaborator, to pin that the defaults are wired up.
+client raises. Two tests reach the real emulator: one runs a single real tick with
+every default collaborator to pin that the defaults are wired up, and one runs a
+whole scripted run into a real death to pin the ``"death"`` classification against
+the real thing rather than against a fake.
 """
 
 from __future__ import annotations
 
 import json
 from dataclasses import fields, replace
+from pathlib import Path
 from typing import Callable
 
 import numpy as np
@@ -41,22 +44,27 @@ from mario_jev.jev import (
 )
 from mario_jev.policy import (
     OVERSHOOT_FACTOR,
+    TERMINATIONS,
     DecisionCadence,
     DecisionSource,
     ExecutionLoop,
+    RunSummary,
     TickDecision,
     TickRecord,
     advisor_view,
     journal_state,
     select_action,
 )
+from mario_jev.journal import JournalWriter, read_journal
 from mario_jev.perception import detect
 
 # From the modules rather than the packages: the stall constants are new, and the
 # curated package ``__all__``s do not re-export them.
-from mario_jev.policy.loop import STALL_ESCALATION, STALL_FRAMES
+from mario_jev.policy.loop import JEV_RETRIED, STALL_ESCALATION, STALL_FRAMES
 from mario_jev.state import (
     HAZARD_OUTCOMES,
+    INFO_DEATH,
+    INFO_FLAG_GET,
     MarioState,
     NearestEnemy,
     PlayerFeatures,
@@ -144,6 +152,7 @@ def response(
     risk: float | None = None,
     model: str = "jev-test",
     latency_ms: float = 3.0,
+    attempts: int = 1,
 ) -> JevResponse:
     answers: dict[str, ChoiceAnswer | ScoreAnswer] = {
         "best_action": ChoiceAnswer(
@@ -166,6 +175,7 @@ def response(
         answers=answers,
         usage=Usage(input_tokens=10, output_tokens=5),
         latency_ms=latency_ms,
+        attempts=attempts,
     )
 
 
@@ -266,12 +276,22 @@ def ok_body(choice: str, *, confidence: float = 0.9, risk: float = 0.2) -> str:
 class FakeEmulator:
     """A deterministic stand-in for the real emulator: a black frame, one frame per step."""
 
-    def __init__(self, *, terminate_at: int | None = None, truncate_at: int | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        terminate_at: int | None = None,
+        truncate_at: int | None = None,
+        end_info: dict[str, object] | None = None,
+    ) -> None:
         self._actions = build_actions("simple")
         self._tick = 0
         self._steps = 0
         self._terminate_at = terminate_at
         self._truncate_at = truncate_at
+        # What the *ending* step reports in its info. The real emulator sets the
+        # death/clear bits on the step that ends the episode, not before it, so
+        # this fake does the same: an ordinary step carries an empty info.
+        self._end_info = {} if end_info is None else dict(end_info)
         self.executed: list[object] = []
 
     @property
@@ -299,12 +319,14 @@ class FakeEmulator:
         self._tick += 1
         self._steps += 1
         self.executed.append(action)
+        terminated = self._terminate_at is not None and self._steps >= self._terminate_at
+        truncated = self._truncate_at is not None and self._steps >= self._truncate_at
         return StepResult(
             frame=self.frame(),
-            info={},
+            info=dict(self._end_info) if terminated or truncated else {},
             reward=0.0,
-            terminated=self._terminate_at is not None and self._steps >= self._terminate_at,
-            truncated=self._truncate_at is not None and self._steps >= self._truncate_at,
+            terminated=terminated,
+            truncated=truncated,
             tick=self._tick,
         )
 
@@ -1104,6 +1126,165 @@ def test_the_loop_stops_on_the_first_ended_step_and_never_steps_again(ending: st
         loop.step()
 
 
+# -- 11b. why the run stopped -------------------------------------------------------
+# The live run that motivated these: 805 tick records against a 900-tick budget,
+# and nothing in the journal that could tell a death from the flag from a hand on
+# the keyboard. The classification below is the missing fact.
+
+
+@pytest.mark.parametrize(
+    ("terminate_at", "truncate_at", "end_info", "expected"),
+    [
+        # The episode's own signals, read through the state layer's predicates.
+        (3, None, {INFO_DEATH: True}, "death"),
+        (3, None, {INFO_FLAG_GET: True}, "goal"),
+        # Neither signal, so the catch-alls: ``truncated`` names itself, and an
+        # episode that simply ended is ``episode_ended`` rather than a guess.
+        (None, 3, {}, "truncated"),
+        (3, None, {}, "episode_ended"),
+        # Precedence, stated as a test and not only as a comment: ``truncated``
+        # may accompany a real signal, and the real signal wins.
+        (3, 3, {INFO_DEATH: True}, "death"),
+        (3, 3, {INFO_FLAG_GET: True}, "goal"),
+    ],
+)
+def test_the_summary_names_why_the_episode_ended(
+    terminate_at: int | None,
+    truncate_at: int | None,
+    end_info: dict[str, object],
+    expected: str,
+) -> None:
+    emulator = FakeEmulator(
+        terminate_at=terminate_at, truncate_at=truncate_at, end_info=end_info
+    )
+    loop, _, _ = loop_with(settings=make_settings(key=None), emulator=emulator)
+
+    summary = loop.run(max_ticks=10)
+
+    assert summary.termination == expected
+    assert summary.termination in TERMINATIONS
+    # The episode ended early, and the count alone could not have said so.
+    assert summary.ticks == 3
+
+
+def test_reaching_the_tick_cap_is_recorded_as_max_ticks() -> None:
+    emulator = FakeEmulator()
+    loop, _, _ = loop_with(settings=make_settings(key=None), emulator=emulator)
+
+    records: list[TickRecord] = []
+    summary = loop.run(max_ticks=4, observer=records.append)
+
+    assert summary.termination == "max_ticks"
+    assert summary.ticks == 4
+    # The cap stopped the run, so nothing about the last step ended the episode.
+    assert records[-1].terminated is False
+    assert records[-1].truncated is False
+
+
+def test_a_zero_tick_run_stopped_at_its_cap() -> None:
+    loop, _, _ = loop_with(settings=make_settings(key=None))
+
+    assert loop.run(max_ticks=0).termination == "max_ticks"
+
+
+@pytest.mark.parametrize("ending", ["terminated", "truncated"])
+def test_only_the_final_record_carries_the_end_of_the_episode(ending: str) -> None:
+    """The fact the journal was missing: *which* tick ended the run.
+
+    Every other field on a record describes the world the tick decided from,
+    read before the action ran, so the last line of the old journal still showed
+    two lives on the tick that lost the third.
+    """
+    emulator = FakeEmulator(
+        terminate_at=3 if ending == "terminated" else None,
+        truncate_at=3 if ending == "truncated" else None,
+        end_info={INFO_DEATH: True} if ending == "terminated" else {},
+    )
+    loop, _, _ = loop_with(settings=make_settings(key=None), emulator=emulator)
+
+    records: list[TickRecord] = []
+    loop.run(max_ticks=10, observer=records.append)
+
+    assert len(records) == 3
+    for record in records[:-1]:
+        assert record.terminated is False
+        assert record.truncated is False
+    final = records[-1]
+    assert getattr(final, ending) is True
+    assert (final.terminated, final.truncated) == (ending == "terminated", ending == "truncated")
+
+
+def summary_with(termination: str) -> RunSummary:
+    return RunSummary(
+        ticks=1,
+        frames=1,
+        decisions=0,
+        sources={},
+        degradations={},
+        elapsed_s=1.0,
+        decision_rate_hz=0.0,
+        termination=termination,
+    )
+
+
+@pytest.mark.parametrize("termination", sorted(TERMINATIONS))
+def test_every_member_of_the_closed_set_constructs(termination: str) -> None:
+    assert summary_with(termination).termination == termination
+
+
+@pytest.mark.parametrize("invalid", ["", "finished", "MAX_TICKS", "crashed", "None"])
+def test_the_summary_refuses_a_termination_outside_the_closed_set(invalid: str) -> None:
+    with pytest.raises(ValueError, match="unknown termination"):
+        summary_with(invalid)
+
+
+def test_the_refusal_message_names_every_valid_termination() -> None:
+    """Refusing is not enough: the message has to say what is allowed.
+
+    A caller who got this wrong is holding a traceback, and "unknown termination:
+    'made_up'" tells them only that they are wrong. Naming the closed set means
+    they do not have to open this module to find the answer, and it means the set
+    cannot grow without this test noticing.
+    """
+    with pytest.raises(ValueError) as caught:
+        summary_with("made_up")
+
+    message = str(caught.value)
+    assert "unknown termination: 'made_up'" in message
+    for member in TERMINATIONS:
+        assert member in message, member
+    # Every member, not merely some: five names, and the list is not a prefix of
+    # a longer set that went unmentioned.
+    assert len(TERMINATIONS) == 5
+
+
+def test_a_wrong_but_valid_termination_is_accepted_and_that_is_documented() -> None:
+    """The check is set membership, not truth, and the docstring says so.
+
+    ``termination="goal"`` on a run that hit its tick cap is a member of the closed
+    set and constructs fine. That is inherent to a plain dataclass whose public
+    construction is legitimate -- the journal readers rebuild summaries -- and no
+    validator here could tell a wrong-but-valid reason from a right one. Only
+    :func:`classify_termination`, which watched the run, can. This test pins the
+    acceptance so nobody mistakes the type check for a correctness guarantee, and
+    pins that the field's own documentation states the limit.
+    """
+    wrong = summary_with("goal")
+
+    assert wrong.termination == "goal"
+    # Whitespace-normalised: the assertion is about the sentence being there, not
+    # about where the docstring happens to wrap.
+    documentation = " ".join((RunSummary.__doc__ or "").split())
+    assert "set membership, not truth" in documentation
+    assert "classify_termination` is the single producer" in documentation
+
+
+def test_the_closed_set_is_exactly_the_five_documented_reasons() -> None:
+    assert TERMINATIONS == frozenset(
+        {"max_ticks", "goal", "death", "truncated", "episode_ended"}
+    )
+
+
 # -- extra: the default collaborators are wired up ----------------------------------
 
 
@@ -1118,6 +1299,97 @@ def test_one_real_tick_runs_with_the_default_collaborators(emulator) -> None:
     assert set(record.state.to_jev_state()) == FROZEN_STATE_KEYS
     assert record.jev_questions is None
     assert set(record.latencies_ms) >= {"rollout", "jev", "advisor", "total"}
+
+
+# -- extra: the death classification, against the real emulator ---------------------
+# The fakes above pin the classification's *rule*. They cannot pin that the rule
+# fires on a real death, because they decide what ``terminated`` and ``info`` say.
+# An unscripted real run is no better as evidence: four such runs survived to their
+# 400-tick cap, so a death that happened once was luck and does not reproduce.
+#
+# What does reproduce is a *scripted* real run. Holding ``right`` from the reset of
+# 1-1 walks into the first Goomba on frame 160, every time, so this test is
+# deterministic without depending on anything that varies.
+
+
+class RightOnlyPlanner:
+    """One fixed table whose only candidate -- and so whose ``best`` -- is ``right``.
+
+    The point is to remove every source of variation *except* the emulator. It runs
+    no sweep, so it never steps the emulator and the loop's frame count is exactly
+    the number of game frames; it touches no clock, so the rollout's cost model
+    cannot change the answer; and one candidate means the fallback's tie-break
+    cannot either. ``min_horizon`` is accepted because a stalled tick passes one,
+    and is ignored because there is no horizon here to lengthen.
+    """
+
+    def __init__(self) -> None:
+        self.plans = 0
+        self.asked: list[int | None] = []
+
+    def plan(self, emulator: object, *, min_horizon: int | None = None) -> RolloutTable:
+        self.plans += 1
+        self.asked.append(min_horizon)
+        return table_of(candidate("right", risk=0.1, dx=8))
+
+
+def test_a_scripted_real_run_dies_and_the_journal_says_so(
+    emulator, tmp_path: Path
+) -> None:
+    """The real emulator, the real ``run()``, and a scripted decision source.
+
+    No credential, so no network: the decision is ``FALLBACK_NO_KEY`` and takes the
+    table's best candidate, which is ``right`` on every tick. What is under test is
+    everything between the emulator's own ``terminated`` flag and the two places a
+    reader looks for it -- ``RunSummary.termination`` and the journal file.
+
+    The cap is generous on purpose. It is a guard against an infinite loop, not a
+    prediction: if it were ever reached the termination would read ``max_ticks`` and
+    this test would fail loudly rather than quietly testing nothing.
+    """
+    planner = RightOnlyPlanner()
+    settings = make_settings(key=None, cadence=1)
+    loop = ExecutionLoop(settings, emulator=emulator, planner=planner)
+    path = tmp_path / "death.jsonl"
+    writer = JournalWriter(path, settings=settings)
+
+    records: list[TickRecord] = []
+
+    def observe(record: TickRecord) -> None:
+        records.append(record)
+        writer.observer()(record)
+
+    summary = loop.run(max_ticks=400, observer=observe)
+    writer.write_summary(summary)
+    writer.close()
+
+    # 1. the classification, from the real episode's own signals.
+    assert summary.termination == "death"
+    assert summary.ticks == len(records) < 400
+    assert all(record.decision.action == "right" for record in records)
+    assert planner.plans == summary.ticks
+
+    # 2. the terminating tick is the last one, and only the last one.
+    assert records[-1].terminated is True
+    assert [index for index, r in enumerate(records) if r.terminated] == [
+        len(records) - 1
+    ]
+    assert not any(record.truncated for record in records)
+
+    # 3. the same run's file agrees, read back from disk.
+    lines = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    tick_lines = [line for line in lines if line["kind"] == "tick"]
+    summary_line = lines[-1]
+
+    assert summary_line["kind"] == "summary"
+    assert summary_line["termination"] == "death"
+    assert len(tick_lines) == summary.ticks
+    assert tick_lines[-1]["terminated"] is True
+    assert [line["terminated"] for line in tick_lines[:-1]] == [False] * (
+        len(tick_lines) - 1
+    )
+    # And through the reader the dashboard uses, not only through raw json.
+    assert read_journal(path).summary["termination"] == "death"
 
 
 # -- 12. the record carries its own evidence ----------------------------------------
@@ -1337,3 +1609,73 @@ def test_a_tick_with_no_stall_plans_on_the_budget_alone() -> None:
         assert record.rollout.escalated is False
         assert record.rollout.horizon == 8
         assert STALL_ESCALATION not in record.degradations
+
+
+# -- 11. the retry the tick paid for -------------------------------------------------
+#
+# The client retries 429s, 5xxs and timeouts, and a tick that succeeded on its
+# second attempt is not a clean tick: it spent a whole failed call's wall clock
+# first. The measured case is a tick whose total read 21 272 ms while its
+# recorded response read 577 ms, with an empty ``degradations`` list.
+
+
+def test_a_retried_response_is_recorded_as_a_degradation() -> None:
+    client = FakeClient(response("right", 0.9, risk=0.2, attempts=2))
+    loop, _, _ = loop_with(settings=make_settings(cadence=1), client=client)
+
+    record = loop.step()
+
+    assert record.decision.jev_called is True
+    assert JEV_RETRIED in record.degradations
+
+
+def test_a_first_try_response_records_no_retry() -> None:
+    client = FakeClient(response("right", 0.9, risk=0.2, attempts=1))
+    loop, _, _ = loop_with(settings=make_settings(cadence=1), client=client)
+
+    record = loop.step()
+
+    assert record.decision.jev_called is True
+    assert JEV_RETRIED not in record.degradations
+
+
+def test_a_tick_that_made_no_call_records_no_retry() -> None:
+    """No call is no attempt count, and certainly not a retry.
+
+    With ``cadence=2`` the second tick is off cadence and never reaches the
+    client, so there is no response to read a count from.
+    """
+    client = FakeClient(response("right", 0.9, risk=0.2, attempts=2))
+    loop, _, _ = loop_with(settings=make_settings(cadence=2), client=client)
+
+    called = loop.step()
+    uncalled = loop.step()
+
+    assert called.decision.jev_called is True
+    assert JEV_RETRIED in called.degradations
+    assert uncalled.decision.jev_called is False
+    assert uncalled.jev_response is None
+    assert JEV_RETRIED not in uncalled.degradations
+
+
+def test_a_retry_and_a_stall_escalation_co_occur_and_are_both_counted() -> None:
+    ticks = STALL_FRAMES + 1
+    client = FakeClient(
+        *(response("right", 0.9, risk=0.2, attempts=2) for _ in range(ticks))
+    )
+    loop, _, _ = loop_with(
+        settings=make_settings(cadence=1),
+        planner=StallPlanner(),
+        client=client,
+        builder=ProgressBuilder(lambda tick: 724),
+    )
+    records: list[TickRecord] = []
+
+    summary = loop.run(max_ticks=ticks, observer=records.append)
+
+    stalled = records[-1]
+    assert JEV_RETRIED in stalled.degradations
+    assert STALL_ESCALATION in stalled.degradations
+    # The existing counter aggregates both; neither needs a summary field of its own.
+    assert summary.degradations[JEV_RETRIED] == ticks
+    assert summary.degradations[STALL_ESCALATION] == 1

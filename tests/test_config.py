@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from mario_jev.config import (
@@ -9,9 +11,17 @@ from mario_jev.config import (
     DEFAULT_MODEL,
     JEV_API_KEY_ENV,
     Settings,
+    redact_url_userinfo,
 )
 
 SECRET = "sk_jev_this_must_never_appear_anywhere_1234567890"
+
+#: A credential smuggled into the endpoint's userinfo instead of the key field.
+#: The endpoint is a URL, and a URL has a documented place to put a password; the
+#: redaction has to cover that place too, or the key field's guarantee is a
+#: guarantee about one field rather than about the file.
+URL_PASSWORD = "url_pw_this_must_never_appear_anywhere_0987654321"
+ENDPOINT_WITH_USERINFO = f"https://alice:{URL_PASSWORD}@example.invalid/v1/systemone"
 
 
 def test_defaults_are_documented_values() -> None:
@@ -102,6 +112,28 @@ def test_redacted_view_reports_availability_not_material() -> None:
     assert not any(SECRET in str(value) for value in redacted.values())
 
 
+def test_the_redacted_view_carries_the_budget_that_defines_slow() -> None:
+    """The header has to say what "slow" meant for the run.
+
+    A tick that spent 20 s is only reconstructible from the journal when the
+    header says the timeout was 20 s and the attempt budget was 3: without those
+    two numbers a reader cannot tell a slow call from a call that hit its
+    deadline and was retried. ``rollout_min_frames`` rides along because the
+    horizon bounds only mean anything as a pair.
+    """
+    redacted = Settings.load(
+        env={JEV_API_KEY_ENV: SECRET, "JEV_TIMEOUT_S": "20", "JEV_MAX_ATTEMPTS": "3"}
+    ).redacted
+
+    assert redacted["jev_timeout_s"] == 20.0
+    assert redacted["jev_max_attempts"] == 3
+    assert redacted["rollout_min_frames"] == 6
+    assert redacted["rollout_max_frames"] == 48
+    # The whole view, serialised the way the journal serialises it, and scanned
+    # for the sentinel: a new key must not become a new way out for the key.
+    assert SECRET not in json.dumps(redacted)
+
+
 def test_missing_or_blank_key_is_reported_unavailable() -> None:
     assert Settings.load(env={}).jev_available is False
     assert Settings.load(env={JEV_API_KEY_ENV: ""}).jev_available is False
@@ -130,6 +162,55 @@ def test_invalid_settings_are_rejected(env: dict[str, str], field: str) -> None:
         Settings.load(env=env)
 
     assert field in str(excinfo.value) or "must be" in str(excinfo.value)
+
+
+# -- a credential in the endpoint URL ----------------------------------------------
+
+
+def test_the_redacted_endpoint_carries_no_userinfo() -> None:
+    # The leak this closes: ``redacted`` used to emit ``jev_endpoint`` verbatim, so
+    # a password in the URL was written straight into the journal's run header.
+    settings = Settings.load(env={"JEV_ENDPOINT": ENDPOINT_WITH_USERINFO})
+
+    redacted = settings.redacted
+
+    assert redacted["jev_endpoint"] == "https://example.invalid/v1/systemone"
+    assert URL_PASSWORD not in json.dumps(redacted)
+    assert "alice" not in json.dumps(redacted)
+    # And the host is still there: this is a redaction, not a deletion. A reader
+    # must still be able to tell which endpoint the run talked to.
+    assert "example.invalid" in str(redacted["jev_endpoint"])
+
+
+def test_settings_still_accepts_an_endpoint_with_userinfo() -> None:
+    # Deliberately permissive: userinfo is a legitimate form for a URL to take, and
+    # refusing it would break a working deployment to protect a log. The guarantee
+    # is about what gets *written*, so the field itself keeps what it was given.
+    settings = Settings.load(env={"JEV_ENDPOINT": ENDPOINT_WITH_USERINFO})
+
+    assert settings.jev_endpoint == ENDPOINT_WITH_USERINFO
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        # Nothing to strip: returned untouched, including the default endpoint.
+        (DEFAULT_ENDPOINT, DEFAULT_ENDPOINT),
+        ("https://example.invalid/v1", "https://example.invalid/v1"),
+        # A bare username carries no secret, but it goes too: a rule that depended
+        # on a colon being present would hold only sometimes.
+        ("https://alice@example.invalid/v1", "https://example.invalid/v1"),
+        # The port, path, query and fragment all survive.
+        ("https://a:b@example.invalid:8443/v1?q=1#f", "https://example.invalid:8443/v1?q=1#f"),
+        # An IPv6 literal keeps its brackets.
+        ("https://a:b@[::1]:9000/v1", "https://[::1]:9000/v1"),
+        # Not a URL at all: printed as what it is, so a misconfiguration stays visible.
+        ("not a url", "not a url"),
+        ("", ""),
+    ],
+)
+def test_redact_url_userinfo_cases(url: str, expected: str) -> None:
+    assert redact_url_userinfo(url) == expected
 
 
 def test_malformed_numbers_are_rejected_with_the_variable_name() -> None:
