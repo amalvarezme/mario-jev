@@ -96,6 +96,12 @@ frames of wall clock. The architecture's own degradation ladder is what covers t
 787 of 900 frames were `hold` rather than decisions — the cadence fired when it could, not when it
 was scheduled to.
 
+**§6 changed part of this and none of the conclusion.** Taking the call off the tick means a slow
+round trip no longer stops the game, and it removed the ticks that used to absorb a whole call — but it
+did **not** raise how often the loop decides *per frame*: §6 measures the same 25 calls over the same 200
+frames in both builds. A faster loop gets through those same ticks sooner, so the Hz figure rises with
+the frame rate and by the same 23 % — which says nothing about reaching 7.5 Hz of decisions.
+
 ### 2. `real_time=True` makes the agent dramatically worse, not more real
 
 This was not expected and is the most actionable finding. Enabling pacing raised the rollout sweep
@@ -333,6 +339,77 @@ progressing far enough to meet an enemy. So the file records the agent's best ru
 how it ended. The fix is the block above — a termination reason on the summary, plus the post-step
 outcome on the final record — and it applied to no file that already existed.
 
+### 6. The world stopped while Jev thought — the call is off the tick now
+
+This is the finding that mattered most, and it was a **redesign**, not a tweak. `step()` executes
+exactly one game frame per tick and called the API **in series inside that tick**, so the game clock
+was hostage to a 416 ms round trip: the unpaced run advanced **900 frames in 184 s (4.9 fps)**, and the
+tick that hit a 20 s timeout spent **21 271.52 ms inside Jev** — Mario froze for twenty seconds.
+
+**What changed.** A dispatcher owns one worker and at most one call in flight: the tick fires a call,
+takes whatever has finished, and executes its frame either way. It never waits. An answer older than
+three cadences is discarded, and the tick holds — what a non-cadence tick always did. The client itself
+is untouched; it is run in a worker instead of rewritten. An answer applied from an earlier tick is
+recorded as `jev_stale` with its age, so "Jev decided this" can never silently mean "Jev decided this
+four ticks ago".
+
+**Measured, same machine, same stage and seed, same 200 frames, same cadence (8), same day:**
+
+```sh
+PYTHONPATH=src scripts/jev-env.sh .venv/bin/python -m mario_jev run --fast \
+    --max-ticks 200 --stage 1-1 --journal artifacts/t1-after.jsonl     # this build
+# and the same command at the previous commit, in a worktree of it, for artifacts/t1-before.jsonl
+```
+
+| | before (call inside the tick) | after (call off the tick) |
+|---|---|---|
+| frames / wall clock | 200 / **35.63 s** | 200 / **28.87 s** |
+| game frames per second | **5.61** | **6.93** |
+| tick `total`, p90 (nearest-rank) | **475.8 ms** | **238.1 ms** |
+| tick `total`, **maximum** | **1 203.4 ms** | **243.6 ms** |
+| ticks whose own cost ≥ 1 s | **1** | **0** |
+| ticks whose own cost ≥ 400 ms | **26** | **0** |
+| calls fired | 25 | 25 |
+| sum of the calls' cost | 10 628 ms | 10 832 ms |
+| median call | 422.6 ms | 428.9 ms |
+
+The 25 calls still cost the same **~10.7 s**. What changed is that **no tick contains it any more**:
+the worst tick drops from 1.2 s to 244 ms, and every tick that carried a call now costs a couple of
+hundred milliseconds instead. Precisely, and this is worth stating because the first reading of these
+two rows invites a wrong attribution: in the old build **25 of the 26 ticks above 400 ms carried a
+call**, and the **twenty-sixth did not** — the 1 203.4 ms worst tick of that run was a **rollout
+overrun** (`rollout: 1 199.7 ms`, Jev phase ≈0), not a Jev stall. The worst *call-carrying* tick was
+680.5 ms. So the call was not the only thing that could stop the world, and after the change neither
+is the world's cost: the new build's maximum tick, 243.6 ms, is the sweep.
+
+**What this deliberately did not change.** The decision cadence is the cadence, not the latency. Both
+runs fired the same 25 calls and held the same 175 frames:
+
+| `decision.source` | before | after |
+|---|---|---|
+| `hold` | 175 | 175 |
+| `jev` | 19 | 0 |
+| `jev_stale` | 0 | 18 |
+| `fallback_below_confidence` | 6 | 6 |
+| `guardrail_lethal` | 0 | 1 |
+
+So the agent does not decide **more often per frame** than before, and it is not closer to the 7.5 Hz
+design target: **Jev's own choice was executed on 19 of 200 frames before and 18 after** (the 19th is
+the one the lethal guardrail overrode), because the cadence asks every eighth frame and the loop holds
+in between. What the redesign removed is the *freeze*, not the cadence. In the paragraph §1's units the
+rate did rise, from **0.702 to 0.866 Hz**, and that rise is exactly the same 23 % as the frame rate: the
+loop asks at the same density, and a faster loop gets through more of those ticks per second. The
+answers arrived **3–5 ticks** after being asked, none was discarded as stale, and all 25 were applied.
+
+**Honest limits of this comparison.** One run per build, and the load differed (the load average read
+by `uptime` just before each run was 4.16 for the new build and 5.73 for the old — read at the time and
+recorded here, **not** written into either journal, so it is context rather than evidence), so the 23 %
+rate gain is a floor rather than a clean measurement — the *structural* figures above are the ones to
+trust, because where a call's cost lands is not a matter of load. The frames per second is still ~7, i.e.
+the game advances **8.7× slower than real time**, now bounded by the rollout sweep (~120 ms per tick)
+rather than by the API. **The next bottleneck is the rollout, not Jev**, and this section claims nothing
+about saturating the emulator's 60 Hz.
+
 ## What the journal recorded honestly, and what it cannot say
 
 The advisor was **disabled** for both runs (`{"available": false, "reason": "disabled",
@@ -379,6 +456,13 @@ dashboard redacts what it prints.
 * **The horizon is a sample, never a constant.** Per-frame rollout cost ranged 0.645–2.349 ms within
   a single process in earlier measurements, and the cost model ratchets one way, so the horizons
   above (14 → 8, and 6 under pacing) are what happened on this machine under this load.
+* **No run has saturated the emulator's frame rate.** With the call off the tick the game still advances
+  at ~7 fps, bounded now by the rollout sweep (~120 ms per tick); the 60 Hz of the machine's configured
+  rate is untouched, and nothing here claims it. The decision cadence is still the cadence: the loop
+  holds between answers rather than deciding more often.
+* **The one before-and-after comparison is a single run per build, and the load differed** (4.16 against
+  5.73). Its rate figures are a floor; its structural figures — where a call's cost lands — are not
+  load-sensitive in the same way.
 * **One machine, one seed, one stage.** Nothing here generalises to another machine's latency or
   another machine's rollout cost, and 1-1's first wall is not a benchmark for the level. Note too that
   even a fixed seed does not fix the trajectory (see above): what replicates is the procedure.
@@ -390,9 +474,13 @@ dashboard redacts what it prints.
 
 In the order I would act on them, each with the evidence above:
 
-1. **Decouple Jev from the tick** (or accept ~1 Hz and say so). A synchronous call of 416 ms median
-   inside a 16.7 ms frame budget cannot hold any cadence above about 2 Hz. Nothing else on this list
-   matters if the decision rate is 8 % of the design. **Still open.**
+1. ~~**Decouple Jev from the tick**~~ **Done, and measured** — see §6. A dispatcher runs the call in a
+   worker, the tick never waits, and an answer applied late is recorded as `jev_stale` with its age.
+   Same machine, stage, seed, cadence and 200 frames: the worst tick's own cost fell from **1 203 ms to
+   244 ms**, the ticks that carried a call from **25 to 0**, and the game went from **5.61 to 6.93 frames
+   per second** while the 25 calls cost the same ~10.7 s. It is deliberately **not** a cadence change:
+   both builds fired 25 calls and held 175 frames; the same density of decisions, and a faster loop.
+   The next bottleneck is the rollout (~120 ms per tick), not the API.
 2. ~~**Do not pace the shared emulator.**~~ **Fixed and re-measured** — see §2. `FramePacer.suspended()`
    plus one `with` in `plan()`: the sweep sleeps zero times, the paced run went from 157 s to 18 s, the
    horizon recovered from its floor of 6, and the fallback rate fell from 40 % to 27 %.

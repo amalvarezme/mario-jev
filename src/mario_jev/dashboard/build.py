@@ -12,10 +12,19 @@ of the artifact rather than a formatting preference:
 
 * **A tick that made no Jev call is shown as "no call".** It is never rendered as
   a zero confidence or a zero latency, and in the time series it is a *gap* in the
-  line rather than a point at ``0``. The raw ``latencies_ms["jev"]`` field is
-  written even when no call was made (it measures the skipped branch), so the
-  ``decision.jev_called`` flag — not the presence of the number — decides what is
-  shown.
+  line rather than a point at ``0``.
+* **The Jev latency shown is the call's, never the tick's.** With the call off the
+  tick, ``latencies_ms["jev"]`` is the few microseconds the tick spent submitting
+  and taking — a 21 s call lands on a tick whose Jev phase reads 0.002 ms — so
+  every latency on this page comes from the *call*: ``jev_call_ms``, the
+  dispatcher's measurement around the whole thing, and only failing that
+  ``response["latency_ms"]``, which is the single attempt that succeeded and is all
+  a journal written before ``jev_call_ms`` existed has to offer. The order matters:
+  for a call that retried, the response's own figure is the *smaller* one — a
+  20 694 ms call whose second attempt took 577 ms would be reported as 577 ms, which
+  is the undercount this journal format was extended to stop making. A tick that
+  observed no call has no latency to show, and says ``no call`` or ``not recorded``
+  instead of a number that would read as a fast one.
 * **A missing or unreadable picture is text, not a picture.** A tick with no
   ``frame_png``, or one whose file cannot be read, is labelled "not recorded" in
   words. No placeholder is ever drawn that could be mistaken for a real frame.
@@ -37,6 +46,11 @@ from typing import Mapping, Sequence
 
 from mario_jev.config import redact_url_userinfo
 from mario_jev.journal import Journal
+# The one recorded degradation this module has to recognise by name: a tick that
+# threw an answer away still paid for the call, and must not read as one that
+# never asked. Imported rather than repeated, so the page and the loop can never
+# disagree about the spelling.
+from mario_jev.policy import JEV_STALE_DISCARDED
 
 __all__ = ["build_html", "render_text", "write_html"]
 
@@ -47,6 +61,11 @@ DEFAULT_TITLE = "mario-jev run report"
 #: The words used when no call was made, and when a value was not recorded.
 NO_CALL = "no call"
 NOT_RECORDED = "not recorded"
+#: The words for a tick that applied no answer, and for one that threw away the
+#: answer it took. Both are recorded facts, and neither is "no call": the run may
+#: well have had a call in flight, or have just paid for one it refused to act on.
+NO_ANSWER = "no answer"
+DISCARDED = "discarded (stale)"
 #: The label used for a decision whose source was not recorded at all.
 UNRECORDED_SOURCE = "(unrecorded)"
 
@@ -65,10 +84,6 @@ def _escape(value: object) -> str:
 
 def _decision(tick: Mapping[str, object]) -> Mapping[str, object]:
     return _mapping(tick.get("decision"))
-
-
-def _latencies(tick: Mapping[str, object]) -> Mapping[str, object]:
-    return _mapping(tick.get("latencies_ms"))
 
 
 def _as_int(value: object, default: int = 0) -> int:
@@ -93,24 +108,91 @@ def _source_text(decision: Mapping[str, object]) -> str:
     return UNRECORDED_SOURCE if source is None else str(source)
 
 
-def _confidence_text(tick: Mapping[str, object]) -> str:
-    decision = _decision(tick)
-    if not decision.get("jev_called"):
-        return NO_CALL
-    value = decision.get("confidence")
+def _degradations(tick: Mapping[str, object]) -> tuple[str, ...]:
+    """The tick's recorded degradations as plain strings, or an empty tuple."""
+    recorded = tick.get("degradations")
+    if isinstance(recorded, Sequence) and not isinstance(recorded, (str, bytes)):
+        return tuple(str(item) for item in recorded)
+    return ()
+
+
+def _call_latency(tick: Mapping[str, object]) -> float | None:
+    """What the *call* this tick observed cost, or ``None`` if it observed none.
+
+    ``jev_call_ms`` first: it is the dispatcher's measurement around the whole call,
+    so it includes every attempt and the backoff between them. ``response["latency_ms"]``
+    is only the attempt that succeeded, and for a call that retried the two differ by
+    the entire failed attempt -- a 20 694 ms call whose second attempt took 577 ms is
+    one such case, and reporting 577 as "the Jev latency" hides 20 s. The response's
+    own figure is therefore the *fallback*, and only because a journal written before
+    ``jev_call_ms`` existed has nothing else to offer.
+
+    ``latencies_ms["jev"]`` is deliberately not consulted — it is this tick's
+    submit-and-take cost, and reporting it as the Jev latency would turn a 21 s call
+    into 0.002 ms.
+    """
+    value = tick.get("jev_call_ms")
     if value is None:
-        return NOT_RECORDED
-    return f"{float(value):.3f}"  # type: ignore[arg-type]
+        value = _mapping(tick.get("response")).get("latency_ms")
+    if value is None:
+        return None
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+def _answered(tick: Mapping[str, object]) -> bool:
+    """Whether this tick has any Jev call of its own to speak about.
+
+    True when it fired one, when it applied an answer, or when it observed a call
+    finish -- including one that failed or whose answer it discarded.
+    ``decision.jev_called`` alone is no longer this question: it means "this tick
+    *fired* a call", and a tick can apply or pay for a call it did not fire.
+    Anything that would otherwise print ``no call`` over a tick that did ask asks
+    this instead.
+    """
+    return (
+        bool(_decision(tick).get("jev_called"))
+        or tick.get("response") is not None
+        or _call_latency(tick) is not None
+    )
+
+
+def _confidence_text(tick: Mapping[str, object]) -> str:
+    value = _decision(tick).get("confidence")
+    if value is not None:
+        return f"{float(value):.3f}"  # type: ignore[arg-type]
+    return NOT_RECORDED if _answered(tick) else NO_CALL
 
 
 def _jev_latency_text(tick: Mapping[str, object]) -> str:
-    decision = _decision(tick)
-    if not decision.get("jev_called"):
-        return NO_CALL
-    value = _latencies(tick).get("jev")
-    if value is None:
+    value = _call_latency(tick)
+    if value is not None:
+        return f"{value:.3f}"
+    if _decision(tick).get("jev_called"):
+        # A call was fired and had not come back by the end of this tick. Its cost
+        # is recorded on the tick that observes it, not invented here.
         return NOT_RECORDED
-    return f"{float(value):.3f}"  # type: ignore[arg-type]
+    return NO_CALL
+
+
+def _answer_age_text(tick: Mapping[str, object]) -> str:
+    """How old the answer this tick applied was, in ticks, or why there is no number.
+
+    Four different facts, and none of them is ``0``: a journal written before the
+    staleness fields existed says ``not recorded``; a tick that applied a fresh
+    answer says ``0``; a tick that applied none says ``no answer``; and a tick that
+    took an answer and threw it away says so, because it paid for that call.
+    """
+    if "answer_age_ticks" not in tick:
+        return NOT_RECORDED
+    value = tick.get("answer_age_ticks")
+    if value is not None:
+        return str(_as_int(value))
+    if JEV_STALE_DISCARDED in _degradations(tick):
+        return DISCARDED
+    return NO_ANSWER
 
 
 def _attempts_text(tick: Mapping[str, object]) -> str:
@@ -118,14 +200,13 @@ def _attempts_text(tick: Mapping[str, object]) -> str:
 
     A tick that made no call reads as ``no call``, never as ``1``: one attempt and
     no attempt are different facts, and a run's whole point can be that it never
-    asked.
+    asked. A tick that observed a call which failed has no attempt count on the
+    record at all, and says ``not recorded`` rather than borrowing one.
     """
-    if not _decision(tick).get("jev_called"):
-        return NO_CALL
     value = _mapping(tick.get("response")).get("attempts")
-    if value is None:
-        return NOT_RECORDED
-    return str(_as_int(value, default=1))
+    if value is not None:
+        return str(_as_int(value, default=1))
+    return NOT_RECORDED if _answered(tick) else NO_CALL
 
 
 def _risk_text(tick: Mapping[str, object]) -> str:
@@ -176,16 +257,49 @@ def _derived(journal: Journal) -> dict[str, object]:
     }
 
 
+def _staleness(journal: Journal) -> dict[str, int] | None:
+    """How many answers were applied, how late, and how many were thrown away.
+
+    ``None`` means the journal predates these fields entirely — no tick line
+    carries ``answer_age_ticks`` — and the readers print ``not recorded`` for it.
+    Counting zeros over an old file would be a fact nobody recorded: a run from
+    before this change applied answers, it just never wrote down when they were
+    asked for.
+    """
+    if not any("answer_age_ticks" in tick for tick in journal.ticks):
+        return None
+    applied = 0
+    stale = 0
+    oldest = 0
+    discarded = 0
+    for tick in journal.ticks:
+        if JEV_STALE_DISCARDED in _degradations(tick):
+            discarded += 1
+        value = tick.get("answer_age_ticks")
+        if value is None:
+            continue
+        age = _as_int(value)
+        applied += 1
+        oldest = max(oldest, age)
+        if age > 0:
+            stale += 1
+    return {
+        "applied": applied,
+        "stale": stale,
+        "oldest": oldest,
+        "discarded": discarded,
+    }
+
+
 def _retried_ticks(journal: Journal) -> int:
     """How many ticks recorded a Jev answer that took more than one attempt.
 
-    Counted over the ticks that actually called, for the same reason the latency
-    statistics are: a tick that made no call has no attempt count to compare.
+    Counted over the recorded answers, wherever they landed: the attempt count is
+    a fact about the call, and the tick that applies an answer is the one that
+    writes it down, which need not be the tick that fired it.
     """
     retried = 0
     for tick in journal.ticks:
-        if not _decision(tick).get("jev_called"):
-            continue
         value = _mapping(tick.get("response")).get("attempts")
         if value is not None and _as_int(value, default=1) > 1:
             retried += 1
@@ -193,16 +307,19 @@ def _retried_ticks(journal: Journal) -> int:
 
 
 def _latency_stats(journal: Journal) -> tuple[float, float, float] | None:
-    """``(min, median, max)`` over the ticks that actually called Jev, or ``None``."""
+    """``(min, median, max)`` over the calls this run observed, or ``None``.
+
+    Over the *calls*, not over the ticks that fired one: a call fired on tick 4 and
+    observed on tick 6 costs what it cost, and tick 6 is the only line that can say
+    so. A tick that fired and is still waiting contributes nothing rather than a
+    zero.
+    """
     values: list[float] = []
     for tick in journal.ticks:
-        decision = _decision(tick)
-        if not decision.get("jev_called"):
-            continue
-        value = _latencies(tick).get("jev")
+        value = _call_latency(tick)
         if value is None:
             continue
-        values.append(float(value))  # type: ignore[arg-type]
+        values.append(value)
     if not values:
         return None
     values.sort()
@@ -230,19 +347,12 @@ def _series(
 
 
 def _confidence_point(tick: Mapping[str, object]) -> float | None:
-    decision = _decision(tick)
-    if not decision.get("jev_called"):
-        return None
-    value = decision.get("confidence")
+    value = _decision(tick).get("confidence")
     return None if value is None else float(value)  # type: ignore[arg-type]
 
 
 def _latency_point(tick: Mapping[str, object]) -> float | None:
-    decision = _decision(tick)
-    if not decision.get("jev_called"):
-        return None
-    value = _latencies(tick).get("jev")
-    return None if value is None else float(value)  # type: ignore[arg-type]
+    return _call_latency(tick)
 
 
 # -- the inline SVG charts ---------------------------------------------------------
@@ -453,7 +563,11 @@ def _summary_section(journal: Journal, derived: Mapping[str, object]) -> str:
         ("termination", summary.get("termination", NOT_RECORDED)),
         ("ticks", summary.get("ticks")),
         ("frames", summary.get("frames")),
-        ("decisions", summary.get("decisions")),
+        ("decisions (calls fired)", summary.get("decisions")),
+        # Beside ``decisions``, never instead of it: one counts the calls this run
+        # fired and the other the answers it acted on, and with the call off the
+        # tick they are different numbers.
+        ("answers_applied", summary.get("answers_applied", NOT_RECORDED)),
         ("decision_rate_hz", summary.get("decision_rate_hz")),
         ("elapsed_s", summary.get("elapsed_s")),
     ]
@@ -465,6 +579,16 @@ def _summary_section(journal: Journal, derived: Mapping[str, object]) -> str:
         ("fallbacks (source fallback_*)", derived["fallbacks"]),
         ("fallback_rate", f"{float(derived['fallback_rate']):.4f}"),
     ]
+    staleness = _staleness(journal)
+    if staleness is None:
+        derived_pairs.append(("answers applied (per tick)", NOT_RECORDED))
+    else:
+        derived_pairs += [
+            ("answers applied (per tick)", staleness["applied"]),
+            ("applied from an earlier tick", staleness["stale"]),
+            ("oldest applied answer (ticks)", staleness["oldest"]),
+            ("answers discarded as stale", staleness["discarded"]),
+        ]
     return (
         "<section><h2>Summary</h2>"
         "<h3>Recorded</h3>"
@@ -488,8 +612,9 @@ def _charts_section(journal: Journal) -> str:
         "<section><h2>Confidence and Jev latency over time</h2>"
         f"{_svg_chart(chart_id='confidence', title='confidence over frame index', series=confidence, y_min=0.0, y_max=1.0, y_format='{:.2f}')}"
         f"{_svg_chart(chart_id='latency', title='Jev latency (ms) over frame index', series=latency, y_min=0.0, y_max=latency_ceiling, y_format='{:.1f}')}"
-        "<p class=\"note\">A tick that made no Jev call is a gap in the series, "
-        "never a point at zero.</p>"
+        "<p class=\"note\">A tick that observed no Jev call is a gap in the series, "
+        "never a point at zero. The latency plotted is the call's own, on the tick "
+        "that observed it finish.</p>"
         "</section>"
     )
 
@@ -523,7 +648,7 @@ def _advisor_html(advisor: object) -> str:
 
 def _scores_html(tick: Mapping[str, object], chosen: str | None, probabilities: Mapping[str, object]) -> str:
     if not probabilities:
-        if _decision(tick).get("jev_called"):
+        if _answered(tick):
             return f"<p class=\"missing\">{NOT_RECORDED}</p>"
         return f"<p class=\"missing\">{NO_CALL}: no Jev response was recorded</p>"
     rows = []
@@ -540,8 +665,8 @@ def _scores_html(tick: Mapping[str, object], chosen: str | None, probabilities: 
 def _tick_table(journal: Journal) -> str:
     header = (
         "<tr><th>tick</th><th>frame</th><th>emulator tick</th><th>action</th>"
-        "<th>source</th><th>confidence</th><th>risk</th><th>jev called</th>"
-        "<th>jev latency (ms)</th><th>jev attempts</th></tr>"
+        "<th>source</th><th>answer age (ticks)</th><th>confidence</th><th>risk</th>"
+        "<th>jev called</th><th>jev latency (ms)</th><th>jev attempts</th></tr>"
     )
     rows = []
     for tick in journal.ticks:
@@ -553,6 +678,10 @@ def _tick_table(journal: Journal) -> str:
             f"<td>{_as_int(tick.get('emulator_tick'))}</td>"
             f"<td>{_escape(decision.get('action'))}</td>"
             f"<td>{_escape(_source_text(decision))}</td>"
+            # Beside the source, because ``jev_stale`` says an answer was old and
+            # only this column says how old, and because a discarded answer shows
+            # up here rather than vanishing into an unread degradations list.
+            f"<td>{_escape(_answer_age_text(tick))}</td>"
             f"<td>{_escape(_confidence_text(tick))}</td>"
             f"<td>{_escape(_risk_text(tick))}</td>"
             f"<td>{_escape('yes' if decision.get('jev_called') else 'no')}</td>"
@@ -580,6 +709,7 @@ def _tick_sections(journal: Journal, base: Path | None) -> str:
         pairs = [
             ("action", decision.get("action")),
             ("source", _source_text(decision)),
+            ("answer age (ticks)", _answer_age_text(tick)),
             ("confidence", _confidence_text(tick)),
             ("risk", _risk_text(tick)),
             ("jev called", "yes" if decision.get("jev_called") else "no"),
@@ -587,9 +717,9 @@ def _tick_sections(journal: Journal, base: Path | None) -> str:
             ("jev attempts", _attempts_text(tick)),
             ("reason", decision.get("reason")),
         ]
-        degradations = tick.get("degradations")
-        if isinstance(degradations, Sequence) and not isinstance(degradations, (str, bytes)) and degradations:
-            pairs.append(("degradations", ", ".join(str(item) for item in degradations)))
+        degradations = _degradations(tick)
+        if degradations:
+            pairs.append(("degradations", ", ".join(degradations)))
         blocks.append(
             f"<section class=\"tick\" id=\"tick-{number}\">"
             f"<h3>Tick {number} (frame {_frame_index(tick)})</h3>"
@@ -694,8 +824,18 @@ def render_text(journal: Journal) -> str:
     """The same facts as the dashboard, as plain text for the terminal.
 
     A tick that made no Jev call prints ``no call`` for its confidence and its
-    Jev latency; the Jev latency statistics cover only the ticks that actually
-    called Jev, and say so when there were none.
+    Jev latency; the Jev latency statistics cover only the calls this run actually
+    observed, and say so when there were none. Every latency here is the *call's*,
+    taken from the applied answer or from ``jev_call_ms`` — never from
+    ``latencies_ms["jev"]``, which since the call left the tick measures only the
+    submit and the take.
+
+    Firing a call and applying an answer are printed as the two different facts
+    they are: ``decisions`` counts the calls this run fired, ``answers_applied``
+    the answers it acted on, and the block between them says how many of those
+    answers came from an earlier tick and how many were thrown away for being too
+    old. A journal written before those fields existed says ``not recorded`` there
+    rather than zero.
 
     The retry line is printed only when some tick's answer cost more than one
     transport attempt. Read with the header's ``jev_timeout_s``, it is what turns
@@ -724,6 +864,7 @@ def render_text(journal: Journal) -> str:
         "ticks",
         "frames",
         "decisions",
+        "answers_applied",
         "decision_rate_hz",
         "elapsed_s",
     ):
@@ -750,6 +891,23 @@ def render_text(journal: Journal) -> str:
     lines.append(f"  fallbacks (source fallback_*): {derived['fallbacks']}")
     lines.append(f"  fallback_rate: {float(derived['fallback_rate']):.4f}")
 
+    # Fired and applied are not the same fact any more, and a reader who only saw
+    # ``decisions`` would read a run that asked ten times and acted seven as one
+    # that decided ten times.
+    staleness = _staleness(journal)
+    lines += ["", "jev calls, fired versus applied:"]
+    lines.append(f"  calls fired (jev_called true): {derived['decisions']}")
+    if staleness is None:
+        lines.append(
+            f"  answers applied: {NOT_RECORDED} (this journal carries no "
+            "answer_age_ticks; it predates the staleness fields)"
+        )
+    else:
+        lines.append(f"  answers applied: {staleness['applied']}")
+        lines.append(f"  applied from an earlier tick: {staleness['stale']}")
+        lines.append(f"  oldest applied answer age (ticks): {staleness['oldest']}")
+        lines.append(f"  answers discarded as stale: {staleness['discarded']}")
+
     lines += ["", "ticks:"]
     if journal.ticks:
         for tick in journal.ticks:
@@ -759,6 +917,7 @@ def render_text(journal: Journal) -> str:
                 f"emulator_tick {_as_int(tick.get('emulator_tick'))} "
                 f"action={decision.get('action')} "
                 f"source={_source_text(decision)} "
+                f"answer_age={_answer_age_text(tick)} "
                 f"confidence={_confidence_text(tick)} "
                 f"risk={_risk_text(tick)} "
                 f"jev_called={'true' if decision.get('jev_called') else 'false'} "
@@ -770,10 +929,14 @@ def render_text(journal: Journal) -> str:
     retried = _retried_ticks(journal)
     if retried:
         # Printed only when there was one. A "0" here would be a number a reader
-        # has to interpret; silence is the same fact without the ambiguity.
+        # has to interpret; silence is the same fact without the ambiguity. The
+        # denominator is the recorded answers, which is the set the numerator was
+        # counted over -- ``decisions`` counts fired calls, and a ratio of one set
+        # over another would be a number that means nothing.
+        answers = sum(1 for tick in journal.ticks if tick.get("response") is not None)
         lines.append("")
         lines.append(
-            f"retried jev calls: {retried} of {derived['decisions']} called ticks "
+            f"retried jev calls: {retried} of {answers} recorded answers "
             "reported more than one transport attempt"
         )
 
@@ -781,12 +944,12 @@ def render_text(journal: Journal) -> str:
     lines.append("")
     if stats is None:
         lines.append(
-            "jev latency over called ticks: no tick called Jev; not recorded"
+            "jev latency over observed calls: no call was observed; not recorded"
         )
     else:
         low, median, high = stats
         lines.append(
-            "jev latency over called ticks: "
+            "jev latency over observed calls: "
             f"min={low:.3f} median={median:.3f} max={high:.3f}"
         )
     return "\n".join(lines)

@@ -948,7 +948,47 @@ because a reader is handed a *file* and an older or edited header must not put a
 honest limits are stated in the code rather than implied: redaction is a projection, so the raw endpoint
 is still an attribute of the client object, and journals written before the change are not migrated.
 
-Round totals: **480 passed, 1 skipped** (from 406 before the batch), the single skip being the
+**Follow-up on finding #1 — the last one open — same day, and it was a redesign.** The defect was not the
+decision rate but that the world stopped: `step()` executes one game frame per tick and called the API
+in series inside it, so an unpaced run did 900 frames in 184 s and the tick that hit a 20 s timeout spent
+21 271.52 ms inside Jev, freezing Mario for twenty seconds. A new `JevDispatcher`
+(`src/mario_jev/policy/dispatch.py`) owns one worker and at most one call in flight; the tick fires,
+takes whatever has finished, and executes its frame either way; a result older than
+`STALE_LIMIT_CADENCES * decision_cadence_frames` is discarded and the tick holds, which is what a
+non-cadence tick always did. `mario_jev.jev` was **not touched** — the committed synchronous client is
+run in a worker, and one call in flight is what makes that legitimate. No cancellation is attempted or
+claimed. The record gained the facts that make the evidence true: `asked_at_tick`, `answer_age_ticks`,
+`jev_call_ms` on the tick, `answers_applied` on the summary, and `DecisionSource.JEV_STALE` — promoted
+into the closed set rather than left as a free string, because that file's own docstring requires it.
+
+**Measured** (same machine, stage, seed, cadence 8, 200 frames; the "before" run in a worktree of the
+previous commit, both driven by `scripts/jev-env.sh` and both journalled into `artifacts/`):
+
+| | before (call inside the tick) | after (call off the tick) |
+|---|---|---|
+| frames / wall clock | 200 / 35.63 s | 200 / 28.87 s |
+| game frames per second | 5.61 | 6.93 |
+| tick `total` p90 / maximum | 475.8 / **1 203.4 ms** | 238.1 / **243.6 ms** |
+| ticks whose own cost ≥ 400 ms | **26** | **0** |
+| calls fired / their summed cost | 25 / 10 628 ms | 25 / 10 832 ms |
+| `decision.source` | hold 175, jev 19, below-conf 6 | hold 175, **jev_stale 18**, below-conf 6, guardrail 1 |
+
+The same 25 calls cost the same ~10.7 s and **no tick contains it any more**. It is deliberately not a
+cadence change: both builds fired 25 calls and held 175 frames, and Jev's own choice was executed on
+**19 of 200 frames before and 18 after** (the 19th is the one the lethal guardrail overrode). The rate
+figures are a single sample per build with different load (4.16 against 5.73); the structural ones are
+the claim. The worst tick of the old build (1 203.4 ms) was a **rollout** overrun, not a Jev stall — so
+the call was never the only thing that could stop the world, and the report says which was which. The
+next bottleneck is the rollout (~120 ms per tick), not the API, and no run has saturated 60 fps — both
+stated in the report rather than left implied.
+
+One defect was introduced by the parent's own instruction to the round and caught by the parent's probe:
+the reader was told to prefer `response["latency_ms"]`, which is only the attempt that *succeeded*, so a
+call that retried was reported as its 577 ms second attempt instead of its 20 694 ms whole cost — the
+undercount finding #3 exists to prevent, reappearing in the reader. It now reads `jev_call_ms` first and
+falls back to the response only for journals written before that field existed.
+
+Round totals after this redesign: **525 passed, 1 skipped** (480 before it), the single skip being the same
 pre-existing `live_jev` test gated on `JEV_API_KEY`. No `xfail`, `skipif` or `pytest.skip` was added
 anywhere in `tests/`; the only skip marker in the tree is that pre-existing sanctioned one at
 `tests/test_jev_client.py`. A new observation also reached the report: the **same seed does not

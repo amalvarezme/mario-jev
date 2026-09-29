@@ -119,9 +119,13 @@ class TickDecision:
     ``confidence`` is ``None`` when no *choice* answer was gated (the decision was
     taken before the confidence gate); otherwise it is the gated confidence.
     ``risk`` is the ``risk`` score answer, populated only when the choice was
-    executed. ``jev_called`` is true whenever a Jev reply was consulted or a call
-    was attempted and degraded, which is exactly what ``RunSummary.decisions``
-    counts.
+    executed. ``jev_called`` is true when **this tick fired a call**, which is what
+    ``RunSummary.decisions`` counts. That is not the same as consulting a reply:
+    since the call left the tick, a tick can apply an answer an *earlier* tick asked
+    for, and it records ``jev_called=False``, because the fire is counted where it
+    happened. ``RunSummary.answers_applied`` counts the other fact, and reading
+    ``jev_called`` as "this decision came from Jev" would overstate how often the
+    model was asked.
     """
 
     action: str

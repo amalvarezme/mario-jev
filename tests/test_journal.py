@@ -21,10 +21,11 @@ transport, so the records are genuine rows rather than fixtures.
 from __future__ import annotations
 
 import json
+from collections import Counter
 from concurrent.futures import Future
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Mapping, Sequence
 
 import mario_jev.journal
 import numpy as np
@@ -40,7 +41,14 @@ from mario_jev.advisor import (
 )
 from mario_jev.config import Settings
 from mario_jev.emulator import MarioEmulator, build_actions
-from mario_jev.jev import ChoiceAnswer, HttpResult, JevClient, JevResponse, Usage
+from mario_jev.jev import (
+    ChoiceAnswer,
+    HttpResult,
+    JevClient,
+    JevResponse,
+    JevUnavailable,
+    Usage,
+)
 from mario_jev.journal import (
     Journal,
     JournalFormatError,
@@ -326,6 +334,12 @@ def test_the_header_is_written_on_construction(tmp_path: Path) -> None:
 #: the schema, so they are written out here rather than read off the code under
 #: test: a key that appears without this list changing is an unreviewed schema
 #: change, and a reader of the journal has no way to notice one.
+#:
+#: Updated deliberately when the Jev call left the tick: ``asked_at_tick``,
+#: ``answer_age_ticks`` and ``jev_call_ms`` on the tick line, ``answers_applied``
+#: on the summary. Firing a call and applying its answer became two facts about
+#: two different ticks, and the four keys are what a reader needs to tell them
+#: apart. Leaving this list stale would have been the failure it is here to catch.
 TICK_LINE_KEYS = (
     "kind",
     "tick",
@@ -335,6 +349,9 @@ TICK_LINE_KEYS = (
     "rollout",
     "questions",
     "response",
+    "asked_at_tick",
+    "answer_age_ticks",
+    "jev_call_ms",
     "decision",
     "advisor",
     "latencies_ms",
@@ -349,6 +366,7 @@ SUMMARY_LINE_KEYS = (
     "ticks",
     "frames",
     "decisions",
+    "answers_applied",
     "sources",
     "degradations",
     "elapsed_s",
@@ -894,6 +912,328 @@ def test_a_real_run_distinguishes_a_measured_absence_from_a_disabled_advisor(
     }
     # The whole point: an enabled-but-absent advisor is never written as disabled.
     assert measured.ticks[0]["advisor"] != disabled.ticks[0]["advisor"]
+
+
+# -- 6b. the call left the tick, so the journal has to say when it was asked --------
+# Every record above is written by a run whose call finishes inside the tick that
+# fired it (``InlineRunner``), so every one of them reads an age of 0 and none of
+# them can show what this section is about. Driving the runner by hand is the only
+# way a *file* can carry an answer applied late, one discarded for being too old,
+# or a call that failed after the tick that fired it was already over.
+
+
+class ManualRunner:
+    """A runner the test drives by hand: a call finishes when ``run_next`` says so.
+
+    The same seam ``tests/test_dispatch.py`` and ``tests/test_policy.py`` drive,
+    kept local for the same reason :class:`InlineRunner` is: it is a dozen lines,
+    and the test files here do not import each other.
+    """
+
+    def __init__(self) -> None:
+        self.pending: list[tuple[Future[object], Callable[[], object]]] = []
+        self.submitted = 0
+        self.shutdowns = 0
+
+    def submit(self, fn: Callable[[], object]) -> Future[object]:
+        self.submitted += 1
+        future: Future[object] = Future()
+        self.pending.append((future, fn))
+        return future
+
+    def run_next(self) -> None:
+        """Finish the oldest submitted call, as a real worker eventually would."""
+        future, fn = self.pending.pop(0)
+        future.set_result(fn())
+
+    def shutdown(self, *, wait: bool = True) -> None:
+        self.shutdowns += 1
+
+
+class StepClock:
+    """A clock that jumps a fixed amount per reading, so a call costs exactly that.
+
+    The dispatcher reads it once on each side of ``client.ask``, so ``step_s=0.25``
+    makes every call a quarter-second one -- written as ``jev_call_ms == 250.0``
+    without any test waiting a quarter of a second or reading the real clock.
+    """
+
+    def __init__(self, *, step_s: float) -> None:
+        self.step_s = step_s
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        value = self.now
+        self.now += self.step_s
+        return value
+
+
+CALL_MS = 250.0
+
+
+class QueuedClient:
+    """A client that hands back queued answers and raises queued failures.
+
+    It replaces the transport *and* the client for the two tests whose subject is
+    a failed call: ``JevUnavailable`` is what the loop absorbs, and raising it
+    here says so directly instead of hoping a scripted HTTP result is classified
+    into it. The successful answers are real :class:`JevResponse` values, so what
+    reaches the journal is the client's own ``as_dict``.
+    """
+
+    def __init__(self, *outcomes: object) -> None:
+        self.outcomes = list(outcomes)
+        self.calls = 0
+
+    def ask(self, questions: object, state: object) -> JevResponse:
+        self.calls += 1
+        if not self.outcomes:
+            raise AssertionError("the loop asked more times than the test queued")
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        assert isinstance(outcome, JevResponse)
+        return outcome
+
+
+def answer(choice: str = "right", *, confidence: float = 0.9) -> JevResponse:
+    """One successful answer, as the client would have parsed it."""
+    return JevResponse(
+        model="jev-test",
+        answers={
+            "best_action": ChoiceAnswer(
+                type="choice",
+                choice=choice,
+                confidence=confidence,
+                probabilities={choice: 1.0},
+            )
+        },
+        usage=Usage(input_tokens=10, output_tokens=5),
+        latency_ms=CALL_MS,
+        attempts=1,
+    )
+
+
+def hand_driven_loop(
+    client: object, runner: ManualRunner, emulator: MarioEmulator
+) -> tuple[ExecutionLoop, Settings]:
+    """A real loop over a real emulator whose calls land only when the test says."""
+    settings = make_settings()
+    dispatcher = JevDispatcher(
+        client,  # type: ignore[arg-type]
+        runner=runner,
+        clock=StepClock(step_s=CALL_MS / 1000.0),
+    )
+    loop = ExecutionLoop(
+        settings,
+        emulator=emulator,
+        client=client,  # type: ignore[arg-type]
+        dispatcher=dispatcher,
+    )
+    return loop, settings
+
+
+def summary_over(records: Sequence[TickRecord], *, elapsed_s: float = 0.5) -> RunSummary:
+    """A summary counted off the records the way ``ExecutionLoop.run`` counts one.
+
+    These tests step the loop by hand so a call can land on a later tick, which
+    means ``run()`` -- and the summary it builds -- is not available to them. The
+    counting rule itself is pinned over the real ``run()`` in
+    ``tests/test_policy.py``; what is at stake here is that both counts reach the
+    file and stay apart on the way.
+    """
+    decisions = sum(1 for record in records if record.decision.jev_called)
+    return RunSummary(
+        ticks=len(records),
+        frames=len(records),
+        decisions=decisions,
+        answers_applied=sum(
+            1 for record in records if record.answer_age_ticks is not None
+        ),
+        sources=Counter(record.decision.source for record in records),
+        degradations=Counter(
+            name for record in records for name in record.degradations
+        ),
+        elapsed_s=elapsed_s,
+        decision_rate_hz=decisions / elapsed_s,
+        termination="max_ticks",
+    )
+
+
+def write_records(
+    path: Path, records: Sequence[TickRecord], settings: Settings
+) -> Journal:
+    """Put real records through a real writer and read the file back."""
+    writer = JournalWriter(path, settings=settings, clock=fixed_clock)
+    for record in records:
+        writer.observer()(record)
+    writer.write_summary(summary_over(records))
+    writer.close()
+    return read_journal(path)
+
+
+def raw_lines(path: Path) -> list[Mapping[str, object]]:
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def test_an_answer_applied_a_tick_late_is_written_with_the_tick_that_asked(
+    tmp_path: Path, emulator: MarioEmulator
+) -> None:
+    """The file, not the record, has to say that the answer came from tick 0.
+
+    ``questions`` says a tick fired and ``response`` says a tick applied, and with
+    the call off the tick those are two different ticks. Without ``asked_at_tick``
+    and ``answer_age_ticks`` on the line, a reader of this run would see tick 1
+    decide with Jev and have no way to learn the answer described the world as it
+    was a frame earlier.
+    """
+    runner = ManualRunner()
+    transport = ScriptedTransport(ok_result("right"))
+    settings = make_settings()
+    client = JevClient(
+        endpoint=settings.jev_endpoint,
+        model=settings.jev_model,
+        api_key=settings.jev_api_key,
+        timeout_s=settings.jev_timeout_s,
+        max_attempts=1,
+        transport=transport,
+        sleeper=SilentSleeper(),
+    )
+    loop, settings = hand_driven_loop(client, runner, emulator)
+
+    asked = loop.step()  # fires; nothing has finished, so nothing is applied
+    runner.run_next()  # the worker finishes the call between the two ticks
+    applied = loop.step()  # takes an answer that is one tick old
+
+    path = tmp_path / "late.jsonl"
+    journal = write_records(path, (asked, applied), settings)
+    first, second = journal.ticks
+
+    assert first["questions"] is not None, "tick 0 is the tick that fired"
+    assert first["response"] is None
+    assert first["asked_at_tick"] is None
+    assert first["answer_age_ticks"] is None
+    assert first["jev_call_ms"] is None
+    assert first["decision"]["source"] == "hold"
+
+    assert second["response"] is not None
+    assert second["asked_at_tick"] == 0
+    assert second["answer_age_ticks"] == 1
+    assert second["jev_call_ms"] == CALL_MS
+    assert second["decision"]["source"] == "jev_stale"
+    # It fired nothing itself: the call it applied was tick 0's.
+    assert second["questions"] is None
+    assert second["decision"]["jev_called"] is False
+
+    # Off the raw bytes too: the age and the cost must survive JSON as numbers.
+    lines = raw_lines(path)
+    assert lines[2]["answer_age_ticks"] == 1
+    assert lines[2]["jev_call_ms"] == CALL_MS
+    assert lines[3]["answers_applied"] == 1
+
+
+def test_an_answer_older_than_the_bound_is_written_as_discarded(
+    tmp_path: Path, emulator: MarioEmulator
+) -> None:
+    """A discarded answer still cost what it cost, and the file has to show both.
+
+    The tick that throws the answer away is the only tick that can report the
+    call, so ``jev_call_ms`` is on it while ``response`` is not. A reader who saw
+    neither would read the tick as one that never asked.
+    """
+    runner = ManualRunner()
+    client = QueuedClient(answer("right"))
+    loop, settings = hand_driven_loop(client, runner, emulator)
+
+    # ``STALE_LIMIT_CADENCES`` is 3 and the cadence is 1 frame, so an answer is
+    # discarded once it is four ticks old. Nothing fires in between: the call is
+    # still in flight, which is exactly the run this bound exists for.
+    records = [loop.step()]
+    for _ in range(3):
+        records.append(loop.step())
+    runner.run_next()
+    records.append(loop.step())
+
+    journal = write_records(tmp_path / "discarded.jsonl", records, settings)
+    discarding = journal.ticks[4]
+
+    assert discarding["response"] is None
+    assert discarding["answer_age_ticks"] is None
+    assert discarding["asked_at_tick"] is None
+    assert discarding["jev_call_ms"] == CALL_MS
+    assert "jev_stale_discarded" in discarding["degradations"]
+    assert discarding["decision"]["source"] == "hold"
+    assert journal.summary["answers_applied"] == 0
+    assert journal.summary["decisions"] == 1, "the one call was still fired"
+
+
+def test_a_failed_call_is_written_on_the_tick_that_observed_it(
+    tmp_path: Path, emulator: MarioEmulator
+) -> None:
+    """A transient failure lands a tick later than the tick that paid for it.
+
+    The failure is degraded, not raised -- that part is the policy's, and it is
+    pinned there. What is pinned here is that the *file* carries it: the observing
+    tick has the degraded source with the transport's own reason, the cost of the
+    call that failed, and no response at all.
+    """
+    runner = ManualRunner()
+    failure = JevUnavailable("the endpoint timed out after 20.0s")
+    client = QueuedClient(failure)
+    loop, settings = hand_driven_loop(client, runner, emulator)
+
+    firing = loop.step()
+    runner.run_next()
+    observing = loop.step()
+
+    path = tmp_path / "failed.jsonl"
+    journal = write_records(path, (firing, observing), settings)
+    first, second = journal.ticks
+
+    assert first["decision"]["jev_called"] is True, "tick 0 fired the call"
+    assert first["jev_call_ms"] is None, "nothing had come back yet"
+
+    assert second["response"] is None
+    assert second["jev_call_ms"] == CALL_MS
+    assert second["asked_at_tick"] is None
+    assert second["answer_age_ticks"] is None
+    assert second["decision"]["source"] == "fallback_degraded"
+    assert "timed out" in second["decision"]["reason"]
+    assert client.calls == 1
+
+    lines = raw_lines(path)
+    assert lines[2]["jev_call_ms"] == CALL_MS
+    assert lines[2]["response"] is None
+
+
+def test_the_summary_line_keeps_fired_calls_and_applied_answers_apart(
+    tmp_path: Path, emulator: MarioEmulator
+) -> None:
+    """Two calls fired, one answer applied, and the trailer says both numbers.
+
+    ``decisions`` has always counted fired calls and still does; a run whose first
+    call failed applied one fewer answer than it fired, and ``answers_applied`` is
+    the only field on the line that can say so.
+    """
+    runner = ManualRunner()
+    client = QueuedClient(JevUnavailable("connection reset"), answer("right"))
+    loop, settings = hand_driven_loop(client, runner, emulator)
+
+    records = [loop.step()]  # fires the call that will fail
+    runner.run_next()
+    records.append(loop.step())  # observes the failure
+    records.append(loop.step())  # fires the call that will succeed
+    runner.run_next()
+    records.append(loop.step())  # applies it, one tick late
+
+    journal = write_records(tmp_path / "apart.jsonl", records, settings)
+
+    assert journal.summary["decisions"] == 2
+    assert journal.summary["answers_applied"] == 1
+    assert journal.summary["decisions"] != journal.summary["answers_applied"]
+    assert journal.ticks[3]["answer_age_ticks"] == 1
+    assert journal.summary["sources"]["jev_stale"] == 1
+    assert journal.summary["sources"]["fallback_degraded"] == 1
 
 
 # -- 9. frame_index and emulator_tick are different quantities -----------------------

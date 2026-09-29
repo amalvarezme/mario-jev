@@ -162,10 +162,21 @@ def tick_record(
     tick's action ran, which is what lets a reader find the tick that ended the
     run instead of inferring it from the line count.
 
+    ``questions`` is what this tick **fired** and ``response`` what it
+    **applied**, and they need not describe the same call. The three keys between
+    them close that gap: ``asked_at_tick`` is the tick that fired the applied
+    answer, ``answer_age_ticks`` is ``tick - asked_at_tick``, and ``jev_call_ms``
+    is what the *call* cost, on the tick that observed it finish -- applied,
+    discarded or failed. All three are ``null`` where there is nothing to report,
+    and ``jev_call_ms`` is deliberately **not** ``latencies_ms["jev"]``: that one
+    is the few microseconds this tick spent submitting and taking, and folding a
+    21 s call into it would break the arithmetic a reader does over the phases.
+
     The keys are, in order: ``kind``, ``tick``, ``frame_index``,
     ``emulator_tick``, ``state``, ``rollout``, ``questions``, ``response``,
-    ``decision``, ``advisor``, ``latencies_ms``, ``degradations``,
-    ``terminated``, ``truncated``, ``frame_png`` and ``trajectory_png``.
+    ``asked_at_tick``, ``answer_age_ticks``, ``jev_call_ms``, ``decision``,
+    ``advisor``, ``latencies_ms``, ``degradations``, ``terminated``,
+    ``truncated``, ``frame_png`` and ``trajectory_png``.
     """
     decision = record.decision
     return {
@@ -177,6 +188,15 @@ def tick_record(
         "rollout": record.rollout.as_dict(),
         "questions": record.jev_questions,
         "response": record.jev_response,
+        "asked_at_tick": (
+            None if record.asked_at_tick is None else int(record.asked_at_tick)
+        ),
+        "answer_age_ticks": (
+            None if record.answer_age_ticks is None else int(record.answer_age_ticks)
+        ),
+        "jev_call_ms": (
+            None if record.jev_call_ms is None else float(record.jev_call_ms)
+        ),
         "decision": {
             "action": str(decision.action),
             "source": _source_value(decision.source),
@@ -206,15 +226,21 @@ def summary_record(summary: RunSummary) -> dict[str, object]:
     of :data:`~mario_jev.policy.TERMINATIONS`, written verbatim: the summary was
     refused at construction if it were anything else.
 
+    ``decisions`` counts the ticks that **fired** a call and ``answers_applied``
+    the ticks that **applied** an answer. They are different numbers once the call
+    is off the tick, so both are written: a run can fire ten calls and act on
+    seven of them, and no arithmetic over the other keys can recover that.
+
     The keys are, in order: ``kind``, ``ticks``, ``frames``, ``decisions``,
-    ``sources``, ``degradations``, ``elapsed_s``, ``decision_rate_hz`` and
-    ``termination``.
+    ``answers_applied``, ``sources``, ``degradations``, ``elapsed_s``,
+    ``decision_rate_hz`` and ``termination``.
     """
     return {
         "kind": KIND_SUMMARY,
         "ticks": int(summary.ticks),
         "frames": int(summary.frames),
         "decisions": int(summary.decisions),
+        "answers_applied": int(summary.answers_applied),
         "sources": {
             _source_value(source): int(count) for source, count in summary.sources.items()
         },

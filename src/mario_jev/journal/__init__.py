@@ -26,11 +26,17 @@ What each line carries, and why
   block that says whether an advice was present and, when none was, whether its
   absence was *measured* or the advisor was simply disabled, ``latencies_ms``,
   ``degradations``, the post-step ``terminated``/``truncated`` flags, and the
-  relative ``frame_png``/``trajectory_png`` paths.
+  relative ``frame_png``/``trajectory_png`` paths. Because the Jev call is no
+  longer made inside the tick, the ``questions`` a tick fired and the
+  ``response`` it applied can belong to different calls, so the line also carries
+  ``asked_at_tick`` (the tick the applied answer was asked on),
+  ``answer_age_ticks`` (how many ticks old it was) and ``jev_call_ms`` (what the
+  call itself cost, on the tick that observed it finish).
 * **summary** — its ``kind`` and the counted run shape: ``ticks``, ``frames``,
-  ``decisions``, ``sources`` and ``degradations`` as plain objects keyed by
-  string names, ``elapsed_s``, ``decision_rate_hz``, and the ``termination``
-  that says why the run stopped.
+  ``decisions`` (calls fired), ``answers_applied`` (answers acted on),
+  ``sources`` and ``degradations`` as plain objects keyed by string names,
+  ``elapsed_s``, ``decision_rate_hz``, and the ``termination`` that says why the
+  run stopped.
 
 Those two enumerations are the schema, and they are checked against the real
 key sets by ``tests/test_journal.py``: a stale enumeration is a false statement

@@ -76,7 +76,26 @@ def _tick(
     terminated: bool = False,
     truncated: bool = False,
     attempts: int = 1,
+    asked_at_tick: int | None = None,
+    answer_age_ticks: int | None = None,
+    jev_call_ms: float | None = None,
+    jev_phase_ms: float | None = None,
+    degradations: tuple[str, ...] = (),
 ) -> dict[str, object]:
+    """One crafted tick line, in the schema the writer produces today.
+
+    A tick that carries a response is a tick that *applied* an answer, so unless
+    the caller says otherwise it applied a fresh one: age ``0``, asked on itself,
+    and ``jev_call_ms`` equal to the call's own latency. That is the shape the
+    writer produces, and leaving the three new keys off would make every crafted
+    journal here look like one written before they existed.
+
+    ``jev_phase_ms`` overrides ``latencies_ms["jev"]``, which since the call left
+    the tick measures only the submit and the take. The two fields are given the
+    same value by default and pulled apart in ``_decoupled_journal``, which is
+    where a reader that takes its Jev latency from the tick instead of the call
+    stops agreeing with one that takes it from the call.
+    """
     response = None
     if probabilities is not None:
         response = {
@@ -93,6 +112,7 @@ def _tick(
                 }
             },
         }
+    applied = response is not None and asked_at_tick is None and answer_age_ticks is None
     return {
         "kind": "tick",
         "tick": number,
@@ -102,6 +122,9 @@ def _tick(
         "rollout": {},
         "questions": None,
         "response": response,
+        "asked_at_tick": number if applied and asked_at_tick is None else asked_at_tick,
+        "answer_age_ticks": 0 if applied and answer_age_ticks is None else answer_age_ticks,
+        "jev_call_ms": jev_latency if (jev_call_ms is None and response is not None) else jev_call_ms,
         "decision": {
             "action": action,
             "source": source,
@@ -111,8 +134,13 @@ def _tick(
             "jev_called": jev_called,
         },
         "advisor": {"available": False, "reason": "disabled", "measured": False},
-        "latencies_ms": {"rollout": 1.0, "jev": jev_latency, "advisor": 0.0, "total": 2.0},
-        "degradations": [],
+        "latencies_ms": {
+            "rollout": 1.0,
+            "jev": jev_latency if jev_phase_ms is None else jev_phase_ms,
+            "advisor": 0.0,
+            "total": 2.0,
+        },
+        "degradations": list(degradations),
         "terminated": terminated,
         "truncated": truncated,
         "frame_png": frame_png,
@@ -128,17 +156,23 @@ def _summary_for(
 ) -> dict[str, object]:
     sources: dict[str, int] = {}
     decisions = 0
+    applied = 0
     for tick in ticks:
         decision = tick["decision"]
         assert isinstance(decision, dict)
         sources[str(decision["source"])] = sources.get(str(decision["source"]), 0) + 1
         if decision["jev_called"]:
             decisions += 1
+        if tick.get("answer_age_ticks") is not None:
+            applied += 1
     return {
         "kind": "summary",
         "ticks": len(ticks),
         "frames": len(ticks),
         "decisions": decisions,
+        # Counted apart from ``decisions`` for the same reason the loop counts them
+        # apart: one is the calls fired, the other the answers acted on.
+        "answers_applied": applied,
         "sources": sources,
         "degradations": {},
         "elapsed_s": elapsed_s,
@@ -710,8 +744,11 @@ def test_build_html_is_deterministic() -> None:
 def test_render_text_prints_sources_fallbacks_and_latency_stats() -> None:
     ticks = (
         _tick(0, source="fallback_no_key"),
-        _tick(1, source="jev", jev_called=True, jev_latency=1.0, confidence=0.9),
-        _tick(2, source="jev", jev_called=True, jev_latency=3.0, confidence=0.8),
+        # These two observed their own calls, and what a call cost is
+        # ``jev_call_ms``: the statistic used to read ``latencies_ms["jev"]``,
+        # which is now the submit-and-take cost and would be microseconds.
+        _tick(1, source="jev", jev_called=True, jev_call_ms=1.0, confidence=0.9),
+        _tick(2, source="jev", jev_called=True, jev_call_ms=3.0, confidence=0.8),
     )
     text = render_text(_journal(ticks))
 
@@ -720,13 +757,13 @@ def test_render_text_prints_sources_fallbacks_and_latency_stats() -> None:
     assert "jev: 2" in text
     assert "fallbacks (source fallback_*): 1" in text
     assert "confidence=no call" in text
-    assert "jev latency over called ticks: min=1.000 median=2.000 max=3.000" in text
+    assert "jev latency over observed calls: min=1.000 median=2.000 max=3.000" in text
 
 
 def test_render_text_says_so_when_no_tick_called_jev() -> None:
     text = render_text(_journal((_tick(0, source="fallback_no_key"),)))
 
-    assert "no tick called Jev; not recorded" in text
+    assert "jev latency over observed calls: no call was observed; not recorded" in text
 
 
 # -- the retry, in both readers -----------------------------------------------------
@@ -756,7 +793,11 @@ def test_render_text_names_the_retry_count_only_when_a_tick_retried() -> None:
 
     text = render_text(_journal(retried))
 
-    assert "retried jev calls: 1 of 2 called ticks" in text
+    # Counted over the recorded answers, which is the set the numerator comes
+    # from: ``decisions`` counts fired calls, and an answer can be applied by a
+    # tick that fired nothing, so a ratio of one set over the other would mean
+    # nothing.
+    assert "retried jev calls: 1 of 2 recorded answers" in text
     # A journal with no retried tick says nothing about retries at all, rather
     # than printing a zero a reader has to interpret.
     assert "retr" not in render_text(_journal((retried[1],)))
@@ -776,6 +817,263 @@ def test_the_dashboard_tick_row_shows_the_attempt_count() -> None:
     assert "<td>577.000</td><td>2</td>" in html
     # And a tick that made no call still reads as no call in both cells, never as 1.
     assert "<td>no call</td><td>no call</td>" in html
+
+
+# -- the call that left the tick, in both readers -----------------------------------
+# Firing a call and applying its answer are now two facts about two ticks, and the
+# trap this sets is ``latencies_ms["jev"]``: it still exists, it is still a Jev
+# number, and it now measures the submit and the take rather than the call. A
+# reader that keeps printing it reports a twenty-one-second call as two
+# microseconds, which is the most flattering lie available.
+
+#: What a tick spends on Jev now: submitting and taking, in microseconds.
+JEV_PHASE_MS = 0.002
+#: What the call itself cost -- the 21 s stall the live evaluation measured.
+CALL_MS = 21271.52
+#: The one attempt of that call that succeeded. The response records this, and it is
+#: smaller than the call by everything the retry cost.
+ATTEMPT_MS = 577.0
+
+#: The keys a journal written before the call left the tick does not carry.
+LEGACY_TICK_KEYS = ("asked_at_tick", "answer_age_ticks", "jev_call_ms")
+
+
+def _legacy(journal: Journal) -> Journal:
+    """The same run as an older build would have written it: without the new keys.
+
+    Those journals exist, they still load, and every one of them is evidence for a
+    run somebody made. What a reader must never do is fill the gap with a default:
+    ``0`` applied answers is a claim about a run that never recorded one.
+    """
+    ticks = tuple(
+        {key: value for key, value in tick.items() if key not in LEGACY_TICK_KEYS}
+        for tick in journal.ticks
+    )
+    summary = {
+        key: value
+        for key, value in journal.summary.items()
+        if key != "answers_applied"
+    }
+    return Journal(run=journal.run, ticks=ticks, summary=summary)
+
+
+def _stale_journal() -> Journal:
+    """Tick 0 fires a call; tick 1 applies the answer, one tick late."""
+    ticks = (
+        _tick(
+            0,
+            source="hold",
+            action="right",
+            reason="cadence not due on this frame",
+            jev_called=True,
+            jev_phase_ms=JEV_PHASE_MS,
+        ),
+        _tick(
+            1,
+            source="jev_stale",
+            action="right",
+            reason="Jev chose 'right'",
+            confidence=0.9,
+            probabilities={"right": 1.0},
+            choice="right",
+            jev_latency=CALL_MS,
+            jev_phase_ms=JEV_PHASE_MS,
+            asked_at_tick=0,
+            answer_age_ticks=1,
+        ),
+    )
+    return _journal(ticks)
+
+
+def _discarded_journal() -> Journal:
+    """A call fired on tick 0 and thrown away on tick 4 for being four ticks old.
+
+    The staleness bound is three cadences, so tick 4 refuses to act on it -- and
+    tick 4 is still the only tick that can say what the call cost, because it is
+    the tick that observed it finish.
+    """
+    waiting = tuple(
+        _tick(
+            number,
+            source="hold",
+            action="right",
+            reason="cadence not due on this frame",
+            jev_phase_ms=JEV_PHASE_MS,
+        )
+        for number in range(1, 4)
+    )
+    ticks = (
+        _tick(
+            0,
+            source="hold",
+            action="right",
+            reason="cadence not due on this frame",
+            jev_called=True,
+            jev_phase_ms=JEV_PHASE_MS,
+        ),
+        *waiting,
+        _tick(
+            4,
+            source="hold",
+            action="right",
+            reason="cadence not due on this frame",
+            jev_call_ms=CALL_MS,
+            jev_phase_ms=JEV_PHASE_MS,
+            degradations=("jev_stale_discarded",),
+        ),
+    )
+    return _journal(ticks)
+
+
+def _failed_journal() -> Journal:
+    """A call fired on tick 0 that failed, observed and degraded on tick 1."""
+    ticks = (
+        _tick(
+            0,
+            source="hold",
+            action="right",
+            reason="cadence not due on this frame",
+            jev_called=True,
+            jev_phase_ms=JEV_PHASE_MS,
+        ),
+        _tick(
+            1,
+            source="fallback_degraded",
+            action="right",
+            reason="the endpoint timed out after 20.0s",
+            jev_call_ms=CALL_MS,
+            jev_phase_ms=JEV_PHASE_MS,
+        ),
+    )
+    return _journal(ticks)
+
+
+def test_render_text_reads_the_jev_latency_from_the_call_not_from_the_tick() -> None:
+    text = render_text(_stale_journal())
+
+    # The call cost 21 271.52 ms and the tick spent 0.002 ms submitting and taking
+    # it. Only one of those is a Jev latency, and the tick's own number must not
+    # appear anywhere a reader would read as one.
+    assert f"jev_latency_ms={CALL_MS:.3f}" in text
+    assert f"jev latency over observed calls: min={CALL_MS:.3f}" in text
+    assert f"{JEV_PHASE_MS:.3f}" not in text
+
+
+def test_render_text_separates_the_calls_fired_from_the_answers_applied() -> None:
+    text = render_text(_stale_journal())
+
+    assert "calls fired (jev_called true): 1" in text
+    assert "answers applied: 1" in text
+    assert "applied from an earlier tick: 1" in text
+    assert "oldest applied answer age (ticks): 1" in text
+    assert "answers discarded as stale: 0" in text
+    # And per tick: the source says the answer was old, the age says how old.
+    assert "source=jev_stale answer_age=1" in text
+    assert "source=hold answer_age=no answer" in text
+
+
+def test_render_text_shows_a_discarded_answer_as_a_call_that_was_paid_for() -> None:
+    text = render_text(_discarded_journal())
+
+    assert "answers discarded as stale: 1" in text
+    assert "answers applied: 0" in text
+    # The discarding tick made no *new* call, but it did observe one, and reading
+    # it as "no call" would hide 21 s of work the run really paid for.
+    assert f"answer_age=discarded (stale) confidence=not recorded risk=not recorded jev_called=false jev_latency_ms={CALL_MS:.3f}" in text
+
+
+def test_render_text_shows_a_failed_call_with_what_it_cost() -> None:
+    text = render_text(_failed_journal())
+
+    assert "answers applied: 0" in text
+    assert "calls fired (jev_called true): 1" in text
+    assert "source=fallback_degraded answer_age=no answer" in text
+    assert f"jev_latency_ms={CALL_MS:.3f}" in text
+    assert f"jev latency over observed calls: min={CALL_MS:.3f}" in text
+
+
+def test_render_text_reports_a_legacy_journal_as_not_recorded_never_as_zero(
+    tmp_path,
+) -> None:
+    # A journal an older build really wrote: the sources it knew, and none of the
+    # four keys this round added. Through a file, because "an old journal still
+    # loads" is a claim about the reader and the bytes, not about a value built
+    # in memory.
+    path = _write_journal(tmp_path / "legacy.jsonl", _legacy(_two_tick_journal()))
+    text = render_text(read_journal(path))
+
+    assert "answers_applied: not recorded" in text
+    assert "answers applied: not recorded" in text
+    assert "answer_age=not recorded" in text
+    assert "answers applied: 0" not in text
+    assert "applied from an earlier tick" not in text
+    # The response is still on the line, so its latency is still readable.
+    assert "jev_latency_ms=5.000" in text
+
+
+def test_the_dashboard_shows_the_answer_age_beside_the_source() -> None:
+    html = build_html(_stale_journal())
+
+    assert "<th>answer age (ticks)</th>" in html
+    # A stale tick and a fresh one must not read the same: the source names it and
+    # the age quantifies it, in the row and in the tick's own section.
+    assert "<td>jev_stale</td><td>1</td>" in html
+    assert "<th>answer age (ticks)</th><td>1</td>" in html
+    fresh = build_html(_two_tick_journal())
+    assert "<td>jev</td><td>0</td>" in fresh
+    assert "jev_stale" not in fresh
+
+
+def test_the_dashboard_reads_the_jev_latency_from_the_call() -> None:
+    html = build_html(_stale_journal())
+
+    assert f"<td>{CALL_MS:.3f}</td>" in html
+    assert f"{JEV_PHASE_MS:.3f}" not in html
+
+
+def test_the_dashboard_summary_counts_answers_applied_beside_decisions() -> None:
+    html = build_html(_stale_journal())
+
+    assert "<th>answers_applied</th><td>1</td>" in html
+    assert "<th>decisions (calls fired)</th><td>1</td>" in html
+    assert "<th>applied from an earlier tick</th><td>1</td>" in html
+    assert "<th>oldest applied answer (ticks)</th><td>1</td>" in html
+
+
+def test_the_dashboard_shows_a_discarded_answer_as_a_call_that_was_made() -> None:
+    html = build_html(_discarded_journal())
+
+    assert "<th>answers discarded as stale</th><td>1</td>" in html
+    # The discarding tick: its age cell says why there is no answer, and its
+    # latency cell says the call was still made and still cost 21 s.
+    assert "<td>discarded (stale)</td>" in html
+    assert f"<td>{CALL_MS:.3f}</td>" in html
+    assert "jev_stale_discarded" in html
+    # A tick that really made no call still reads as one, in the same table.
+    assert "<td>no answer</td>" in html
+    assert "<td>no call</td>" in html
+
+
+def test_the_dashboard_shows_a_failed_call_with_what_it_cost() -> None:
+    html = build_html(_failed_journal())
+
+    assert "<th>answers_applied</th><td>0</td>" in html
+    assert f"<td>{CALL_MS:.3f}</td>" in html
+    # No response was recorded, so there is no attempt count to print -- and "1"
+    # would be a number nobody measured.
+    assert "<td>not recorded</td>" in html
+    assert "the endpoint timed out after 20.0s" in html
+
+
+def test_the_dashboard_shows_not_recorded_for_a_journal_without_the_new_keys() -> None:
+    html = build_html(_legacy(_two_tick_journal()))
+
+    assert "<th>answers_applied</th><td>not recorded</td>" in html
+    assert "<th>answers applied (per tick)</th><td>not recorded</td>" in html
+    assert "<th>applied from an earlier tick</th>" not in html
+    # The age column is present for every tick and recorded for none of them.
+    assert "<th>answer age (ticks)</th>" in html
+    assert html.count("<td>not recorded</td>") >= 2
 
 
 # -- why the run stopped, in both readers ------------------------------------------
@@ -862,3 +1160,41 @@ def test_module_entry_point_delegates_to_main() -> None:
     import mario_jev.__main__ as entry
 
     assert entry.main is cli.main
+
+
+def test_the_jet_latency_a_reader_shows_is_the_whole_call_not_the_attempt_that_worked() -> (
+    None
+):
+    """A retried call has two honest figures, and the reader must show the larger.
+
+    ``response["latency_ms"]`` is the attempt that succeeded; ``jev_call_ms`` is the
+    dispatcher's measurement around the whole call, failed attempt and backoff
+    included. Reporting the first as "the Jev latency" hides everything the retry
+    cost -- for the call that motivated this schema, 20 117 ms of a 20 694 ms call.
+    """
+    journal = _journal(
+        [
+            _tick(
+                1,
+                source="jev",
+                action="right",
+                confidence=0.9,
+                jev_called=True,
+                attempts=2,
+                jev_latency=ATTEMPT_MS,  # the successful attempt alone
+                jev_call_ms=CALL_MS,  # the whole call, both attempts and the backoff
+                asked_at_tick=1,
+                answer_age_ticks=0,
+                choice="right",
+                probabilities={"right": 1.0},
+            )
+        ]
+    )
+
+    text = render_text(journal)
+
+    assert f"jev_latency_ms={CALL_MS:.3f}" in text
+    assert f"jev latency over observed calls: min={CALL_MS:.3f}" in text
+    assert f"jev_latency_ms={ATTEMPT_MS:.3f}" not in text, (
+        "the reader reported the successful attempt as the call's latency"
+    )
