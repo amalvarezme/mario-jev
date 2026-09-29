@@ -25,6 +25,21 @@ alone. A single slow moment therefore cannot hold the horizon down once sweeps
 start measuring lower again — but it does hold it for as long as they do not,
 and each of those sweeps leaves it untouched.
 
+A fixed cost source exists for the reproducibility instrument, not as an
+upgrade. When ``rollout_cost_source`` is ``"fixed"`` the planner takes the two
+configured figures for :func:`choose_horizon` and consults no clock on any path
+that can change the horizon or the table: it never calibrates, it runs exactly
+one sweep pass, and it neither learns from an overrun nor relaxes towards a
+measurement, so the horizon is the same on the first tick and on the thousandth.
+The measured ``elapsed_ms``/``sweep_ms`` stay on the table — they are real
+facts about the tick — but they no longer decide anything. The honest cost of
+that determinism is that a fixed per-frame figure cannot track the machine: on a
+machine slower than the figure, the one sweep can overrun the budget and nothing
+corrects it, because the correction pass is measurement-driven. The horizon
+stays put. Fixing the cost source makes a run reproducible; it does not make it
+faster, and a figure that is wrong for the machine holds the horizon wrong for
+the whole run.
+
 Four measured behaviours shape this module, and each one has a test:
 
 1. ``nes_py`` raises a ``ValueError`` ("cannot step in a done environment") on the
@@ -45,6 +60,7 @@ Four measured behaviours shape this module, and each one has a test:
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass
 from enum import StrEnum
@@ -129,9 +145,10 @@ STALL_MAX_HORIZON: int = 96
 class CostSource(StrEnum):
     """Where the cost model that sized one sweep came from.
 
-    A closed two-value set, because the journal has to record a fact rather than
-    an inference: either this call ran the calibration pass itself, or it sized
-    itself from the model its predecessor on the same planner left behind.
+    A closed three-value set, because the journal has to record a fact rather
+    than an inference: either this call ran the calibration pass itself, or it
+    sized itself from the model its predecessor on the same planner left behind,
+    or it took the two configured constants and never measured at all.
     """
 
     #: This call ran the calibration pass and sized the sweep from it.
@@ -143,6 +160,11 @@ class CostSource(StrEnum):
     #: back towards what that sweep measured. "Reused" means "not calibrated on
     #: this call", not "the same numbers as last time".
     REUSED = "reused"
+    #: This call took :func:`choose_horizon`'s figures from the configured
+    #: constants rather than from any measurement, and consulted no clock on the
+    #: horizon path. A ``"fixed"`` tick is reproducible by construction and,
+    #: equally, unable to track a machine slower than the configured figure.
+    FIXED = "fixed"
 
 
 def choose_horizon(
@@ -326,10 +348,10 @@ class RolloutTable:
     calibration_frames: int
     #: 1 normally; 2 when the measured sweep forced a smaller horizon.
     passes: int
-    #: Whether the cost model above was calibrated on this call or inherited from
-    #: the previous one on the same planner instance — inherited as the previous
-    #: call left it, which is after that call's own overrun correction or fitting
-    #: relaxation. Recorded, never inferred.
+    #: Where the cost model above came from: calibrated on this call, inherited
+    #: from the previous one on the same planner instance (after that call's own
+    #: overrun correction or fitting relaxation), or taken from the configured
+    #: constants. Recorded, never inferred.
     cost_source: CostSource
     #: Total emulator steps issued by the whole ``plan()`` call. The frame counter
     #: moves by exactly this much.
@@ -408,6 +430,7 @@ class TrajectoryPlanner:
         "_actions",
         "_budget_ms",
         "_calibration_action",
+        "_fixed_cost",
         "_max_frames",
         "_min_frames",
         "_remembered",
@@ -420,6 +443,9 @@ class TrajectoryPlanner:
         min_frames: int,
         max_frames: int,
         actions: Sequence[Action] | None = None,
+        cost_source: str = "measured",
+        fixed_base_ms: float = 0.0,
+        fixed_per_frame_ms: float = 0.0,
     ) -> None:
         if budget_ms <= 0:
             raise ValueError(f"budget_ms must be > 0, got {budget_ms}")
@@ -432,6 +458,24 @@ class TrajectoryPlanner:
         selected = tuple(actions) if actions is not None else build_actions()
         if not selected:
             raise ValueError("the planner needs at least one candidate action")
+        if cost_source not in {"measured", "fixed"}:
+            raise ValueError(
+                f"cost_source must be 'measured' or 'fixed', got {cost_source!r}"
+            )
+        if cost_source == "fixed" and (
+            not math.isfinite(fixed_base_ms) or fixed_base_ms <= 0
+        ):
+            raise ValueError(
+                "fixed_base_ms must be a positive, finite number when cost_source "
+                f"is 'fixed', got {fixed_base_ms!r}"
+            )
+        if cost_source == "fixed" and (
+            not math.isfinite(fixed_per_frame_ms) or fixed_per_frame_ms <= 0
+        ):
+            raise ValueError(
+                "fixed_per_frame_ms must be a positive, finite number when "
+                f"cost_source is 'fixed', got {fixed_per_frame_ms!r}"
+            )
 
         self._budget_ms = float(budget_ms)
         self._min_frames = int(min_frames)
@@ -440,6 +484,17 @@ class TrajectoryPlanner:
         #: What the previous ``plan()`` measured, or ``None`` before the first
         #: one. ``None`` is the only trigger for a calibration pass.
         self._remembered: _CostModel | None = None
+        #: The configured constant model under a ``"fixed"`` source, or ``None``
+        #: under the measured one. Unlike ``_remembered`` it never changes and is
+        #: never replaced by a measurement.
+        self._fixed_cost: _CostModel | None = (
+            _CostModel(
+                base_ms=float(fixed_base_ms),
+                per_frame_ms=float(fixed_per_frame_ms),
+            )
+            if cost_source == "fixed"
+            else None
+        )
         # Calibration must not be allowed to die mid-measurement, so it steps the
         # action that does nothing when the set has one.
         self._calibration_action = next(
@@ -456,6 +511,9 @@ class TrajectoryPlanner:
             min_frames=settings.rollout_min_frames,
             max_frames=settings.rollout_max_frames,
             actions=actions,
+            cost_source=settings.rollout_cost_source,
+            fixed_base_ms=settings.rollout_fixed_base_ms,
+            fixed_per_frame_ms=settings.rollout_fixed_per_frame_ms,
         )
 
     @property
@@ -502,24 +560,37 @@ class TrajectoryPlanner:
         # untouched -- only the rollout is exempt, and the schedule is reset on
         # the way out so the next real frame starts a fresh period.
         with emulator.pacer.suspended():
-            # Warm start: only the first call on an instance pays for a calibration.
-            # Later calls size their horizon from what the machine cost last time,
-            # which is what keeps the steady-state tick at roughly one sweep.
-            if self._remembered is None:
-                calibration = self._calibrate(emulator, snapshot)
-                cost = _CostModel(
-                    base_ms=calibration.base_ms, per_frame_ms=calibration.per_frame_ms
-                )
-                calibration_frames = calibration.frames
-                cost_source = CostSource.CALIBRATED
-            else:
-                cost = self._remembered
+            # A fixed source takes the two configured constants for the cost model
+            # and consults no clock on any path that can move the horizon or the
+            # table: no calibration, no correction pass, no remembered model. The
+            # measured elapsed/sweep below stay on the table as facts about the
+            # tick; they simply stop deciding anything.
+            fixed_cost = self._fixed_cost
+            if fixed_cost is not None:
+                cost = fixed_cost
                 calibration_frames = 0
-                cost_source = CostSource.REUSED
-            # Seed the next call's model with this call's, before the sweep can refute
-            # it. A calibrated call hands its measurement on; a reused call keeps the
-            # one it inherited.
-            self._remembered = cost
+                cost_source = CostSource.FIXED
+            else:
+                # Warm start: only the first call on an instance pays for a
+                # calibration. Later calls size their horizon from what the machine
+                # cost last time, which is what keeps the steady-state tick at
+                # roughly one sweep.
+                if self._remembered is None:
+                    calibration = self._calibrate(emulator, snapshot)
+                    cost = _CostModel(
+                        base_ms=calibration.base_ms,
+                        per_frame_ms=calibration.per_frame_ms,
+                    )
+                    calibration_frames = calibration.frames
+                    cost_source = CostSource.CALIBRATED
+                else:
+                    cost = self._remembered
+                    calibration_frames = 0
+                    cost_source = CostSource.REUSED
+                # Seed the next call's model with this call's, before the sweep can
+                # refute it. A calibrated call hands its measurement on; a reused
+                # call keeps the one it inherited.
+                self._remembered = cost
 
             budget_horizon = choose_horizon(
                 budget_ms=self._budget_ms,
@@ -555,9 +626,12 @@ class TrajectoryPlanner:
             # The correction may not shrink past ``floor``: an escalated horizon
             # was bought precisely because the budget's own choice was blind, and
             # handing those frames straight back would undo the escalation while
-            # still charging for it.
+            # still charging for it. Under the fixed source both this correction
+            # and the relaxation below are skipped: they are measurement-driven,
+            # and a fixed horizon deliberately does not follow a measurement.
             if (
-                passes < MAX_SWEEP_PASSES
+                fixed_cost is None
+                and passes < MAX_SWEEP_PASSES
                 and sweep_ms > self._budget_ms
                 and horizon > floor
             ):
@@ -577,7 +651,7 @@ class TrajectoryPlanner:
                         refuted_horizon=tighter,
                         base_ms=cost.base_ms,
                     )
-            elif sweep_ms <= self._budget_ms:
+            elif fixed_cost is None and sweep_ms <= self._budget_ms:
                 # The fitting path's only lowering step -- and deliberately not
                 # described as the model's only one: an overrun at a long horizon
                 # can measure a lower per-frame cost than the model remembers and

@@ -264,19 +264,30 @@ the Jev decision-score table, and the confidence and latency evolution over time
   `__reduce__`, and no buffer protocol, and `load_state` rejects anything that is
   not that exact type. Reproducing a run means replaying its recorded actions, not
   restoring a file.
-- **The rollout horizon is a budget, not a guarantee.** Under load the horizon
+- **The rollout horizon is a budget, not a guarantee** — for the default
+  `rollout_cost_source="measured"`. Under load the horizon
   shrinks, so a decision taken under pressure is made with less foresight than the
-  same decision taken on an idle machine.
-- **The cost model ratchets one way.** A measured overrun raises the remembered
-  per-frame cost, but an underrun never lowers it, so a single transient stall
-  permanently shrinks the horizon for that planner instance — observed settling at
-  14 → 13 → 9 and staying at 9. This is a persistent bias, not momentary pressure,
-  and it is visible in the journal as `per_frame_ms` and `cost_source`.
-- **The per-frame cost is not pinnable.** It ranged over `0.645 .. 2.349 ms`
+  same decision taken on an idle machine. `"fixed"` trades exactly that away: the
+  horizon is held at the figure the configuration implies, and on a machine slower
+  than that figure the sweep can overrun its budget with nothing to correct it.
+- **The cost model tracks the machine in both directions.** A measured overrun
+  replaces the remembered per-frame cost with one derived from that measurement,
+  and a sweep that fits its budget relaxes the memory one `COST_RECOVERY` step
+  toward what it measured. It used to ratchet one way — an underrun could not lower
+  it, so a single transient stall permanently shrank the horizon for that planner
+  instance (observed settling at 14 → 13 → 9 and staying at 9) — and that is fixed
+  and measured live: `per_frame_ms` 1.51 → 0.86, horizon 6 → 8–24, visible in the
+  journal as `per_frame_ms` and `cost_source`. The residual is the step size:
+  recovery is one step per tick and floored by its own measurement, so a poisoned
+  model heals over several ticks rather than at once.
+- **The per-frame cost is not pinnable** — under the default `"measured"` source.
+  It ranged over `0.645 .. 2.349 ms`
   *within a single process*, so the horizon chosen at a given budget is not
   reproducible; observed horizons at `rollout_budget_ms = 120` were
   `10, 20, 15, 18, 15` across five consecutive runs. Any number quoted for "the"
-  rollout cost is a sample, never a constant.
+  rollout cost is a sample, never a constant. That is what `rollout_cost_source
+  ="fixed"` exists to escape for measurement work: the horizon stops depending on
+  the machine, at the price of no longer tracking it.
 - **A small budget cannot bound the sweep at all.** At 40 ms the horizon sits at
   `rollout_min_frames`, so the sweep can still overrun and the budget stops
   constraining anything.

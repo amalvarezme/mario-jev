@@ -34,6 +34,9 @@ def test_defaults_are_documented_values() -> None:
     assert settings.confidence_threshold == 0.6
     assert settings.rollout_min_frames == 6
     assert settings.rollout_max_frames == 48
+    assert settings.rollout_cost_source == "measured"
+    assert settings.rollout_fixed_base_ms == 0.0
+    assert settings.rollout_fixed_per_frame_ms == 0.0
     assert settings.real_time is True
     assert settings.target_fps == 60.0
     assert settings.max_ticks is None
@@ -62,6 +65,9 @@ def test_environment_overrides_every_setting_it_claims() -> None:
             "MARIO_DECISION_CADENCE": "16",
             "MARIO_CONFIDENCE_THRESHOLD": "0.75",
             "MARIO_ROLLOUT_BUDGET_MS": "50",
+            "MARIO_ROLLOUT_COST_SOURCE": "fixed",
+            "MARIO_ROLLOUT_FIXED_BASE_MS": "0.5",
+            "MARIO_ROLLOUT_FIXED_PER_FRAME_MS": "1.1",
             "MARIO_REAL_TIME": "false",
             "MARIO_TARGET_FPS": "30",
             "MARIO_MAX_TICKS": "250",
@@ -77,6 +83,9 @@ def test_environment_overrides_every_setting_it_claims() -> None:
     assert settings.decision_cadence_frames == 16
     assert settings.confidence_threshold == 0.75
     assert settings.rollout_budget_ms == 50
+    assert settings.rollout_cost_source == "fixed"
+    assert settings.rollout_fixed_base_ms == 0.5
+    assert settings.rollout_fixed_per_frame_ms == 1.1
     assert settings.real_time is False
     assert settings.target_fps == 30.0
     assert settings.max_ticks == 250
@@ -132,6 +141,92 @@ def test_the_redacted_view_carries_the_budget_that_defines_slow() -> None:
     # The whole view, serialised the way the journal serialises it, and scanned
     # for the sentinel: a new key must not become a new way out for the key.
     assert SECRET not in json.dumps(redacted)
+
+
+def test_the_cost_source_defaults_to_measured_and_ignores_the_fixed_figures() -> None:
+    settings = Settings.load(env={})
+
+    assert settings.rollout_cost_source == "measured"
+    # "Measured ignores them": the figures are never read, so nonsense in them must
+    # not stop a measured run that does not use them. Asserted through ``load``
+    # because validation lives there -- a directly constructed ``Settings`` is never
+    # validated, so building one could not falsify this.
+    ignored = Settings.load(
+        env={
+            "MARIO_ROLLOUT_COST_SOURCE": "measured",
+            "MARIO_ROLLOUT_FIXED_BASE_MS": "-1",
+            "MARIO_ROLLOUT_FIXED_PER_FRAME_MS": "0",
+        }
+    )
+
+    assert ignored.rollout_cost_source == "measured"
+    assert ignored.rollout_fixed_base_ms == -1.0
+    assert ignored.rollout_fixed_per_frame_ms == 0.0
+
+
+def test_the_fixed_cost_source_is_accepted_with_two_positive_finite_figures() -> None:
+    settings = Settings.load(
+        env={
+            "MARIO_ROLLOUT_COST_SOURCE": "fixed",
+            "MARIO_ROLLOUT_FIXED_BASE_MS": "0.5",
+            "MARIO_ROLLOUT_FIXED_PER_FRAME_MS": "1.1",
+        }
+    )
+
+    assert settings.rollout_cost_source == "fixed"
+    assert settings.rollout_fixed_base_ms == 0.5
+    assert settings.rollout_fixed_per_frame_ms == 1.1
+
+
+def test_an_unknown_cost_source_is_rejected_with_the_field_name() -> None:
+    with pytest.raises(ValueError, match="rollout_cost_source"):
+        Settings.load(env={"MARIO_ROLLOUT_COST_SOURCE": "guessed"})
+
+
+def test_a_fixed_source_without_the_figures_is_rejected() -> None:
+    # The defaults are 0.0, so opting in to "fixed" without stating the figures is
+    # rejected rather than silently sized from a figure nobody chose.
+    with pytest.raises(ValueError, match="rollout_fixed_base_ms"):
+        Settings.load(env={"MARIO_ROLLOUT_COST_SOURCE": "fixed"})
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "inf", "nan", ""])
+def test_fixed_base_ms_must_be_positive_and_finite(value: str) -> None:
+    with pytest.raises(ValueError, match="rollout_fixed_base_ms"):
+        Settings.load(
+            env={
+                "MARIO_ROLLOUT_COST_SOURCE": "fixed",
+                "MARIO_ROLLOUT_FIXED_BASE_MS": value,
+                "MARIO_ROLLOUT_FIXED_PER_FRAME_MS": "1.1",
+            }
+        )
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "inf", "nan", ""])
+def test_fixed_per_frame_ms_must_be_positive_and_finite(value: str) -> None:
+    with pytest.raises(ValueError, match="rollout_fixed_per_frame_ms"):
+        Settings.load(
+            env={
+                "MARIO_ROLLOUT_COST_SOURCE": "fixed",
+                "MARIO_ROLLOUT_FIXED_BASE_MS": "0.5",
+                "MARIO_ROLLOUT_FIXED_PER_FRAME_MS": value,
+            }
+        )
+
+
+def test_the_redacted_view_carries_the_source_that_decided_the_horizon() -> None:
+    redacted = Settings.load(
+        env={
+            "MARIO_ROLLOUT_COST_SOURCE": "fixed",
+            "MARIO_ROLLOUT_FIXED_BASE_MS": "0.5",
+            "MARIO_ROLLOUT_FIXED_PER_FRAME_MS": "1.1",
+        }
+    ).redacted
+
+    assert redacted["rollout_cost_source"] == "fixed"
+    assert redacted["rollout_fixed_base_ms"] == 0.5
+    assert redacted["rollout_fixed_per_frame_ms"] == 1.1
+    json.dumps(redacted)  # the run header serialises this view
 
 
 def test_missing_or_blank_key_is_reported_unavailable() -> None:

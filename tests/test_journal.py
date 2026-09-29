@@ -161,7 +161,9 @@ def make_candidate(
 
 
 def make_table(
-    *candidates: CandidateRollout, tick: int = 0
+    *candidates: CandidateRollout,
+    tick: int = 0,
+    cost_source: CostSource = CostSource.CALIBRATED,
 ) -> RolloutTable:
     return RolloutTable(
         tick=tick,
@@ -174,7 +176,7 @@ def make_table(
         per_frame_ms=1.0,
         calibration_frames=0,
         passes=1,
-        cost_source=CostSource.CALIBRATED,
+        cost_source=cost_source,
         steps_taken=16,
         candidates=tuple(candidates),
     )
@@ -199,6 +201,7 @@ def make_record(
     terminated: bool = False,
     truncated: bool = False,
     jev_response: dict[str, object] | None = None,
+    rollout: RolloutTable | None = None,
 ) -> TickRecord:
     pixels = np.zeros(SCREEN, dtype=np.uint8) if frame is None else frame
     return TickRecord(
@@ -208,7 +211,7 @@ def make_record(
         frame=pixels,
         perception=detect(pixels, tick=frame_index),
         state=make_state(tick=tick),
-        rollout=default_table(tick=tick),
+        rollout=default_table(tick=tick) if rollout is None else rollout,
         jev_questions=None,
         jev_response=jev_response,
         decision=TickDecision(
@@ -306,6 +309,50 @@ def test_every_line_is_plain_json_data(tmp_path: Path) -> None:
     assert entries[1]["degradations"] == []
     assert isinstance(entries[1]["rollout"]["candidates"], list)
     assert entries[1]["state"]["progress"]["world"] == "1-1"
+
+
+def test_the_journal_says_whether_a_horizon_came_from_a_constant_or_a_measurement() -> None:
+    """The header records the configured source; each tick records the one used.
+
+    The per-tick field is the existing ``rollout.cost_source`` vocabulary, not a
+    new one: a fixed tick carries ``"fixed"`` beside the ``"calibrated"`` and
+    ``"reused"`` a measured run emits. A reader can therefore tell a constant-sized
+    horizon from a measured one without inferring it from a clock reading.
+    """
+    settings = make_settings(
+        rollout_cost_source="fixed",
+        rollout_fixed_base_ms=0.5,
+        rollout_fixed_per_frame_ms=1.1,
+    )
+
+    header = run_record(settings, started_at=STARTED_AT)
+    fixed = tick_record(
+        make_record(
+            rollout=make_table(
+                make_candidate("right", dx=12, risk=0.2), cost_source=CostSource.FIXED
+            )
+        )
+    )
+    measured = tick_record(
+        make_record(
+            rollout=make_table(
+                make_candidate("right", dx=12, risk=0.2),
+                cost_source=CostSource.CALIBRATED,
+            )
+        )
+    )
+
+    assert header["settings"]["rollout_cost_source"] == "fixed"
+    assert fixed["rollout"]["cost_source"] == "fixed"
+    assert measured["rollout"]["cost_source"] == "calibrated"
+    # The distinction survives the JSON the journal is actually made of.
+    assert json.loads(json.dumps(fixed))["rollout"]["cost_source"] == "fixed"
+    assert json.loads(json.dumps(fixed))["rollout"]["cost_source"] != json.loads(
+        json.dumps(measured)
+    )["rollout"]["cost_source"]
+    # The figures the horizon was sized from are next to the header's claim.
+    assert header["settings"]["rollout_fixed_base_ms"] == 0.5
+    assert header["settings"]["rollout_fixed_per_frame_ms"] == 1.1
 
 
 def test_a_run_header_omits_artifacts_dir_until_artifacts_are_enabled(tmp_path: Path) -> None:

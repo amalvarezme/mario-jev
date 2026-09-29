@@ -41,11 +41,17 @@ uv pip install --python .venv/bin/python -e ".[dev]"
 | `MARIO_DECISION_CADENCE` | `8` | emulator frames between two Jev consultations |
 | `MARIO_CONFIDENCE_THRESHOLD` | `0.6` | below this, the deterministic fallback runs |
 | `MARIO_ROLLOUT_BUDGET_MS` | `120` | wall-clock budget for the rollout sweep |
+| `MARIO_ROLLOUT_COST_SOURCE` | `measured` | what decides the horizon: the machine's own timing, or the constants below |
+| `MARIO_ROLLOUT_FIXED_BASE_MS` | *(unset)* | sweep's fixed base cost, required when the source is `fixed` |
+| `MARIO_ROLLOUT_FIXED_PER_FRAME_MS` | *(unset)* | fixed per-frame rollout cost, required when the source is `fixed` |
 | `MARIO_REAL_TIME` | `true` | pace the emulator at real time |
 | `MARIO_TARGET_FPS` | `60` | pacing target |
 | `MARIO_MAX_TICKS` | *(uncapped)* | stop after this many decision ticks |
 | `MARIO_ADVISOR` | `false` | enable the optional PlayJev advisor |
 | `MARIO_ARTIFACTS_DIR` | `artifacts` | where evidence is written |
+
+This table covers the variables worth knowing first; `src/mario_jev/config.py` is
+the complete list, and `mario_jev doctor` reports what this machine resolves.
 
 ## Credential
 

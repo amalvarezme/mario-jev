@@ -9,6 +9,7 @@ only through :meth:`Settings.jev_available`.
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -113,6 +114,17 @@ class Settings:
     rollout_budget_ms: float = 120.0
     rollout_max_frames: int = 48
     rollout_min_frames: int = 6
+    # Where the horizon's cost model comes from. "measured" (the default) times
+    # this machine and remembers what it cost; "fixed" takes the two figures
+    # below as constants and lets no clock reading move the horizon. The trade-off
+    # the fixed source carries is documented in ``trajectory/planner.py``.
+    rollout_cost_source: str = "measured"
+    # The fixed model, read only when ``rollout_cost_source == "fixed"``. Both
+    # must be positive and finite. There is no default that is not a silent claim
+    # about a machine nobody measured, so the operator states the figures; a
+    # ``"fixed"`` source without them is rejected rather than guessed.
+    rollout_fixed_base_ms: float = 0.0
+    rollout_fixed_per_frame_ms: float = 0.0
 
     # --- real-time behaviour ------------------------------------------------
     real_time: bool = True
@@ -155,6 +167,11 @@ class Settings:
             rollout_budget_ms=_float_env(source, "MARIO_ROLLOUT_BUDGET_MS", 120.0),
             rollout_max_frames=_int_env(source, "MARIO_ROLLOUT_MAX_FRAMES", 48),
             rollout_min_frames=_int_env(source, "MARIO_ROLLOUT_MIN_FRAMES", 6),
+            rollout_cost_source=source.get("MARIO_ROLLOUT_COST_SOURCE") or "measured",
+            rollout_fixed_base_ms=_float_env(source, "MARIO_ROLLOUT_FIXED_BASE_MS", 0.0),
+            rollout_fixed_per_frame_ms=_float_env(
+                source, "MARIO_ROLLOUT_FIXED_PER_FRAME_MS", 0.0
+            ),
             real_time=_bool_env(source, "MARIO_REAL_TIME", True),
             target_fps=_float_env(source, "MARIO_TARGET_FPS", 60.0),
             max_ticks=max_ticks,
@@ -181,6 +198,30 @@ class Settings:
             raise ValueError("rollout_min_frames must be >= 1")
         if self.rollout_budget_ms <= 0:
             raise ValueError("rollout_budget_ms must be > 0")
+        if self.rollout_cost_source not in {"measured", "fixed"}:
+            raise ValueError(
+                "rollout_cost_source must be 'measured' or 'fixed', "
+                f"got {self.rollout_cost_source!r}"
+            )
+        if self.rollout_cost_source == "fixed":
+            if (
+                not math.isfinite(self.rollout_fixed_base_ms)
+                or self.rollout_fixed_base_ms <= 0
+            ):
+                raise ValueError(
+                    "rollout_fixed_base_ms must be a positive, finite number when "
+                    "rollout_cost_source is 'fixed', "
+                    f"got {self.rollout_fixed_base_ms!r}"
+                )
+            if (
+                not math.isfinite(self.rollout_fixed_per_frame_ms)
+                or self.rollout_fixed_per_frame_ms <= 0
+            ):
+                raise ValueError(
+                    "rollout_fixed_per_frame_ms must be a positive, finite number "
+                    "when rollout_cost_source is 'fixed', "
+                    f"got {self.rollout_fixed_per_frame_ms!r}"
+                )
         if self.jev_max_attempts < 1:
             raise ValueError("jev_max_attempts must be >= 1")
 
@@ -203,6 +244,12 @@ class Settings:
         ``rollout_min_frames`` joins ``rollout_max_frames`` because the horizon
         bounds only mean anything as a pair.
 
+        ``rollout_cost_source`` and its two fixed figures are here because the
+        header has to say whether the horizon came from a measurement of this
+        machine or from a constant. A reader who finds a ``cost_source`` of
+        ``"fixed"`` on a tick needs the figures next to the header, or the tick
+        records a provenance it cannot verify.
+
         ``jev_endpoint`` is emitted through :func:`redact_url_userinfo`, not
         verbatim. An endpoint may legitimately carry ``user:password@`` userinfo
         and :class:`Settings` deliberately stays permissive about accepting one,
@@ -221,6 +268,9 @@ class Settings:
             "rollout_budget_ms": self.rollout_budget_ms,
             "rollout_max_frames": self.rollout_max_frames,
             "rollout_min_frames": self.rollout_min_frames,
+            "rollout_cost_source": self.rollout_cost_source,
+            "rollout_fixed_base_ms": self.rollout_fixed_base_ms,
+            "rollout_fixed_per_frame_ms": self.rollout_fixed_per_frame_ms,
             "real_time": self.real_time,
             "target_fps": self.target_fps,
             "max_ticks": self.max_ticks,

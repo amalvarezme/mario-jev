@@ -42,6 +42,7 @@ from mario_jev.trajectory import (
     NO_PROGRESS_RISK,
     SAFE_MARGIN_PX,
     CostSource,
+    RolloutTable,
     TrajectoryPlanner,
     choose_horizon,
     died_over_gap,
@@ -650,7 +651,8 @@ def test_the_first_plan_calibrates_and_the_second_reuses_that_measurement(
 
     # The journal records the source rather than a value a reader has to guess at.
     assert second.as_dict()["cost_source"] == str(CostSource.REUSED)
-    assert {str(source) for source in CostSource} == {"calibrated", "reused"}
+    assert CostSource.FIXED.value == "fixed"
+    assert {str(source) for source in CostSource} == {"calibrated", "reused", "fixed"}
 
 
 def test_a_remembered_cost_the_machine_contradicts_is_replaced_and_corrected(
@@ -1307,3 +1309,260 @@ def test_the_recovered_horizon_climbs_back_towards_what_the_real_cost_pays_for(
     assert horizons[:28] == (
         [6] * 6 + [7] * 5 + [8] * 4 + [9] * 3 + [10] * 3 + [11] * 3 + [12] * 3 + [13]
     )
+
+
+# -- the deterministic cost source --------------------------------------------------
+#
+# The property T1 exists to pin: with the clock made absurd, the horizon and the
+# table are unchanged under ``"fixed"`` and move under ``"measured"``. The clock
+# is not slowed and nothing sleeps -- the planner's ``time`` module is replaced
+# with an advancing fake, the same "inject the cost" move the warm-start tests
+# make with ``_calibrate`` and ``_sweep``.
+
+
+class _AdvancingClock:
+    """A stand-in for the planner's ``time`` module.
+
+    Only ``perf_counter`` is read by the planner. Each read advances the clock by
+    ``step_ms``, so a tiny step models a fast machine and a huge one models a
+    machine far slower than any figure the plan would configure.
+    """
+
+    def __init__(self, step_ms: float) -> None:
+        self._now = 0.0
+        self._step_s = float(step_ms) / 1000.0
+
+    def perf_counter(self) -> float:
+        now = self._now
+        self._now += self._step_s
+        return now
+
+
+def _decision_view(table: RolloutTable) -> dict[str, object]:
+    """The table a decision is made from, without the two genuine measurements.
+
+    ``elapsed_ms`` and ``sweep_ms`` come from the clock under both sources: they
+    are real facts about the tick, which is why the design keeps them. Removing
+    exactly those two lets the test compare every field a clock could have moved
+    a decision with, and says out loud that the measurements are the only things
+    allowed to differ.
+    """
+    view = table.as_dict()
+    del view["elapsed_ms"]
+    del view["sweep_ms"]
+    return view
+
+
+def test_a_fixed_source_planner_takes_the_configured_figures_from_the_settings(
+    emulator: MarioEmulator,
+) -> None:
+    settings = Settings(
+        rollout_budget_ms=120.0,
+        rollout_cost_source="fixed",
+        rollout_fixed_base_ms=0.5,
+        rollout_fixed_per_frame_ms=1.1,
+    )
+
+    planner = TrajectoryPlanner.from_settings(settings)
+    table = planner.plan(emulator)
+
+    assert table.cost_source is CostSource.FIXED
+    assert table.base_ms == 0.5
+    assert table.per_frame_ms == 1.1
+    assert table.calibration_frames == 0
+    assert table.passes == 1
+    assert table.horizon == choose_horizon(
+        budget_ms=120.0,
+        candidate_count=len(planner.actions),
+        base_ms=0.5,
+        per_frame_ms=1.1,
+        min_frames=6,
+        max_frames=48,
+    )
+    # The measured facts are still recorded, even though they decided nothing.
+    assert table.elapsed_ms > 0.0
+    assert table.sweep_ms > 0.0
+    assert table.as_dict()["cost_source"] == "fixed"
+
+
+def test_the_default_planner_sizes_its_horizon_from_a_measurement(
+    emulator: MarioEmulator,
+) -> None:
+    planner = TrajectoryPlanner.from_settings(Settings())
+
+    table = planner.plan(emulator)
+
+    assert table.cost_source is CostSource.CALIBRATED
+    assert table.calibration_frames == CALIBRATION_LOADS * (1 + CALIBRATION_STEADY_STEPS)
+
+
+def test_a_fixed_source_keeps_one_horizon_across_ticks_and_remembers_nothing(
+    emulator: MarioEmulator,
+) -> None:
+    planner = TrajectoryPlanner(
+        budget_ms=120.0,
+        min_frames=6,
+        max_frames=48,
+        cost_source="fixed",
+        fixed_base_ms=0.5,
+        fixed_per_frame_ms=1.1,
+    )
+
+    tables = [planner.plan(emulator) for _ in range(3)]
+
+    assert all(table.cost_source is CostSource.FIXED for table in tables)
+    assert len({table.horizon for table in tables}) == 1
+    assert len({(table.base_ms, table.per_frame_ms) for table in tables}) == 1
+    # No measurement is ever handed to the next tick: the fixed model is enough.
+    assert planner._remembered is None
+
+
+def test_a_fixed_source_ignores_an_absurd_clock_while_a_measured_source_does_not(
+    emulator_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The observable property, with the negative control that keeps it honest."""
+
+    def plan(*, cost_source: str, step_ms: float) -> RolloutTable:
+        monkeypatch.setattr(planner_module, "time", _AdvancingClock(step_ms))
+        emulator = emulator_factory()
+        emulator.reset(seed=0)
+        if cost_source == "fixed":
+            planner = TrajectoryPlanner(
+                budget_ms=120.0,
+                min_frames=6,
+                max_frames=48,
+                cost_source="fixed",
+                fixed_base_ms=0.5,
+                fixed_per_frame_ms=1.1,
+            )
+        else:
+            planner = TrajectoryPlanner(budget_ms=120.0, min_frames=6, max_frames=48)
+        return planner.plan(emulator)
+
+    fixed_fast = plan(cost_source="fixed", step_ms=0.003)
+    fixed_absurd = plan(cost_source="fixed", step_ms=3000.0)
+
+    # Every field a clock could have moved the decision with is identical.
+    assert fixed_fast.cost_source is CostSource.FIXED
+    assert fixed_absurd.cost_source is CostSource.FIXED
+    assert _decision_view(fixed_fast) == _decision_view(fixed_absurd)
+    assert fixed_fast.horizon == fixed_absurd.horizon
+    assert fixed_fast.passes == fixed_absurd.passes == 1
+    # The two genuine measurements are the only fields that move, which is why the
+    # comparison above excludes exactly them.
+    assert fixed_fast.sweep_ms != fixed_absurd.sweep_ms
+    assert fixed_fast.elapsed_ms != fixed_absurd.elapsed_ms
+
+    measured_fast = plan(cost_source="measured", step_ms=0.003)
+    measured_absurd = plan(cost_source="measured", step_ms=3000.0)
+
+    # The same manipulations visibly move the measured horizon: the test above is
+    # not vacuous.
+    assert measured_fast.cost_source is CostSource.CALIBRATED
+    assert measured_absurd.cost_source is CostSource.CALIBRATED
+    assert measured_fast.horizon != measured_absurd.horizon
+
+
+def test_a_fixed_source_never_makes_the_calibration_a_measured_source_must(
+    emulator: MarioEmulator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The raising half of the absurd-clock property. Two clock reads can move a
+    # measured horizon -- the calibration, and the sweep that decides both the
+    # correction pass and the learning branches -- and under the fixed source
+    # neither decides anything, so a calibration that raises cannot disturb the
+    # table. Under the measured source the same raise is fatal.
+    def exploding_calibrate(self, emulator, snapshot):  # type: ignore[no-untyped-def]
+        raise RuntimeError("the clock exploded")
+
+    monkeypatch.setattr(TrajectoryPlanner, "_calibrate", exploding_calibrate)
+
+    fixed = TrajectoryPlanner(
+        budget_ms=120.0,
+        min_frames=6,
+        max_frames=48,
+        cost_source="fixed",
+        fixed_base_ms=0.5,
+        fixed_per_frame_ms=1.1,
+    )
+    table = fixed.plan(emulator)
+
+    assert table.cost_source is CostSource.FIXED
+    assert table.horizon == 15
+    assert fixed._remembered is None
+
+    measured = TrajectoryPlanner(budget_ms=120.0, min_frames=6, max_frames=48)
+    with pytest.raises(RuntimeError, match="exploded"):
+        measured.plan(emulator)
+
+
+def test_a_fixed_source_takes_one_pass_and_never_corrects_a_measured_overrun(
+    emulator: MarioEmulator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Make the recorded sweep cost more than the budget without changing the
+    # rollouts, and start the measured side from an injected cheapest-possible
+    # model so it predictably picks the maximum horizon and then overruns. The
+    # measured planner corrects; the fixed one deliberately does not, because the
+    # correction is measurement-driven and a fixed horizon does not follow one.
+    injected = _Calibration(base_ms=0.0, per_frame_ms=MIN_PER_FRAME_MS, frames=0)
+    monkeypatch.setattr(
+        TrajectoryPlanner, "_calibrate", lambda self, emulator, snapshot: injected
+    )
+    real_sweep = TrajectoryPlanner._sweep
+
+    def overrunning_sweep(self, emulator, snapshot, horizon):  # type: ignore[no-untyped-def]
+        sweep_ms, candidates, steps = real_sweep(self, emulator, snapshot, horizon)
+        return 10_000.0, candidates, steps
+
+    monkeypatch.setattr(TrajectoryPlanner, "_sweep", overrunning_sweep)
+
+    fixed = TrajectoryPlanner(
+        budget_ms=120.0,
+        min_frames=6,
+        max_frames=48,
+        cost_source="fixed",
+        fixed_base_ms=0.5,
+        fixed_per_frame_ms=1.1,
+    )
+    fixed_table = fixed.plan(emulator)
+
+    assert fixed_table.sweep_ms == 10_000.0
+    assert fixed_table.passes == 1
+    assert fixed_table.horizon == 15  # the constants' own choice, not a correction
+    assert fixed._remembered is None
+
+    measured = TrajectoryPlanner(budget_ms=120.0, min_frames=6, max_frames=48)
+    measured_table = measured.plan(emulator)
+
+    assert measured_table.cost_source is CostSource.CALIBRATED
+    assert measured_table.passes == MAX_SWEEP_PASSES == 2
+
+
+def test_the_planner_rejects_a_cost_source_it_cannot_honour() -> None:
+    # The settings layer validates its own view; the planner validates what it is
+    # constructed with, because a planner can be built without going through
+    # ``Settings`` at all. Each message names the offending field, so a caller can
+    # fix it rather than guess.
+    with pytest.raises(ValueError, match="cost_source"):
+        TrajectoryPlanner(
+            budget_ms=120.0, min_frames=6, max_frames=48, cost_source="guessed"
+        )
+
+    with pytest.raises(ValueError, match="fixed_base_ms"):
+        TrajectoryPlanner(
+            budget_ms=120.0,
+            min_frames=6,
+            max_frames=48,
+            cost_source="fixed",
+            fixed_base_ms=0.0,
+            fixed_per_frame_ms=1.1,
+        )
+
+    with pytest.raises(ValueError, match="fixed_per_frame_ms"):
+        TrajectoryPlanner(
+            budget_ms=120.0,
+            min_frames=6,
+            max_frames=48,
+            cost_source="fixed",
+            fixed_base_ms=0.5,
+            fixed_per_frame_ms=math.inf,
+        )
