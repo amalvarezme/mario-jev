@@ -45,6 +45,23 @@ answer that was asked on an earlier tick is recorded as
 than ``jev``, so "Jev decided this" never silently means "Jev decided this three
 ticks ago".
 
+The call source is an interface, not a class
+--------------------------------------------
+
+``ExecutionLoop`` is written against :class:`CallSource`, the four members that
+:class:`~mario_jev.policy.dispatch.JevDispatcher` already has, so a run can be
+driven instead from a :class:`~mario_jev.policy.feed.RecordedAnswerFeed` -- a
+journal's recorded answers, served in order with no socket and no thread. A fed
+run cannot exhibit the dispatcher race because it has no worker at all; it is an
+instrument for comparing builds, never a fix for the live path. Every tick of a
+fed run records :data:`TRANSCRIPT_ANSWERS`, because its ``jev_call_ms`` is the
+transcript's latency and not a measurement of this machine. A fed tick that
+out-runs its transcript records :data:`ANSWERS_EXHAUSTED` rather than inventing an
+answer, and a fed tick whose transcript answers a *different* question records
+:data:`TRANSCRIPT_MISMATCH` rather than pairing this build's ``questions`` with
+someone else's ``response``. The two are separate names on purpose: "ran out" and
+"answers another question" are different facts and must not read as each other.
+
 The loop owns the frame index because the planner does not. The rollout sweep steps
 the same emulator while enumerating candidates and never rewinds its counter, so
 ``emulator.tick`` jumps by the whole rollout cost on every tick; keying the cadence
@@ -128,7 +145,7 @@ from __future__ import annotations
 import time
 from collections import Counter
 from dataclasses import dataclass, field, replace
-from typing import Callable, Mapping
+from typing import Callable, Mapping, Protocol
 
 import numpy as np
 
@@ -151,7 +168,55 @@ from .decision import (
     journal_state,
     select_action,
 )
-from .dispatch import JevDispatcher
+from .dispatch import JevDispatcher, Taken
+
+
+class CallSource(Protocol):
+    """What :class:`ExecutionLoop` needs from whatever answers its Jev calls.
+
+    Exactly four members, and both call sources satisfy them:
+    :class:`~mario_jev.policy.dispatch.JevDispatcher` (the live path, one worker)
+    and :class:`~mario_jev.policy.feed.RecordedAnswerFeed` (a transcript, no
+    worker). The loop is written against this shape rather than against the
+    dispatcher class, so a run can be driven from a journal without a socket.
+
+    A source **may** additionally expose three members, which the loop reads
+    defensively and none of which is required:
+
+    * ``source_kind`` -- a string naming where the answers come from. The loop
+      treats any value other than ``"live"`` as recorded and stamps every tick
+      with :data:`TRANSCRIPT_ANSWERS`, so no line is read as a live measurement.
+    * ``exhausted`` -- whether the source was asked for a call it could not
+      answer because it ran out. The loop records :data:`ANSWERS_EXHAUSTED` on
+      the tick that tried.
+    * ``mismatch`` -- whether the source was asked for a call its record could not
+      answer because the record answers a *different* question. The loop records
+      :data:`TRANSCRIPT_MISMATCH` on the tick that tried, so "ran out" and
+      "answers someone else" stay different facts in the journal.
+
+    None is part of the protocol because ``JevDispatcher`` has no such property
+    and must not need one: the live path is unchanged.
+    """
+
+    @property
+    def in_flight(self) -> bool:
+        """Whether a fired call is still waiting to be taken."""
+
+    def request(
+        self,
+        questions: Mapping[str, Mapping[str, object]],
+        state: MarioState,
+        *,
+        tick: int,
+    ) -> bool:
+        """Fire one call, and answer whether it was fired."""
+
+    def take(self) -> Taken | None:
+        """The finished call, or ``None``; never blocks."""
+
+    def close(self) -> None:
+        """Release whatever the source holds. Idempotent."""
+
 
 #: How far past the rollout budget a sweep may go before the tick is recorded as
 #: overrunning. The loop does not try to repair the overrun; it records it.
@@ -196,6 +261,37 @@ STALE_LIMIT_CADENCES = 3
 #: the closed set that owns every ``decision.source`` value.
 JEV_STALE_DISCARDED = "jev_stale_discarded"
 
+#: The ``source_kind`` the loop treats a call source as having when it does not
+#: name one. :class:`~mario_jev.policy.dispatch.JevDispatcher` exposes no
+#: ``source_kind``, so a run over it is live: it measured its own calls and the
+#: journal says nothing extra. A source that names any other kind is recorded.
+LIVE_SOURCE = "live"
+
+#: The degradation recorded on every tick of a run whose answers came from a
+#: transcript. It is not a defect: it is the instrument's stamp, and it is the one
+#: thing that keeps a fed run's ``jev_call_ms`` -- the *recorded* latency, not a
+#: measurement of this machine -- from being read as a live measurement. It is a
+#: degradation rather than a new journal key on purpose: the tick schema is pinned
+#: by ``tests/test_journal.py`` and this task leaves it unchanged, so the mark
+#: rides the existing open ``degradations`` list and is aggregated by the summary.
+TRANSCRIPT_ANSWERS = "transcript_answers"
+
+#: The degradation recorded on a fed tick that tried to fire a call the transcript
+#: could not answer. The feed refuses the call rather than inventing a response,
+#: so this is how the exhaustion is said out loud instead of the run holding in
+#: silence. It can appear on every later cadence tick, one entry per refused try.
+ANSWERS_EXHAUSTED = "answers_exhausted"
+
+#: The degradation recorded on a fed tick that tried to fire a call whose recorded
+#: answer belongs to a *different* question -- a different id, a different
+#: ``type``, a candidate the question never offered, or a scored level it never
+#: named. The feed refuses rather than hand this build a response that answered
+#: someone else's question, because the journal would then pair this build's
+#: ``questions`` with evidence whose origin is not established. It is deliberately
+#: not :data:`ANSWERS_EXHAUSTED`: one means the transcript ran out, the other means
+#: it does not answer what this build asked, and a reader must tell them apart.
+TRANSCRIPT_MISMATCH = "transcript_mismatch"
+
 #: The closed set of reasons a run can stop. It lives here because the loop is
 #: what observes the stop; the journal and the readers only copy the
 #: classification out. A value outside this set is a bug, not a new state, and
@@ -205,13 +301,18 @@ TERMINATIONS: frozenset[str] = frozenset(
 )
 
 __all__ = [
+    "ANSWERS_EXHAUSTED",
     "JEV_RETRIED",
     "JEV_STALE_DISCARDED",
+    "LIVE_SOURCE",
     "OVERSHOOT_FACTOR",
     "STALE_LIMIT_CADENCES",
     "STALL_ESCALATION",
     "STALL_FRAMES",
     "TERMINATIONS",
+    "TRANSCRIPT_ANSWERS",
+    "TRANSCRIPT_MISMATCH",
+    "CallSource",
     "ExecutionLoop",
     "RunSummary",
     "TickRecord",
@@ -429,9 +530,13 @@ class ExecutionLoop:
     a :class:`~mario_jev.policy.dispatch.JevDispatcher` over that client, and —
     only when ``settings.advisor_enabled`` — a :class:`PlayJevAdvisor`.
 
-    The dispatcher is injectable for the same reason the client is: it carries the
-    ``runner`` seam, so a test can drive a call to completion by hand instead of
-    waiting on a thread. ``run()`` closes whichever dispatcher it was given.
+    The call source -- the loop's ``dispatcher`` -- is injectable for the same
+    reason the client is. It is typed as :class:`CallSource`, the four members
+    :class:`~mario_jev.policy.dispatch.JevDispatcher` already has, so either that
+    dispatcher (whose ``runner`` seam lets a test drive a call to completion by
+    hand instead of waiting on a thread) or a
+    :class:`~mario_jev.policy.feed.RecordedAnswerFeed` can be handed in without
+    the loop knowing which. ``run()`` closes whichever source it was given.
     """
 
     __slots__ = (
@@ -462,7 +567,7 @@ class ExecutionLoop:
         client: JevClient | None = None,
         builder: MarioStateBuilder | None = None,
         advisor: PlayJevAdvisor | None = None,
-        dispatcher: JevDispatcher | None = None,
+        dispatcher: CallSource | None = None,
     ) -> None:
         if emulator is None:
             emulator = MarioEmulator(
@@ -604,6 +709,14 @@ class ExecutionLoop:
         jev_call_ms: float | None = None
         fired = False
         jev_started = time.perf_counter()
+        # A fed run's Jev values are not its own, and every line says so. A source
+        # that names a kind other than the live one is a transcript, and its
+        # ``jev_call_ms`` below is the recorded latency rather than a measurement of
+        # this machine; the stamp rides the existing ``degradations`` list, which
+        # the summary aggregates, so the run-level fact is unmissable without
+        # touching the pinned tick schema.
+        if self._source_kind() != LIVE_SOURCE:
+            degradations.append(TRANSCRIPT_ANSWERS)
         if (
             cadence_due
             and settings.jev_available
@@ -611,10 +724,25 @@ class ExecutionLoop:
             and not self._dispatcher.in_flight
         ):
             questions = build_questions(state)
-            # Recorded only because the policy built them; the client exposes no
-            # request handle, so this is the ask, not a capture of the wire request.
-            jev_questions = questions
             fired = self._dispatcher.request(questions, state, tick=self._tick)
+            if fired:
+                # Recorded only because the policy built them; the client exposes no
+                # request handle, so this is the ask, not a capture of the wire
+                # request. A refused fire asked nothing, so ``jev_questions`` stays
+                # ``None`` -- which is exactly how a tick says it did not ask.
+                jev_questions = questions
+            elif self._source_exhausted():
+                # A recorded-answer feed ran out of transcript. It fabricated no
+                # response, so the call was refused; the tick records why instead of
+                # holding in silence.
+                degradations.append(ANSWERS_EXHAUSTED)
+            elif self._source_mismatched():
+                # The recorded answer belongs to a different question than the one
+                # this build asked. The feed refused rather than pair this build's
+                # ``questions`` with someone else's ``response``, and the tick says
+                # so; a distinct value from ``ANSWERS_EXHAUSTED`` because "ran out"
+                # and "answers another question" are different facts.
+                degradations.append(TRANSCRIPT_MISMATCH)
 
         #    Take, on every tick, and never block. What comes back was asked on
         #    this tick or an earlier one, and the tick that observes it is the tick
@@ -721,6 +849,34 @@ class ExecutionLoop:
         )
         self._tick += 1
         return record
+
+    def _source_kind(self) -> str:
+        """The call source's own name for itself; the live default when it has none.
+
+        Read defensively: :class:`~mario_jev.policy.dispatch.JevDispatcher` exposes
+        no ``source_kind`` and must not need one, so a source that stays silent is
+        the live one.
+        """
+        return str(getattr(self._dispatcher, "source_kind", LIVE_SOURCE))
+
+    def _source_exhausted(self) -> bool:
+        """Whether the source was just asked for a call it could not answer.
+
+        Also read defensively: the property is optional and the live dispatcher has
+        none, so a silent source is never exhausted. It is consulted only after a
+        fire was refused, which is the only tick on which exhaustion can appear.
+        """
+        return bool(getattr(self._dispatcher, "exhausted", False))
+
+    def _source_mismatched(self) -> bool:
+        """Whether the source just refused a call whose record answers another question.
+
+        Read after :meth:`_source_exhausted` and, like it, defensively: the live
+        dispatcher has no such property. Exhaustion is checked first because it is
+        terminal -- once a feed has run out it never answers again -- so any later
+        refusal on the same source can only be a mismatch.
+        """
+        return bool(getattr(self._dispatcher, "mismatch", False))
 
     def _observe_progress(self, x_max: int) -> bool:
         """Record this tick's ``x_max`` and answer whether the run has stalled.

@@ -7,6 +7,9 @@ optional PlayJev advisor together into one deterministic tick:
 * :func:`select_action` decides *what* runs, in a fixed, exhaustive order;
 * :class:`JevDispatcher` keeps the call **off** the tick: one worker, at most one
   call in flight, and a take that never blocks;
+* :class:`RecordedAnswerFeed` serves a journal's recorded answers through the same
+  :class:`CallSource` interface, with no socket and no thread -- a measuring
+  instrument, never a fix for the live path;
 * :class:`ExecutionLoop` runs the tick and records every branch it took;
 * :class:`RunSummary` counts the run by :class:`DecisionSource` rather than
   claiming a rate, and names why the run stopped with one member of
@@ -44,11 +47,13 @@ from .decision import (
     select_action,
 )
 from .dispatch import JevDispatcher, Runner, Taken
+from .feed import RecordedAnswer, RecordedAnswerFeed, recorded_answers_from_ticks
 from .loop import (
     JEV_STALE_DISCARDED,
     OVERSHOOT_FACTOR,
     STALE_LIMIT_CADENCES,
     TERMINATIONS,
+    CallSource,
     ExecutionLoop,
     RunSummary,
     TickRecord,
@@ -60,10 +65,13 @@ __all__ = [
     "OVERSHOOT_FACTOR",
     "STALE_LIMIT_CADENCES",
     "TERMINATIONS",
+    "CallSource",
     "DecisionCadence",
     "DecisionSource",
     "ExecutionLoop",
     "JevDispatcher",
+    "RecordedAnswer",
+    "RecordedAnswerFeed",
     "RunSummary",
     "Runner",
     "Taken",
@@ -72,5 +80,6 @@ __all__ = [
     "advisor_view",
     "classify_termination",
     "journal_state",
+    "recorded_answers_from_ticks",
     "select_action",
 ]
