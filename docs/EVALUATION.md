@@ -410,6 +410,48 @@ the game advances **8.7× slower than real time**, now bounded by the rollout sw
 rather than by the API. **The next bottleneck is the rollout, not Jev**, and this section claims nothing
 about saturating the emulator's 60 Hz.
 
+### 7. The first live death with the fixes in: a pit the agent could see
+
+An **observation**, not a defect claim, and it is the run that exercised the fixes end to end. Same
+command as run 1 (`--fast`, stage 1-1, seed 0), extended to the same 900-tick budget, journalled to
+`artifacts/t1-900.jsonl`:
+
+```
+ticks 442   termination "death"   elapsed 65.2 s   6.78 frames/s
+x_max 40 -> 1151 (best at tick 418)   calls fired 55   answers applied 55   discarded 0
+tick total p50 119.7 ms   maximum 281.0 ms   ticks >= 1 s: 0
+```
+
+The freeze is gone on a real run: **the worst tick of 442 cost 281 ms**, where the same build's
+predecessor had a tick at 21 271 ms and the 200-tick comparison had one at 1 203 ms. Every one of the 55
+answers was applied within the staleness bound (ages 2–5, one at 9), and the death is recorded as
+`"termination": "death"` on the summary and `terminated: true` on the final tick — which is §5's fix,
+seen on a real death rather than a scripted one.
+
+**How it died, measured.** Mario ran off a ledge at `x_max` 1151 and fell. Its own state carried the gap
+beforehand — `gap_distance_px` went **60 → 0** over the twenty ticks before the fall completed — and the
+five fresh decisions taken *during* the fall were all `NOOP`:
+
+| tick | what Jev said | confidence | executed |
+|---|---|---|---|
+| 404 | **`right+A`** | 0.49 | **NOOP** (below the 0.60 threshold) |
+| 412 | `NOOP` | 0.51 | NOOP |
+| 419 | `NOOP` | 0.42 | NOOP |
+| 429 | `NOOP` | 0.41 | NOOP |
+| 441 | `NOOP` | 0.24 | NOOP |
+
+At tick 404 the model proposed **moving** and the confidence gate discarded it, so the table's own answer
+ran; the table's best, for a body already in the air over a void, was to do nothing. The gate and the
+rollout then agreed on `NOOP` for the remaining four decisions.
+
+**What this does not establish, and it matters.** It does **not** establish that `right+A` would have
+cleared the gap — air control in Super Mario Bros. is limited and no run here tried it — nor that a
+different confidence threshold would have saved the episode. Both are experiments, not readings. What is
+measured is the sequence: a visible gap, one discarded proposal to move, four agreements to stand still,
+and a death. The stall escalation added for §3 never fired in this run (it needs 30 frames of frozen
+`x_max`; the stall lasted 23), which is worth noting only because a fall gives no recovery to escalate
+towards — it is an observation about this death, not a case for a different threshold.
+
 ## What the journal recorded honestly, and what it cannot say
 
 The advisor was **disabled** for both runs (`{"available": false, "reason": "disabled",
