@@ -7,7 +7,9 @@ agent, so these tests treat its *shape* as the contract:
 * the credential cannot reach the file;
 * a malformed file names its own line instead of failing anonymously;
 * an absent advisor is recorded as absent, not as ``null``;
-* every line is flushed as it is written, so a killed run leaves a valid prefix;
+* every line is flushed as it is written, so a killed run leaves a valid prefix,
+  and that prefix reads back as a run still in progress -- ``in progress``, never
+  ``not recorded``, and with nothing else forgiven;
 * the observer drives a real ``ExecutionLoop`` over a real emulator;
 * the two Pillow drawings are real PNGs, and an artifact that cannot be written
   degrades the tick instead of failing the run;
@@ -616,6 +618,87 @@ def test_a_well_formed_journal_has_no_error(tmp_path: Path) -> None:
     assert journal.run["kind"] == "run"
     assert [entry["kind"] for entry in journal.ticks] == ["tick"]
     assert journal.summary["kind"] == "summary"
+
+
+# -- 3b. a run that has not written its trailer yet ----------------------------------
+# A live run's file ends with its last flushed tick. Reading it must not require
+# pretending the run is over -- and it must not relax anything else: the trailer is
+# the only absence forgiven, so a corrupt line, a second header or a tick after a
+# trailer still refuses to be read.
+
+
+def test_a_journal_without_its_trailer_reads_as_in_progress(tmp_path: Path) -> None:
+    path = tmp_path / "live.jsonl"
+    write_lines(path, [header_line(), tick_line(), tick_line()])
+
+    journal = read_journal(path, allow_partial=True)
+
+    assert journal.summary is None
+    assert journal.run == run_record(make_settings(), started_at=STARTED_AT)
+    assert len(journal.ticks) == 2
+    # The default read of the same bytes is still the strict one: one flag apart.
+    with pytest.raises(JournalFormatError) as excinfo:
+        read_journal(path)
+    assert "missing summary trailer" in excinfo.value.reason
+
+
+def test_partial_reading_still_refuses_a_malformed_line(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "live.jsonl"
+    write_lines(path, [header_line(), tick_line(), "{not json}", tick_line()])
+
+    with pytest.raises(JournalFormatError) as excinfo:
+        read_journal(path, allow_partial=True)
+
+    assert excinfo.value.line == 3
+    assert "not valid JSON" in excinfo.value.reason
+
+
+def test_partial_reading_still_refuses_a_tick_after_a_trailer(tmp_path: Path) -> None:
+    path = tmp_path / "odd.jsonl"
+    write_lines(path, [header_line(), summary_line(), tick_line()])
+
+    with pytest.raises(JournalFormatError) as excinfo:
+        read_journal(path, allow_partial=True)
+
+    assert excinfo.value.line == 3
+    assert "after the summary trailer" in excinfo.value.reason
+
+
+def test_partial_reading_still_refuses_a_second_header(tmp_path: Path) -> None:
+    path = tmp_path / "odd.jsonl"
+    write_lines(path, [header_line(), tick_line(), header_line()])
+
+    with pytest.raises(JournalFormatError) as excinfo:
+        read_journal(path, allow_partial=True)
+
+    assert excinfo.value.line == 3
+    assert "second run header" in excinfo.value.reason
+
+
+def test_partial_reading_still_refuses_an_empty_file(tmp_path: Path) -> None:
+    # No trailer to forgive: there is no header either, so this is not a run in
+    # progress, it is a file that says nothing at all.
+    path = tmp_path / "empty.jsonl"
+    write_lines(path, [])
+
+    with pytest.raises(JournalFormatError) as excinfo:
+        read_journal(path, allow_partial=True)
+
+    assert "empty" in excinfo.value.reason
+
+
+def test_a_header_only_journal_is_in_progress_not_an_error(tmp_path: Path) -> None:
+    # The first instant of a run: the header is flushed and no tick has happened
+    # yet. That is a real state of a live file, not a broken one.
+    path = tmp_path / "just-started.jsonl"
+    write_lines(path, [header_line()])
+
+    journal = read_journal(path, allow_partial=True)
+
+    assert journal.summary is None
+    assert journal.ticks == ()
 
 
 # -- 4. the advisor block -----------------------------------------------------------

@@ -5,14 +5,19 @@ Two readers, one validation core:
 * :func:`iter_journal` validates every line — it is parseable JSON, it is an
   object, and its ``kind`` is one of the three — and yields the raw lines.
 * :func:`read_journal` additionally enforces the run *shape*: one header first,
-  zero or more ticks, one trailer last, and nothing after the trailer.
+  zero or more ticks, one trailer last, and nothing after the trailer. With
+  ``allow_partial=True`` it enforces the same shape for every line it can see and
+  tolerates exactly one absence: the trailer. That is what a run still in
+  progress looks like, and the only thing it may leave out is the end.
 
 A malformed line is never skipped. The reader raises :class:`JournalFormatError`
 with the 1-based line number instead, because a journal that silently drops a
 line is worse evidence than one that refuses to be read. A line that is not
 UTF-8 is one of those malformed lines: the file is decoded line by line so an
 undecodable one is reported with its number rather than letting a
-``UnicodeDecodeError`` escape.
+``UnicodeDecodeError`` escape. Partial reading does not relax any of that: it
+forgives a missing trailer, never a corrupt line, a second header or a tick that
+follows a trailer.
 """
 
 from __future__ import annotations
@@ -81,13 +86,25 @@ def iter_journal(path: object) -> Iterator[dict[str, object]]:
         yield entry
 
 
-def read_journal(path: object) -> Journal:
-    """Read and validate a whole journal.
+def read_journal(path: object, *, allow_partial: bool = False) -> Journal:
+    """Read and validate a journal.
+
+    With ``allow_partial=False`` (the default) the whole run shape is required:
+    exactly one header, zero or more ticks, one trailer last, nothing after it.
+
+    With ``allow_partial=True`` every line that is present is held to exactly the
+    same rules; the one thing that becomes optional is the trailer, because a run
+    still in progress has not written it yet. The returned journal then carries
+    ``summary=None`` -- "not written yet", which is a different fact from a
+    recorded summary that is missing one of its keys. The trailer is the only
+    absence forgiven: a malformed line, a second header, or a tick after a trailer
+    still raises, because a reader that skipped one of those would be showing a
+    different run than the one on disk.
 
     Raises:
         JournalFormatError: a line is not parseable, or is not an object, or has
-            an unknown ``kind``, or the sequence is not exactly one header, zero
-            or more ticks and one trailer.
+            an unknown ``kind``, or the sequence is not one header, zero or more
+            ticks and (unless ``allow_partial``) one trailer.
     """
     entries = list(_iter_entries(path))
     if not entries:
@@ -118,9 +135,20 @@ def read_journal(path: object) -> Journal:
             raise JournalFormatError(number, "a tick after the summary trailer")
 
     if summary_at is None:
-        last_number = entries[-1][0]
-        raise JournalFormatError(
-            last_number, "missing summary trailer; the journal must end with one"
+        if not allow_partial:
+            last_number = entries[-1][0]
+            raise JournalFormatError(
+                last_number, "missing summary trailer; the journal must end with one"
+            )
+        # A run in progress: the header and every tick so far were validated
+        # above, and only the trailer is absent. There is no summary to report,
+        # so the field is ``None`` rather than an empty mapping -- an empty
+        # mapping would read as a summary that recorded nothing, and a summary-less
+        # journal must be labelled as a run still going, never as lost evidence.
+        return Journal(
+            run=first,
+            ticks=tuple(entry for _, entry in entries[1:]),
+            summary=None,
         )
 
     ticks = tuple(entry for _, entry in entries[1:summary_at])

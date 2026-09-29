@@ -1,6 +1,7 @@
-"""The command line: play, replay, render the dashboard, and check readiness.
+"""The command line: play, replay, render the dashboard, serve it live, and check
+readiness.
 
-Four subcommands, one entry point. :func:`main` takes an explicit ``argv`` so the
+Five subcommands, one entry point. :func:`main` takes an explicit ``argv`` so the
 tests drive every path in-process and never spawn a subprocess, and it returns an
 exit code rather than raising: a missing journal, an unreadable journal or a
 broken configuration becomes an actionable message, not a traceback.
@@ -13,6 +14,8 @@ broken configuration becomes an actionable message, not a traceback.
   emulator and no planner, and touches no network; replaying the same file twice
   is byte-identical.
 * ``dashboard`` writes the static HTML report.
+* ``serve`` answers HTTP requests with that same report, regenerated for each
+  one, so a run can be watched while it happens.
 * ``doctor`` reports the environment and dependency readiness, with an exit code
   that the optional advisor stack can never change.
 
@@ -39,6 +42,8 @@ from mario_jev.emulator import MarioEmulator
 from mario_jev.jev import JevClient, JevError
 from mario_jev.journal import JournalFormatError, JournalWriter, read_journal
 from mario_jev.policy import ExecutionLoop
+from mario_jev.serve import DEFAULT_BIND, DEFAULT_PORT
+from mario_jev.serve import serve as serve_journal
 from mario_jev.trajectory import TrajectoryPlanner
 
 __all__ = ["main"]
@@ -340,6 +345,20 @@ def _cmd_dashboard(args: argparse.Namespace) -> int:
     return 0
 
 
+# -- serve -------------------------------------------------------------------------
+
+
+def _cmd_serve(args: argparse.Namespace) -> int:
+    """Serve the report for a journal until interrupted. The journal is read per request."""
+    return serve_journal(
+        args.journal,
+        artifacts_dir=args.artifacts_dir,
+        bind=args.bind,
+        port=args.port,
+        once=args.once,
+    )
+
+
 # -- doctor command ----------------------------------------------------------------
 
 
@@ -401,6 +420,36 @@ def _build_parser() -> argparse.ArgumentParser:
         "--out", default=None, help="output HTML path (default: beside the journal)"
     )
     dashboard.set_defaults(handler=_cmd_dashboard)
+
+    serve = subparsers.add_parser(
+        "serve", help="serve the report for a journal, live, over a local HTTP port"
+    )
+    serve.add_argument("journal", help="journal path to read again on every request")
+    serve.add_argument(
+        "--port",
+        type=int,
+        default=DEFAULT_PORT,
+        help=f"TCP port to listen on (default: {DEFAULT_PORT}; 0 picks a free one)",
+    )
+    serve.add_argument(
+        "--bind",
+        default=DEFAULT_BIND,
+        help=(
+            f"address to listen on (default: {DEFAULT_BIND}, loopback only; "
+            "another address publishes this machine's run to the network)"
+        ),
+    )
+    serve.add_argument(
+        "--artifacts-dir",
+        default=None,
+        help="directory artifacts are served from (default: the one the run recorded)",
+    )
+    serve.add_argument(
+        "--once",
+        action="store_true",
+        help="answer one request and exit",
+    )
+    serve.set_defaults(handler=_cmd_serve)
 
     doctor = subparsers.add_parser("doctor", help="report environment readiness")
     doctor.set_defaults(handler=_cmd_doctor)

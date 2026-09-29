@@ -25,6 +25,7 @@ from mario_jev.dashboard import build_html, render_text
 from mario_jev.emulator import StepResult, build_actions
 from mario_jev.jev import HttpResult, JevClient
 from mario_jev.journal import Journal, read_journal
+from mario_jev.serve import DEFAULT_BIND, DEFAULT_PORT
 from mario_jev.state import TerminalOutcome
 from mario_jev.trajectory import CandidateRollout, CostSource, RolloutTable
 
@@ -1198,3 +1199,109 @@ def test_the_jet_latency_a_reader_shows_is_the_whole_call_not_the_attempt_that_w
     assert f"jev_latency_ms={ATTEMPT_MS:.3f}" not in text, (
         "the reader reported the successful attempt as the call's latency"
     )
+
+
+# -- a run that has not finished, in both readers ------------------------------------
+# A journal with no trailer is a run still going. Its counts do not exist yet, and
+# "not recorded" would describe a finished run that had lost part of itself -- a
+# different fact, and the wrong one. "in progress" says only what is true.
+
+
+def _summary_less(journal: Journal) -> Journal:
+    """The same run as a live viewer sees it: the trailer has not been written."""
+    return Journal(run=journal.run, ticks=journal.ticks, summary=None)
+
+
+def test_both_readers_label_a_summary_less_journal_in_progress() -> None:
+    live = _summary_less(_two_tick_journal())
+
+    text = render_text(live)
+    html = build_html(live)
+
+    # In the terminal report, where the recorded counts would be.
+    recorded = text.split("summary (recorded):", 1)[1].split(
+        "derived from recorded sources", 1
+    )[0]
+    assert "in progress" in recorded
+    assert "not recorded" not in recorded
+    assert "termination:" not in recorded
+    assert "ticks:" not in recorded
+
+    # And in the dashboard, in the same place: the recorded table.
+    recorded_html = html.split("<h3>Recorded</h3>", 1)[1].split("<h3>", 1)[0]
+    assert "in progress" in recorded_html
+    assert "not recorded" not in recorded_html
+    assert "<th>termination</th>" not in recorded_html
+
+
+def test_in_progress_never_displaces_not_recorded_for_a_finished_run() -> None:
+    # The two labels are not alternatives: a finished run that did not record a
+    # value still says "not recorded", and a live one says "in progress".
+    finished = _died_journal()
+    summary = dict(finished.summary)
+    del summary["termination"]
+
+    text = render_text(Journal(run=finished.run, ticks=finished.ticks, summary=summary))
+
+    assert "termination: not recorded" in text
+    assert "in progress" not in text
+
+
+# -- serve, from the command line ----------------------------------------------------
+
+
+def test_the_serve_command_passes_every_option_through(monkeypatch, tmp_path) -> None:
+    journal_path = _write_journal(tmp_path / "live.jsonl", _two_tick_journal())
+    artifacts = tmp_path / "artifacts"
+    recorded: dict[str, object] = {}
+
+    def fake_serve(journal: object, **options: object) -> int:
+        recorded["journal"] = journal
+        recorded.update(options)
+        return 0
+
+    monkeypatch.setattr(cli, "serve_journal", fake_serve)
+
+    code = cli.main(
+        [
+            "serve",
+            str(journal_path),
+            "--port",
+            "9123",
+            "--bind",
+            "0.0.0.0",
+            "--artifacts-dir",
+            str(artifacts),
+            "--once",
+        ]
+    )
+
+    assert code == 0
+    assert recorded == {
+        "journal": str(journal_path),
+        "port": 9123,
+        "bind": "0.0.0.0",
+        "artifacts_dir": str(artifacts),
+        "once": True,
+    }
+
+
+def test_serve_defaults_to_loopback_and_the_watch_port(monkeypatch, tmp_path) -> None:
+    journal_path = _write_journal(tmp_path / "live.jsonl", _two_tick_journal())
+    recorded: dict[str, object] = {}
+
+    def fake_serve(journal: object, **options: object) -> int:
+        recorded["journal"] = journal
+        recorded.update(options)
+        return 0
+
+    monkeypatch.setattr(cli, "serve_journal", fake_serve)
+
+    assert cli.main(["serve", str(journal_path)]) == 0
+
+    # A viewer that binds a wider interface without being asked would publish this
+    # machine's run to the network; the default has to be the loopback address.
+    assert recorded["bind"] == DEFAULT_BIND
+    assert recorded["port"] == DEFAULT_PORT
+    assert recorded["artifacts_dir"] is None
+    assert recorded["once"] is False

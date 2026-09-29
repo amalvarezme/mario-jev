@@ -32,6 +32,30 @@ and `nes_py` present; the ROM present; `JEV_API_KEY` **configured** (printed as 
 value); and `torch`/`transformers` **not installed**, reported as the advisor being unavailable
 rather than as a failure — which is the intended state here.
 
+### Watching a run while it happens
+
+A run can be watched instead of waited for. The viewer serves the same report, regenerated on every
+request, so a browser refresh is the whole mechanism:
+
+```sh
+PYTHONPATH=src .venv/bin/python -m mario_jev serve artifacts/run.jsonl   # http://127.0.0.1:8000/
+```
+
+A journal **without** its summary trailer — a run still in progress — is readable through this path
+(`read_journal(..., allow_partial=True)`) and every reader then says the run is **in progress** rather
+than `not recorded`, which is the label for a *finished* run that lost a key. The strictness that
+matters is untouched: the header is still required and every line present is still validated, so the
+only thing tolerated is that the trailer has not been written yet. A line caught mid-write is answered
+`503` with the reader's own message and a sentence saying the file may be mid-write, never a partial
+report presented as a whole one.
+
+Three limits, measured and stated rather than discovered later: the page **embeds its images**, so it is
+15.26 MB for the 442-tick run above (0.11 MB for a 3-tick one) and grows with the run — fine to refresh
+by hand, unusable as a polling loop; the server is **single-threaded**, so one tab is the target and a
+second request waits; and it binds `127.0.0.1` with **no authentication**, so what keeps the evidence
+private is the loopback default and nothing else — publishing it takes an explicit `--bind`, which the
+startup line then prints.
+
 ## Results
 
 | | run 1 (unpaced) | run 2 (paced, before the fix) |

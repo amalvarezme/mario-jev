@@ -37,6 +37,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Mapping
 
 from mario_jev.advisor import REASON_DISABLED, AdvisorAbsence, AdvisorAdvice
 from mario_jev.config import Settings
@@ -73,7 +74,12 @@ class Journal:
 
     run: dict[str, object]
     ticks: tuple[dict[str, object], ...]
-    summary: dict[str, object]
+    #: ``None`` when the journal has no summary trailer yet -- a run still in
+    #: progress, which ``read_journal(..., allow_partial=True)`` permits and the
+    #: live viewer needs. A *present* summary that lacks a key is a different fact,
+    #: and the readers label the two differently: ``in progress`` against
+    #: ``not recorded``.
+    summary: Mapping[str, object] | None
 
 
 def _utc_isoformat(moment: datetime) -> str:

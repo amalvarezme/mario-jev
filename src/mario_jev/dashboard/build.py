@@ -31,7 +31,10 @@ of the artifact rather than a formatting preference:
 * **Numbers are derived from what was recorded, or they are not shown.** The
   source counts, the fallback count and the fallback rate are counted from the
   recorded ``decision.source``/``decision.jev_called`` values; the recorded
-  summary fields are printed verbatim. Nothing is estimated.
+  summary fields are printed verbatim. Nothing is estimated. A journal with no
+  trailer yet is a run still in progress and says so in place of the summary
+  counts; it is never labelled ``not recorded``, which would describe a finished
+  run that had lost part of itself.
 
 Every string that came out of the journal is HTML-escaped before it reaches the
 page, because a reason is data and data must not be able to inject markup.
@@ -61,6 +64,10 @@ DEFAULT_TITLE = "mario-jev run report"
 #: The words used when no call was made, and when a value was not recorded.
 NO_CALL = "no call"
 NOT_RECORDED = "not recorded"
+#: The words for a summary trailer that has not been written yet. A run still
+#: going has not recorded its counts -- and ``not recorded`` would describe a
+#: finished run that lost part of itself, which is a different fact.
+IN_PROGRESS = "in progress"
 #: The words for a tick that applied no answer, and for one that threw away the
 #: answer it took. Both are recorded facts, and neither is "no call": the run may
 #: well have had a call in flight, or have just paid for one it refused to act on.
@@ -554,25 +561,10 @@ def _run_facts(journal: Journal) -> str:
 
 
 def _summary_section(journal: Journal, derived: Mapping[str, object]) -> str:
-    summary = _mapping(journal.summary)
     # ``termination`` leads: a run that stopped at 805 of 900 ticks is read from
     # the top of this table, and the tick count alone cannot say whether that was
     # a death, the flag, or a hand on the keyboard. The counts stay where they
     # were; the reason is added in front of them, not instead of them.
-    recorded = [
-        ("termination", summary.get("termination", NOT_RECORDED)),
-        ("ticks", summary.get("ticks")),
-        ("frames", summary.get("frames")),
-        ("decisions (calls fired)", summary.get("decisions")),
-        # Beside ``decisions``, never instead of it: one counts the calls this run
-        # fired and the other the answers it acted on, and with the call off the
-        # tick they are different numbers.
-        ("answers_applied", summary.get("answers_applied", NOT_RECORDED)),
-        ("decision_rate_hz", summary.get("decision_rate_hz")),
-        ("elapsed_s", summary.get("elapsed_s")),
-    ]
-    sources = _mapping(summary.get("sources"))
-    degradations = _mapping(summary.get("degradations"))
     derived_pairs = [
         ("ticks counted", derived["ticks"]),
         ("decisions (jev_called true)", derived["decisions"]),
@@ -589,14 +581,41 @@ def _summary_section(journal: Journal, derived: Mapping[str, object]) -> str:
             ("oldest applied answer (ticks)", staleness["oldest"]),
             ("answers discarded as stale", staleness["discarded"]),
         ]
+    if journal.summary is None:
+        # No trailer yet, so there are no recorded counts to print. The words are
+        # "in progress" and not "not recorded": nothing was lost, the run simply
+        # has not finished. The derived block below still stands, because it is
+        # counted from the ticks that are really on disk.
+        recorded = (
+            "<h3>Recorded</h3>"
+            f'<p class="missing">{IN_PROGRESS}: this run has not written its '
+            "summary trailer yet</p>"
+        )
+    else:
+        summary = _mapping(journal.summary)
+        rows = [
+            ("termination", summary.get("termination", NOT_RECORDED)),
+            ("ticks", summary.get("ticks")),
+            ("frames", summary.get("frames")),
+            ("decisions (calls fired)", summary.get("decisions")),
+            # Beside ``decisions``, never instead of it: one counts the calls this run
+            # fired and the other the answers it acted on, and with the call off the
+            # tick they are different numbers.
+            ("answers_applied", summary.get("answers_applied", NOT_RECORDED)),
+            ("decision_rate_hz", summary.get("decision_rate_hz")),
+            ("elapsed_s", summary.get("elapsed_s")),
+        ]
+        recorded = (
+            "<h3>Recorded</h3>"
+            f"<table class=\"facts\"><tbody>{_rows(rows)}</tbody></table>"
+            "<h3>Recorded sources</h3>"
+            f"{_counts_table(_mapping(summary.get('sources')))}"
+            "<h3>Recorded degradations</h3>"
+            f"{_counts_table(_mapping(summary.get('degradations')))}"
+        )
     return (
         "<section><h2>Summary</h2>"
-        "<h3>Recorded</h3>"
-        f"<table class=\"facts\"><tbody>{_rows(recorded)}</tbody></table>"
-        "<h3>Recorded sources</h3>"
-        f"{_counts_table(sources)}"
-        "<h3>Recorded degradations</h3>"
-        f"{_counts_table(degradations)}"
+        f"{recorded}"
         "<h3>Derived from the recorded sources and jev_called</h3>"
         f"<table class=\"facts\"><tbody>{_rows(derived_pairs)}</tbody></table>"
         "</section>"
@@ -841,6 +860,11 @@ def render_text(journal: Journal) -> str:
     transport attempt. Read with the header's ``jev_timeout_s``, it is what turns
     a tick that spent 21 s to record a 577 ms answer into two attempts against a
     20 s deadline rather than unaccounted time.
+
+    A journal without its trailer -- a run still in progress -- prints
+    ``in progress`` where the summary counts would be, and never ``not recorded``:
+    those counts are not lost, they do not exist yet. Everything derived from the
+    ticks really on disk is printed unchanged.
     """
     run = journal.run
     settings = _mapping(run.get("settings"))
@@ -859,31 +883,37 @@ def render_text(journal: Journal) -> str:
     lines.append(f"  artifacts_dir: {recorded_dir if recorded_dir else NOT_RECORDED}")
 
     lines += ["", "summary (recorded):"]
-    for key in (
-        "termination",
-        "ticks",
-        "frames",
-        "decisions",
-        "answers_applied",
-        "decision_rate_hz",
-        "elapsed_s",
-    ):
-        value = summary.get(key)
-        lines.append(f"  {key}: {value if value is not None else NOT_RECORDED}")
-    sources = _mapping(summary.get("sources"))
-    lines.append("  sources:")
-    if sources:
-        for key in sorted(sources):
-            lines.append(f"    {key}: {sources[key]}")
+    if journal.summary is None:
+        # A live journal has not written its trailer yet, so there are no recorded
+        # counts. The words are "in progress", never "not recorded": nothing was
+        # lost, the run has not finished.
+        lines.append(f"  {IN_PROGRESS}: this run has not written its summary trailer yet")
     else:
-        lines.append(f"    {NOT_RECORDED}")
-    degradations = _mapping(summary.get("degradations"))
-    lines.append("  degradations:")
-    if degradations:
-        for key in sorted(degradations):
-            lines.append(f"    {key}: {degradations[key]}")
-    else:
-        lines.append("    none recorded")
+        for key in (
+            "termination",
+            "ticks",
+            "frames",
+            "decisions",
+            "answers_applied",
+            "decision_rate_hz",
+            "elapsed_s",
+        ):
+            value = summary.get(key)
+            lines.append(f"  {key}: {value if value is not None else NOT_RECORDED}")
+        sources = _mapping(summary.get("sources"))
+        lines.append("  sources:")
+        if sources:
+            for key in sorted(sources):
+                lines.append(f"    {key}: {sources[key]}")
+        else:
+            lines.append(f"    {NOT_RECORDED}")
+        degradations = _mapping(summary.get("degradations"))
+        lines.append("  degradations:")
+        if degradations:
+            for key in sorted(degradations):
+                lines.append(f"    {key}: {degradations[key]}")
+        else:
+            lines.append("    none recorded")
 
     lines += ["", "derived from recorded sources and jev_called:"]
     lines.append(f"  ticks counted: {derived['ticks']}")
