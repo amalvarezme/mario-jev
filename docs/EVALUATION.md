@@ -41,6 +41,23 @@ request, so a browser refresh is the whole mechanism:
 PYTHONPATH=src .venv/bin/python -m mario_jev serve artifacts/run.jsonl   # http://127.0.0.1:8000/
 ```
 
+The play and the viewer are also one command, for the case where the run does not exist yet:
+
+```sh
+PYTHONPATH=src scripts/jev-env.sh .venv/bin/python -m mario_jev demo --max-ticks 300 --no-open
+```
+
+`demo` plays stage 1-1, writes `artifacts/demo.jsonl` with the per-tick frame and trajectory PNGs, and
+serves the report for it while the run is still going, so a refresh shows the page growing; it opens the
+browser at the bound address, which is also what `--port 0` prints. Ctrl-C stops the viewer and
+**abandons** the run, and says exactly that: the journal keeps every tick written so far and has **no
+summary trailer of its own**, so the readers report the run as **in progress** — which is the honest
+reading of a run nobody finished, and not a claim that it completed. Two edge states get their own
+sentence rather than that one: a trailer already sitting at the journal path was not written by this run,
+so the demo says only that the trailer is there and may not be its own — this run never opened that file
+(for instance because it is not writable) — and stopping the viewer does not finish a run. A run that
+**fails** prints its error and the viewer keeps serving the ticks up to the failure.
+
 A journal **without** its summary trailer — a run still in progress — is readable through this path
 (`read_journal(..., allow_partial=True)`) and every reader then says the run is **in progress** rather
 than `not recorded`, which is the label for a *finished* run that lost a key. The strictness that

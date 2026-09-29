@@ -309,8 +309,16 @@ def serve(
     once: bool = False,
     retry_delay_s: float = RETRY_DELAY_S,
     out: TextIO | None = None,
+    on_ready: Callable[[str], None] | None = None,
 ) -> int:
-    """Start the viewer for ``journal_path`` and serve until interrupted."""
+    """Start the viewer for ``journal_path`` and serve until interrupted.
+
+    ``on_ready``, when given, is called with the bound URL once the socket is
+    bound and **before** the first request is served. It exists so a caller can
+    act on the address the OS actually chose (``port=0``). ``serve`` prints its
+    own startup lines unconditionally and decides nothing on the callback's
+    behalf; passing ``None`` keeps every current caller unchanged.
+    """
     stream = sys.stdout if out is None else out
     path = Path(journal_path)
     viewer = Viewer(
@@ -320,13 +328,20 @@ def serve(
     )
     server = ViewerServer((bind, port), viewer)
     host, actual_port = server.server_address[0], server.server_address[1]
-    print(f"serving {path} at http://{host}:{actual_port}/", file=stream)
-    print(
-        "this is the run's evidence, not the game: the loop advances one frame per "
-        "tick, so the page grows at the tick rate, not at 60 fps",
-        file=stream,
-    )
+    url = f"http://{host}:{actual_port}/"
     try:
+        # Both prints and the callback sit inside the ``try``: a callback that
+        # raises, or a stream that fails (a closed pipe, say), must not skip
+        # ``server_close`` and leak the socket the viewer just bound. A failing
+        # print is the caller's environment failing, not swallowed here.
+        print(f"serving {path} at {url}", file=stream)
+        print(
+            "this is the run's evidence, not the game: the loop advances one frame per "
+            "tick, so the page grows at the tick rate, not at 60 fps",
+            file=stream,
+        )
+        if on_ready is not None:
+            on_ready(url)
         return run(server, once=once)
     finally:
         server.server_close()

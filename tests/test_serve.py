@@ -515,3 +515,121 @@ def test_serve_says_where_it_listens_and_what_the_page_is(
 
 def test_the_default_bind_is_loopback_only() -> None:
     assert DEFAULT_BIND == "127.0.0.1"
+
+
+# -- on_ready: the address the OS actually chose, before the first request ------
+# ``--port 0`` means the caller cannot know the URL until the socket is bound, so
+# ``on_ready`` is the seam that hands it over. It prints nothing itself: the demo
+# owns what happens when there is nobody to open it.
+
+
+def test_serve_hands_on_ready_the_url_it_bound_before_it_serves(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    journal = _live_journal(tmp_path / "live.jsonl")
+    order: list[object] = []
+    bound: dict[str, object] = {}
+
+    def fake_run(server: ViewerServer, *, once: bool = False) -> int:
+        order.append("serving")
+        bound["address"] = server.server_address
+        return 0
+
+    monkeypatch.setattr(serve_module, "run", fake_run)
+
+    ready: list[str] = []
+    code = serve(
+        journal,
+        port=0,
+        once=True,
+        out=StringIO(),
+        on_ready=lambda url: (order.append("ready"), ready.append(url)),
+    )
+
+    assert code == 0
+    host, port = bound["address"]  # type: ignore[misc]
+    assert ready == [f"http://{host}:{port}/"]
+    # Bound first, then named, then served: the whole point is that the URL is the
+    # real one before anything can ask for it.
+    assert order == ["ready", "serving"]
+
+
+#: A server stand-in with a fixed address, so a test can assert the exact stdout
+#: without a real bind choosing a random port. ``run`` is stubbed out, so the
+#: stand-in only has to answer ``server_address`` and ``server_close``.
+class _FixedAddressServer:
+    def __init__(self, address: tuple[str, int], handler: object) -> None:
+        self.server_address = ("127.0.0.1", 8000)
+
+    def server_close(self) -> None:
+        pass
+
+
+def test_serve_without_on_ready_serves_exactly_as_before(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    journal = _live_journal(tmp_path / "live.jsonl")
+    monkeypatch.setattr(serve_module, "ViewerServer", _FixedAddressServer)
+    monkeypatch.setattr(serve_module, "run", lambda server, *, once=False: 0)
+    out = StringIO()
+
+    code = serve(journal, port=0, once=True, out=out)
+
+    assert code == 0
+    # The whole startup output, not just the first line: "exactly as before" is a
+    # claim about every byte serve prints.
+    assert out.getvalue().splitlines() == [
+        f"serving {journal} at http://127.0.0.1:8000/",
+        "this is the run's evidence, not the game: the loop advances one frame per "
+        "tick, so the page grows at the tick rate, not at 60 fps",
+    ]
+
+
+def test_serve_prints_the_same_lines_with_a_callback_as_without_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    journal = _live_journal(tmp_path / "live.jsonl")
+    monkeypatch.setattr(serve_module, "ViewerServer", _FixedAddressServer)
+    monkeypatch.setattr(serve_module, "run", lambda server, *, once=False: 0)
+
+    without = StringIO()
+    with_callback = StringIO()
+    assert serve(journal, port=0, once=True, out=without) == 0
+    assert (
+        serve(journal, port=0, once=True, out=with_callback, on_ready=lambda url: None)
+        == 0
+    )
+
+    # serve prints its own lines and nothing on the callback's behalf: the silent
+    # callback changes not one byte of them.
+    assert without.getvalue() == with_callback.getvalue()
+
+
+def test_a_raising_on_ready_still_closes_the_socket(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    journal = _live_journal(tmp_path / "live.jsonl")
+    servers: list[object] = []
+
+    class _RecordingServer:
+        def __init__(self, address: tuple[str, int], handler: object) -> None:
+            self.server_address = ("127.0.0.1", 8000)
+            self.closed = False
+            servers.append(self)
+
+        def server_close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(serve_module, "ViewerServer", _RecordingServer)
+    monkeypatch.setattr(serve_module, "run", lambda server, *, once=False: 0)
+
+    def explode(url: str) -> None:
+        raise RuntimeError("the callback is the caller's business, not serve's")
+
+    with pytest.raises(RuntimeError):
+        serve(journal, port=0, once=True, out=StringIO(), on_ready=explode)
+
+    # The callback ran inside the ``try/finally``: the socket it was handed is
+    # released even though the callback raised.
+    assert servers[0].closed is True  # type: ignore[attr-defined]
+

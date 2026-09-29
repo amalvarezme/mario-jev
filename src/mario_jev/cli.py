@@ -1,7 +1,7 @@
 """The command line: play, replay, render the dashboard, serve it live, and check
 readiness.
 
-Five subcommands, one entry point. :func:`main` takes an explicit ``argv`` so the
+Six subcommands, one entry point. :func:`main` takes an explicit ``argv`` so the
 tests drive every path in-process and never spawn a subprocess, and it returns an
 exit code rather than raising: a missing journal, an unreadable journal or a
 broken configuration becomes an actionable message, not a traceback.
@@ -16,6 +16,9 @@ broken configuration becomes an actionable message, not a traceback.
 * ``dashboard`` writes the static HTML report.
 * ``serve`` answers HTTP requests with that same report, regenerated for each
   one, so a run can be watched while it happens.
+* ``demo`` is the whole thing in one command: it plays world 1-1, writes the
+  run's evidence (the journal, with the per-tick frame and trajectory artifacts),
+  and serves the page for it while the run goes.
 * ``doctor`` reports the environment and dependency readiness, with an exit code
   that the optional advisor stack can never change.
 
@@ -31,6 +34,8 @@ import importlib.util
 import os
 import platform
 import sys
+import threading
+import webbrowser
 from dataclasses import replace
 from pathlib import Path
 from typing import Callable, Sequence
@@ -41,7 +46,7 @@ from mario_jev.dashboard import render_text, write_html
 from mario_jev.emulator import MarioEmulator
 from mario_jev.jev import JevClient, JevError
 from mario_jev.journal import JournalFormatError, JournalWriter, read_journal
-from mario_jev.policy import ExecutionLoop
+from mario_jev.policy import ExecutionLoop, RunSummary, TickRecord
 from mario_jev.serve import DEFAULT_BIND, DEFAULT_PORT
 from mario_jev.serve import serve as serve_journal
 from mario_jev.trajectory import TrajectoryPlanner
@@ -229,20 +234,90 @@ def doctor_exit_code(report: dict[str, object]) -> int:
 
 
 def _apply_overrides(settings: Settings, args: argparse.Namespace) -> Settings:
+    # ``getattr``: ``run`` and ``demo`` do not carry the same options, and a
+    # command that does not offer one must leave the setting alone rather than
+    # raise on a missing attribute.
     changes: dict[str, object] = {}
-    if args.stage is not None:
+    if getattr(args, "stage", None) is not None:
         changes["stage"] = args.stage
-    if args.max_ticks is not None:
+    if getattr(args, "max_ticks", None) is not None:
         changes["max_ticks"] = args.max_ticks
-    if args.real_time is not None:
+    if getattr(args, "real_time", None) is not None:
         changes["real_time"] = args.real_time
-    if args.artifacts_dir is not None:
+    if getattr(args, "artifacts_dir", None) is not None:
         changes["artifacts_dir"] = Path(args.artifacts_dir)
+    if getattr(args, "seed", None) is not None:
+        changes["seed"] = args.seed
     if not changes:
         return settings
     updated = replace(settings, **changes)
     updated.validate()
     return updated
+
+
+class _JournalOpenError(OSError):
+    """The journal writer could not be built.
+
+    Raised when opening the journal for writing -- or writing the header that
+    follows -- fails, before the run proper starts. An ``OSError`` like the
+    failure it wraps, but a distinct type so ``run`` can keep its two messages
+    apart: "cannot open journal" for this setup failure, and "run failed" for
+    everything the run itself raised. The header write can fail *after* the file
+    was opened and truncated, so the type marks where the failure happened, not
+    a file that was never touched. Before the shared :func:`_play` existed those
+    two branches sat next to each other, and the type is what carries the
+    distinction across the function boundary.
+    """
+
+
+def _play(
+    settings: Settings,
+    journal_path: object,
+    *,
+    artifacts_dir: object | None,
+    max_ticks: int | None = None,
+    observer: Callable[[TickRecord], None] | None = None,
+) -> RunSummary:
+    """Play one run into ``journal_path`` and return its summary.
+
+    The writer, emulator, planner, client, advisor and loop are built here, so
+    ``run`` and ``demo`` take the same path and produce the same journal. The
+    summary trailer is written before returning: a journal without one is a run
+    that did not finish, which is exactly what the live viewer reports.
+
+    ``observer`` replaces the journal's own per-tick writer when given; ``None``
+    keeps that writer, which is what both commands want. ``max_ticks`` overrides
+    ``settings.max_ticks`` for the loop, as it does for ``run``.
+    """
+    try:
+        writer = JournalWriter(
+            journal_path, settings=settings, artifacts_dir=artifacts_dir
+        )
+    except OSError as exc:
+        raise _JournalOpenError(str(exc)) from exc
+
+    try:
+        emulator = None
+        try:
+            emulator = _build_emulator(settings)
+            loop = ExecutionLoop(
+                settings,
+                emulator=emulator,
+                planner=_build_planner(settings),
+                client=_build_client(settings),
+                advisor=_build_advisor(settings),
+            )
+            summary = loop.run(
+                max_ticks=max_ticks,
+                observer=writer.observer() if observer is None else observer,
+            )
+        finally:
+            if emulator is not None:
+                emulator.close()
+        writer.write_summary(summary)
+    finally:
+        writer.close()
+    return summary
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
@@ -263,35 +338,13 @@ def _cmd_run(args: argparse.Namespace) -> int:
         )
 
     try:
-        writer = JournalWriter(
-            journal_path, settings=settings, artifacts_dir=artifacts_dir
-        )
-    except OSError as exc:
+        _play(settings, journal_path, artifacts_dir=artifacts_dir)
+    except _JournalOpenError as exc:
         print(f"cannot open journal {journal_path}: {exc}", file=sys.stderr)
         return 1
-
-    summary = None
-    try:
-        emulator = None
-        try:
-            emulator = _build_emulator(settings)
-            loop = ExecutionLoop(
-                settings,
-                emulator=emulator,
-                planner=_build_planner(settings),
-                client=_build_client(settings),
-                advisor=_build_advisor(settings),
-            )
-            summary = loop.run(observer=writer.observer())
-        finally:
-            if emulator is not None:
-                emulator.close()
-        writer.write_summary(summary)
     except (JevError, OSError) as exc:
         print(f"run failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
-    finally:
-        writer.close()
 
     try:
         journal = read_journal(journal_path)
@@ -357,6 +410,266 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         port=args.port,
         once=args.once,
     )
+
+
+# -- demo --------------------------------------------------------------------------
+
+#: Printed when this run returned after writing its own summary trailer. The run
+#: finished, whatever the background thread is doing at this instant, because the
+#: ``run_finished`` event is set only after ``_play`` returned. That return is the
+#: one fact that can establish the trailer as this run's own: a trailer read off
+#: disk while this run has not returned cannot be attributed to it. The sentence
+#: therefore states the run's own write and not what the disk holds, which this
+#: branch does not read.
+DEMO_FINISHED_LINE = (
+    "stopping the viewer; the run had already finished and wrote its summary "
+    "trailer"
+)
+#: Printed when the journal is readable and holds no trailer while the run thread
+#: is still going: the viewer was stopped by Ctrl-C and the daemon run died with
+#: the process. The journal genuinely keeps every tick written so far and nothing
+#: marked the end, so a reader really does report the run as in progress. Saying
+#: "finished" here would be a lie.
+DEMO_ABANDONED_LINE = (
+    "stopping the viewer; the run is abandoned, not finished: the journal on disk "
+    "keeps every tick written so far and has no summary trailer, so reading it "
+    "reports the run as in progress"
+)
+#: Printed when the journal is readable and holds no trailer and the run thread has
+#: ended: writing the trailer never happened, so the run did not finish (the error
+#: itself went to stderr when it happened). The journal is evidence up to the
+#: failure and the viewer reads it as in progress, which is what an unfinished run
+#: is -- never a finished one.
+DEMO_FAILED_LINE = (
+    "stopping the viewer; the run stopped before writing its summary trailer: the "
+    "journal on disk keeps every tick written so far and has no summary trailer, "
+    "so reading it reports the run as in progress"
+)
+#: Printed when this run did not return and a readable journal carries a summary
+#: trailer. The trailer may be this run's own -- ``write_summary`` succeeded and
+#: ``writer.close()`` then raised -- or an earlier run's left at the same path, and
+#: this process cannot tell the two apart. The sentence therefore asserts no
+#: provenance: it must stay true in both states.
+DEMO_TRAILER_NOT_OURS_LINE = (
+    "stopping the viewer; this run did not end successfully, and the journal on "
+    "disk carries a summary trailer this run may not have written"
+)
+#: Printed when the journal could not be read from here and the run thread has not
+#: been reaped. "Could not be read from here" is the only thing this process
+#: observed -- the file may be absent, be a directory, or have hidden the failure
+#: inside the reader itself -- so it is the only thing the sentence may say. Nor
+#: may it say whether the run finished: an unreadable journal is evidence neither
+#: way, and a thread that is still alive is not evidence of unfinished work,
+#: because the trailer it wrote may simply not have been reaped yet. Only this
+#: run's own return establishes completion, and that branch never reaches here.
+DEMO_ABANDONED_UNWRITTEN_LINE = (
+    "stopping the viewer; its journal could not be read from here, so there is "
+    "nothing to show, and whether the run finished is not known from here"
+)
+#: Printed when the journal could not be read from here and the run thread has
+#: ended. Same absence, and the same refusal to name a cause this process did not
+#: establish -- "stopped" is deliberate, since a dead thread cannot say whether the
+#: run finished, failed or was killed.
+DEMO_FAILED_UNWRITTEN_LINE = (
+    "stopping the viewer; the run stopped and its journal could not be read from "
+    "here, so there is nothing to show"
+)
+
+
+def _demo_exit_sentence(
+    journal_path: object, *, run_finished: bool, run_alive: bool
+) -> str:
+    """The one honest exit line, decided by this run's own return and the journal.
+
+    FINISHED is derived from this run's own return, never from a trailer found on
+    disk: ``run_finished`` is set only once ``_play`` returned, which happens only
+    after ``write_summary`` wrote this run's trailer. A trailer found while this
+    run has not finished cannot be attributed to it -- the path may still hold an
+    earlier run's trailer, or this run's trailer may have been written just before
+    its ``close()`` raised -- so the sentence reports the trailer's presence
+    without claiming its author.
+
+    The sentence is a claim about the evidence, so it may only be read off the
+    evidence. Reading can fail -- the file may be missing, be a directory, be
+    undecodable, or hold a line that is not JSON -- and that failure *is* the
+    answer, so the two ``*_UNWRITTEN`` sentences report only what this process
+    observed ("could not be read from here") and never what the file *is*. A read
+    failure is never propagated: turning a working exit into a crash over its own
+    status line would be strictly worse than the status line being vague,
+    especially since the exit is what the user sees last.
+
+    The cost of catching everything is stated rather than hidden: if
+    ``read_journal`` itself is broken, this reports that the journal could not be
+    read from here, which is true of what happened and silent about the file. The
+    failure mode is therefore a vague sentence -- never a false claim about ticks,
+    a trailer or completion, and never a traceback on the way out. Completion in
+    particular is asserted only from this run's own return, never from a trailer
+    on disk and never from the background thread's liveness, which the reaping
+    window makes unreliable exactly when a run finishes during the viewing window.
+
+    ``run_alive`` chooses only between the abandoned and failed wording once
+    ``run_finished`` is False. Whether a trailer exists is read from the file, but
+    a trailer with ``run_finished`` False selects the no-provenance sentence rather
+    than a completion claim.
+    """
+    if run_finished:
+        # This run returned after writing its own trailer, so the disk is no longer
+        # the authority for it.
+        return DEMO_FINISHED_LINE
+    try:
+        journal = read_journal(journal_path, allow_partial=True)
+    except Exception:  # noqa: BLE001 - any read failure *is* the unreadable state
+        # Missing, a directory, undecodable bytes, a torn line, or a bug inside
+        # the reader: all this process knows is that it could not read the file,
+        # which is exactly what the sentence says.
+        if run_alive:
+            return DEMO_ABANDONED_UNWRITTEN_LINE
+        return DEMO_FAILED_UNWRITTEN_LINE
+    if journal.summary is not None:
+        # A trailer is present, but this run did not return: it may be this run's
+        # (write_summary succeeded, close then raised) or an earlier run's at the
+        # same path, and this process cannot tell them apart.
+        return DEMO_TRAILER_NOT_OURS_LINE
+    if run_alive:
+        return DEMO_ABANDONED_LINE
+    return DEMO_FAILED_LINE
+
+
+def _start_run_in_background(run_callable: Callable[[], None]) -> threading.Thread:
+    """Run the play in a daemon thread and leave the main thread to the server.
+
+    This is a composition, not a concurrency change: the emulator is headless and
+    the Jev call already runs on the dispatcher's worker, so nothing in the loop
+    needs the main thread. The thread is a daemon because Ctrl-C stops the
+    *viewer* by ending the process; waiting for a run that can take minutes would
+    hold the terminal hostage, and the cost is stated on exit rather than hidden.
+    """
+    thread = threading.Thread(
+        target=run_callable, name="mario-jev-demo-run", daemon=True
+    )
+    thread.start()
+    return thread
+
+
+def _open_browser(url: str) -> bool:
+    """Open ``url`` with the platform browser; returns what ``webbrowser`` said."""
+    return webbrowser.open(url)
+
+
+def _cmd_demo(args: argparse.Namespace) -> int:
+    """Play world 1-1, write the evidence, and serve the page, in one command."""
+    try:
+        settings = _apply_overrides(Settings.load(), args)
+    except ValueError as exc:
+        print(f"configuration error: {exc}", file=sys.stderr)
+        return 2
+
+    journal_path = Path(args.journal)
+    artifacts_dir = Path(settings.artifacts_dir)
+
+    if not settings.jev_available:
+        print(
+            "warning: no JEV_API_KEY is configured; every decision will use the "
+            "local fallback (fallback_no_key) and no Jev request will be sent",
+            file=sys.stderr,
+        )
+
+    run_finished = threading.Event()
+
+    def play() -> None:
+        try:
+            _play(
+                settings,
+                journal_path,
+                artifacts_dir=artifacts_dir,
+                max_ticks=args.max_ticks,
+            )
+        except _JournalOpenError as exc:
+            print(f"cannot open journal {journal_path}: {exc}", file=sys.stderr)
+        except (JevError, OSError) as exc:
+            # A failed run does not end the viewer: the journal keeps the ticks
+            # up to the failure and the page renders them. The error is said out
+            # loud and the server keeps serving.
+            print(f"run failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        else:
+            # The event is the only fact that can establish the trailer on disk
+            # as this run's own: it is set only after ``_play`` returned, which is
+            # only after ``write_summary`` wrote this run's trailer.
+            run_finished.set()
+
+    thread = _start_run_in_background(play)
+
+    def on_ready(url: str) -> None:
+        if args.no_open:
+            return
+        try:
+            opened = _open_browser(url)
+        except Exception as exc:  # noqa: BLE001 - the browser is outside our control
+            # A browser that raises did not open. That is the browser seam
+            # failing, never the viewer: say the observed failure and leave the
+            # already-printed URL as the fallback.
+            print(
+                f"the browser did not open for {url}: {type(exc).__name__}: {exc}; "
+                "open that address yourself",
+                file=sys.stdout,
+            )
+            return
+        if not opened:
+            # The URL has already been printed by ``serve``. A claim that a window
+            # appeared would be about the user's machine and was not observed;
+            # this says only what was observed.
+            print(
+                f"the browser did not open for {url}; open that address yourself",
+                file=sys.stdout,
+            )
+
+    try:
+        code = serve_journal(
+            journal_path,
+            artifacts_dir=artifacts_dir,
+            bind=args.bind,
+            port=args.port,
+            on_ready=on_ready,
+        )
+    except KeyboardInterrupt:
+        # ``serve`` catches its own Ctrl-C; this covers one raised before the
+        # server was up. Either way the viewer was interrupted, not finished.
+        code = 0
+    except OSError as exc:
+        # The browser callback handles its own failures, so what reaches here is an
+        # ``OSError`` from serving itself. The message names the address and the
+        # error and asserts no cause it did not establish. The sentence below is
+        # the same journal-derived one as the normal path.
+        print(
+            f"the viewer failed on {args.bind}:{args.port}: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        print(
+            _demo_exit_sentence(
+                journal_path,
+                run_finished=run_finished.is_set(),
+                run_alive=thread.is_alive(),
+            ),
+            file=sys.stdout,
+        )
+        return 1
+
+    # This run's own return and what the journal holds now decide which sentence
+    # is true. The run can finish inside the viewing window (a few hundred paced
+    # ticks is on the order of a minute on this machine, and the cost is load- and
+    # mode-dependent, so no tighter figure is claimed), and calling that
+    # "abandoned, no trailer" would be a false claim about the evidence -- the one
+    # thing this project never makes.
+    print(
+        _demo_exit_sentence(
+            journal_path,
+            run_finished=run_finished.is_set(),
+            run_alive=thread.is_alive(),
+        ),
+        file=sys.stdout,
+    )
+    return code
 
 
 # -- doctor command ----------------------------------------------------------------
@@ -450,6 +763,56 @@ def _build_parser() -> argparse.ArgumentParser:
         help="answer one request and exit",
     )
     serve.set_defaults(handler=_cmd_serve)
+
+    demo = subparsers.add_parser(
+        "demo",
+        help="play world 1-1, write the run's evidence, and serve the page for it",
+    )
+    demo.add_argument(
+        "--stage", default="1-1", help="world-stage to play (default: 1-1)"
+    )
+    demo.add_argument(
+        "--max-ticks",
+        type=int,
+        default=300,
+        help="stop after N decision ticks (default: 300)",
+    )
+    demo.add_argument(
+        "--journal",
+        default="artifacts/demo.jsonl",
+        help="journal path to write (default: artifacts/demo.jsonl)",
+    )
+    demo.add_argument(
+        "--artifacts-dir",
+        default=None,
+        help="directory for per-tick PNG artifacts (default: the configured one)",
+    )
+    demo.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="emulator seed (default: the configured one)",
+    )
+    demo.add_argument(
+        "--port",
+        type=int,
+        default=DEFAULT_PORT,
+        help=f"TCP port to listen on (default: {DEFAULT_PORT}; 0 picks a free one)",
+    )
+    demo.add_argument(
+        "--bind",
+        default=DEFAULT_BIND,
+        help=(
+            f"address to listen on (default: {DEFAULT_BIND}, loopback only; "
+            "another address publishes this machine's run to the network)"
+        ),
+    )
+    demo.add_argument(
+        "--no-open",
+        action="store_true",
+        help="print the URL but do not open a browser window",
+    )
+    demo.set_defaults(handler=_cmd_demo)
 
     doctor = subparsers.add_parser("doctor", help="report environment readiness")
     doctor.set_defaults(handler=_cmd_doctor)

@@ -16,14 +16,17 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import socket
+import threading
 from pathlib import Path
+from typing import Callable
 
 import pytest
 
 from mario_jev import cli
 from mario_jev.dashboard import build_html, render_text
 from mario_jev.emulator import StepResult, build_actions
-from mario_jev.jev import HttpResult, JevClient
+from mario_jev.jev import HttpResult, JevClient, JevProtocolError
 from mario_jev.journal import Journal, read_journal
 from mario_jev.serve import DEFAULT_BIND, DEFAULT_PORT
 from mario_jev.state import TerminalOutcome
@@ -617,6 +620,55 @@ def test_run_survives_an_episode_that_ends_early(monkeypatch, capsys, tmp_path) 
     assert len(journal.ticks) == 2  # the loop stopped at the ended step
     assert journal.summary["ticks"] == 2
     assert f"ticks: {journal.summary['ticks']}" in out
+
+
+class _WriterThatFailsToClose:
+    """A ``JournalWriter`` whose ``close`` raises, to pin ``_play``'s ``finally``.
+
+    ``close`` sits in a ``finally`` now, so its ``OSError`` reaches ``_cmd_run``'s
+    handler instead of escaping ``main`` as a traceback.
+    """
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def observer(self) -> Callable[[object], None]:
+        return lambda record: None
+
+    def write_summary(self, summary: object) -> None:
+        pass
+
+    def close(self) -> None:
+        raise OSError("the handle could not be flushed and closed")
+
+
+def test_a_close_failure_after_a_run_is_a_diagnosis_not_a_traceback(
+    monkeypatch, capsys, tmp_path
+) -> None:
+    _demo_env(monkeypatch)
+    real_build = cli._build_emulator
+    monkeypatch.setattr(
+        cli, "_build_emulator", lambda settings: _EndingEmulator(real_build(settings), terminate_at=1)
+    )
+    monkeypatch.setattr(cli, "_build_planner", lambda settings: _FixedPlanner(_fixed_table()))
+    monkeypatch.setattr(cli, "JournalWriter", _WriterThatFailsToClose)
+
+    code = cli.main(
+        [
+            "run",
+            "--journal",
+            str(tmp_path / "close.jsonl"),
+            "--artifacts-dir",
+            str(tmp_path / "artifacts"),
+            "--fast",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert code == 1
+    assert "run failed: OSError:" in captured.err
+    # The failure never propagated out of the handler.
+    assert "Traceback" not in captured.err
 
 
 # 4. dashboard ---------------------------------------------------------------------
@@ -1305,3 +1357,911 @@ def test_serve_defaults_to_loopback_and_the_watch_port(monkeypatch, tmp_path) ->
     assert recorded["port"] == DEFAULT_PORT
     assert recorded["artifacts_dir"] is None
     assert recorded["once"] is False
+
+
+# -- demo, the one command ----------------------------------------------------------
+# ``demo`` composes the two things that already work: ``run`` writes the evidence
+# (the journal, and inside it the per-tick frame and trajectory artifacts the page
+# embeds) and ``serve`` reads it back per request. The tests here pin the
+# composition -- order, the flags reaching the run, the browser seam, and what is
+# said when the viewer is stopped -- without starting a real server or a real run.
+
+
+def _demo_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No credential and no ``MARIO_*`` override: the demo's own defaults govern."""
+    for name in (
+        "JEV_API_KEY",
+        "MARIO_STAGE",
+        "MARIO_MAX_TICKS",
+        "MARIO_SEED",
+        "MARIO_ARTIFACTS_DIR",
+        "MARIO_REAL_TIME",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+class _ImmediateThread:
+    """What the run starter returns when a test runs the play synchronously.
+
+    ``_cmd_demo`` reads ``is_alive()`` off the starter's return value. A real
+    background thread would report ``False`` once the synchronous call returned,
+    which is exactly the state these tests are in.
+    """
+
+    def is_alive(self) -> bool:
+        return False
+
+
+def _run_inline(run: Callable[[], None]) -> _ImmediateThread:
+    """A drop-in for ``_start_run_in_background`` that runs and reports "done".
+
+    Returning a stand-in rather than ``None`` matters: production always hands
+    back a live :class:`threading.Thread`, and the demo exit path reads it. A
+    ``None`` here would be a test-only shape the production code would have to
+    defend against.
+    """
+    run()
+    return _ImmediateThread()
+
+
+def test_demo_starts_the_run_then_serves_and_passes_every_flag_to_the_run(
+    monkeypatch, tmp_path
+) -> None:
+    order: list[tuple[str, object]] = []
+
+    def fake_play(settings, journal_path, *, artifacts_dir, max_ticks=None, observer=None):
+        order.append(
+            (
+                "play",
+                (settings.stage, settings.seed, max_ticks, Path(journal_path), Path(artifacts_dir)),
+            )
+        )
+        return None
+
+    def fake_serve(journal, **options):
+        order.append(("serve", str(journal)))
+        options["on_ready"]("http://127.0.0.1:8000/")
+        return 0
+
+    _demo_env(monkeypatch)
+    monkeypatch.setattr(cli, "_play", fake_play)
+    monkeypatch.setattr(cli, "serve_journal", fake_serve)
+    monkeypatch.setattr(cli, "_start_run_in_background", _run_inline)
+    monkeypatch.setattr(cli, "_open_browser", lambda url: True)
+
+    code = cli.main(
+        [
+            "demo",
+            "--journal",
+            str(tmp_path / "demo.jsonl"),
+            "--artifacts-dir",
+            str(tmp_path / "artifacts"),
+            "--stage",
+            "1-2",
+            "--seed",
+            "7",
+            "--max-ticks",
+            "5",
+        ]
+    )
+
+    assert code == 0
+    # The run is started before the URL is offered, and the flags reach the run:
+    # stage and seed through the settings overrides, max_ticks through the shared
+    # play call, and the journal where the viewer will read it.
+    assert [kind for kind, _ in order] == ["play", "serve"]
+    assert order[0][1] == ("1-2", 7, 5, tmp_path / "demo.jsonl", tmp_path / "artifacts")
+
+
+def test_demo_uses_the_documented_defaults(monkeypatch, tmp_path) -> None:
+    seen: dict[str, object] = {}
+
+    def fake_play(settings, journal_path, *, artifacts_dir, max_ticks=None, observer=None):
+        seen.update(
+            stage=settings.stage,
+            seed=settings.seed,
+            max_ticks=max_ticks,
+            journal=Path(journal_path),
+            artifacts_dir=Path(artifacts_dir),
+        )
+        return None
+
+    def fake_serve(journal, **options):
+        seen["port"] = options["port"]
+        seen["bind"] = options["bind"]
+        return 0
+
+    _demo_env(monkeypatch)
+    monkeypatch.setattr(cli, "_play", fake_play)
+    monkeypatch.setattr(cli, "serve_journal", fake_serve)
+    monkeypatch.setattr(cli, "_start_run_in_background", _run_inline)
+    monkeypatch.setattr(cli, "_open_browser", lambda url: True)
+
+    assert cli.main(["demo"]) == 0
+
+    assert seen["stage"] == "1-1"
+    assert seen["seed"] == 0
+    assert seen["max_ticks"] == 300
+    assert seen["journal"] == Path("artifacts/demo.jsonl")
+    assert seen["artifacts_dir"] == Path("artifacts")
+    assert seen["port"] == DEFAULT_PORT
+    assert seen["bind"] == DEFAULT_BIND
+
+
+def test_the_demo_parser_carries_the_documented_defaults() -> None:
+    parser = cli._build_parser()
+
+    args = parser.parse_args(["demo"])
+
+    assert args.stage == "1-1"
+    assert args.max_ticks == 300
+    assert args.journal == "artifacts/demo.jsonl"
+    assert args.artifacts_dir is None
+    assert args.seed is None
+    assert args.port == DEFAULT_PORT
+    assert args.bind == DEFAULT_BIND
+    assert args.no_open is False
+    assert args.handler is cli._cmd_demo
+
+
+def test_demo_help_names_the_defaults(capsys) -> None:
+    parser = cli._build_parser()
+
+    with pytest.raises(SystemExit) as exit_info:
+        parser.parse_args(["demo", "--help"])
+    out = capsys.readouterr().out
+
+    assert exit_info.value.code == 0
+    # Boundary-exact: "(default: 1300)" must not satisfy the check for 300, and
+    # neither must a longer stage or path pass for a shorter default.
+    assert "(default: 1-1)" in out
+    assert "(default: 300)" in out
+    assert "(default: artifacts/demo.jsonl)" in out
+    assert f"(default: {DEFAULT_PORT};" in out
+    assert f"(default: {DEFAULT_BIND}," in out
+
+
+def test_demo_opens_the_browser_once_with_the_url_serve_bound(
+    monkeypatch, tmp_path
+) -> None:
+    opened: list[str] = []
+
+    def fake_serve(journal, **options):
+        options["on_ready"]("http://127.0.0.1:54321/")
+        return 0
+
+    _demo_env(monkeypatch)
+    monkeypatch.setattr(cli, "_play", lambda *args, **kwargs: None)
+    monkeypatch.setattr(cli, "serve_journal", fake_serve)
+    monkeypatch.setattr(cli, "_start_run_in_background", _run_inline)
+    monkeypatch.setattr(cli, "_open_browser", lambda url: opened.append(url) or True)
+
+    code = cli.main(
+        [
+            "demo",
+            "--journal",
+            str(tmp_path / "demo.jsonl"),
+            "--artifacts-dir",
+            str(tmp_path / "artifacts"),
+        ]
+    )
+
+    assert code == 0
+    assert opened == ["http://127.0.0.1:54321/"]
+
+
+def test_demo_no_open_never_touches_the_browser(monkeypatch, tmp_path) -> None:
+    opened: list[str] = []
+
+    def fake_serve(journal, **options):
+        options["on_ready"]("http://127.0.0.1:54321/")
+        return 0
+
+    _demo_env(monkeypatch)
+    monkeypatch.setattr(cli, "_play", lambda *args, **kwargs: None)
+    monkeypatch.setattr(cli, "serve_journal", fake_serve)
+    monkeypatch.setattr(cli, "_start_run_in_background", _run_inline)
+    monkeypatch.setattr(cli, "_open_browser", lambda url: opened.append(url) or True)
+
+    code = cli.main(
+        [
+            "demo",
+            "--journal",
+            str(tmp_path / "demo.jsonl"),
+            "--artifacts-dir",
+            str(tmp_path / "artifacts"),
+            "--no-open",
+        ]
+    )
+
+    assert code == 0
+    assert opened == []
+
+
+def test_demo_prints_the_url_even_when_the_browser_does_not_open(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    from mario_jev import serve as serve_module
+
+    opened: list[str] = []
+    _demo_env(monkeypatch)
+    monkeypatch.setattr(serve_module, "run", lambda server, *, once=False: 0)
+    monkeypatch.setattr(cli, "_play", lambda *args, **kwargs: None)
+    monkeypatch.setattr(cli, "_start_run_in_background", _run_inline)
+    monkeypatch.setattr(cli, "_open_browser", lambda url: opened.append(url) or False)
+
+    code = cli.main(
+        [
+            "demo",
+            "--port",
+            "0",
+            "--journal",
+            str(tmp_path / "demo.jsonl"),
+            "--artifacts-dir",
+            str(tmp_path / "artifacts"),
+        ]
+    )
+    out = capsys.readouterr().out
+
+    assert code == 0
+    # The browser seam got exactly the URL the real server bound, and the page's
+    # own honest line came with it. No window appeared, and the demo says so
+    # rather than pretending one did.
+    assert len(opened) == 1
+    assert f"serving {tmp_path / 'demo.jsonl'} at {opened[0]}" in out
+    assert "the browser did not open for" in out
+    assert "not the game" in out
+
+
+def test_a_keyboard_interrupt_before_the_server_is_up_exits_zero(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    def fake_play(*args, **kwargs):
+        # A journal that really finished: the sentence is read from disk, not
+        # from what the play intended.
+        (tmp_path / "demo.jsonl").write_text(
+            '{"kind": "run"}\n{"kind": "summary", "ticks": 0}\n', encoding="utf-8"
+        )
+
+    def fake_serve(journal, **options):
+        raise KeyboardInterrupt
+
+    _demo_env(monkeypatch)
+    monkeypatch.setattr(cli, "_play", fake_play)
+    monkeypatch.setattr(cli, "serve_journal", fake_serve)
+    monkeypatch.setattr(cli, "_start_run_in_background", _run_inline)
+    monkeypatch.setattr(cli, "_open_browser", lambda url: True)
+
+    code = cli.main(
+        [
+            "demo",
+            "--journal",
+            str(tmp_path / "demo.jsonl"),
+            "--artifacts-dir",
+            str(tmp_path / "artifacts"),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    # A Ctrl-C that lands before ``serve`` owns the loop is still an exit code, not
+    # a traceback, and still ends with a sentence about the journal.
+    assert code == 0
+    assert "Traceback" not in captured.err
+    assert cli.DEMO_FINISHED_LINE in captured.out
+
+
+def test_a_ctrl_c_abandons_a_running_run_and_says_so(monkeypatch, tmp_path, capsys) -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    def fake_play(*args, **kwargs):
+        started.set()
+        release.wait(timeout=30)
+        return None
+
+    def fake_serve(journal, **options):
+        assert started.wait(timeout=30)
+        options["on_ready"]("http://127.0.0.1:9999/")
+        return 0
+
+    _demo_env(monkeypatch)
+    monkeypatch.setattr(cli, "_play", fake_play)
+    monkeypatch.setattr(cli, "serve_journal", fake_serve)
+    monkeypatch.setattr(cli, "_open_browser", lambda url: True)
+
+    try:
+        # The real background thread, so the run really is still in flight when the
+        # fake viewer returns: that is the state Ctrl-C leaves behind.
+        code = cli.main(
+            [
+                "demo",
+                "--journal",
+                str(tmp_path / "demo.jsonl"),
+                "--artifacts-dir",
+                str(tmp_path / "artifacts"),
+            ]
+        )
+        out = capsys.readouterr().out
+
+        assert code == 0
+        # Nothing is on disk here, so the sentence must not claim a trailer exists
+        # or that a reader sees the run still going: it reports only the absence.
+        assert cli.DEMO_ABANDONED_UNWRITTEN_LINE in out
+        assert "in progress" not in out
+        assert "no summary trailer" not in out
+    finally:
+        release.set()
+
+
+def test_a_failed_run_is_an_error_on_stderr_and_the_server_still_serves(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    served: list[str] = []
+
+    def fake_play(*args, **kwargs):
+        # The journal really got as far as the failure: a readable header and a
+        # tick, no trailer. The sentence below is read from that, not from the
+        # error.
+        (tmp_path / "demo.jsonl").write_text(
+            '{"kind": "run"}\n{"kind": "tick"}\n', encoding="utf-8"
+        )
+        raise JevProtocolError("the server answered 2xx with a body of the wrong shape")
+
+    def fake_serve(journal, **options):
+        served.append(str(journal))
+        return 0
+
+    _demo_env(monkeypatch)
+    monkeypatch.setattr(cli, "_play", fake_play)
+    monkeypatch.setattr(cli, "serve_journal", fake_serve)
+    monkeypatch.setattr(cli, "_start_run_in_background", _run_inline)
+    monkeypatch.setattr(cli, "_open_browser", lambda url: True)
+
+    code = cli.main(
+        [
+            "demo",
+            "--journal",
+            str(tmp_path / "demo.jsonl"),
+            "--artifacts-dir",
+            str(tmp_path / "artifacts"),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert "run failed" in captured.err
+    assert "JevProtocolError" in captured.err
+    # The error did not stop the viewer: it served, and the exit line is read from
+    # the journal it left behind -- readable, no trailer, so in progress.
+    assert served == [str(tmp_path / "demo.jsonl")]
+    assert cli.DEMO_FAILED_LINE in captured.out
+
+
+def test_the_demo_run_is_a_daemon_thread() -> None:
+    ran = threading.Event()
+
+    thread = cli._start_run_in_background(ran.set)
+
+    assert isinstance(thread, threading.Thread)
+    assert thread.daemon is True
+    assert thread.name == "mario-jev-demo-run"
+    thread.join(timeout=30)
+    assert not thread.is_alive()
+    assert ran.is_set()
+
+
+# -- the extraction did not change ``run`` ------------------------------------------
+
+
+def test_play_writes_the_journal_and_its_summary_trailer(monkeypatch, tmp_path) -> None:
+    _demo_env(monkeypatch)
+    real_build = cli._build_emulator
+    monkeypatch.setattr(
+        cli, "_build_emulator", lambda settings: _EndingEmulator(real_build(settings), terminate_at=2)
+    )
+    monkeypatch.setattr(cli, "_build_planner", lambda settings: _FixedPlanner(_fixed_table()))
+
+    summary = cli._play(
+        cli.Settings.load({}),
+        tmp_path / "play.jsonl",
+        artifacts_dir=tmp_path / "artifacts",
+        max_ticks=2,
+    )
+
+    journal = read_journal(tmp_path / "play.jsonl")
+    assert summary.ticks == 2
+    assert journal.summary is not None
+    assert journal.summary["ticks"] == 2
+    assert len(journal.ticks) == 2
+
+
+def test_run_and_play_write_the_same_journal(monkeypatch, capsys, tmp_path) -> None:
+    """``run`` is ``_play`` plus the report: the same seams must yield the same file.
+
+    The volatile fields are the wall-clock measurements (a start timestamp and the
+    per-tick latencies) that no two executions can share; everything else -- the
+    header, every tick record and the summary trailer -- has to match, byte for
+    byte, for the extraction to be behaviour-preserving.
+    """
+    _demo_env(monkeypatch)
+    real_build = cli._build_emulator
+    monkeypatch.setattr(
+        cli, "_build_emulator", lambda settings: _EndingEmulator(real_build(settings), terminate_at=2)
+    )
+    monkeypatch.setattr(cli, "_build_planner", lambda settings: _FixedPlanner(_fixed_table()))
+
+    artifacts = tmp_path / "artifacts"
+    run_journal = tmp_path / "run.jsonl"
+    assert (
+        cli.main(
+            [
+                "run",
+                "--journal",
+                str(run_journal),
+                "--artifacts-dir",
+                str(artifacts),
+                "--fast",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    settings = cli.Settings.load(
+        {"MARIO_ARTIFACTS_DIR": str(artifacts), "MARIO_REAL_TIME": "false"}
+    )
+    play_journal = tmp_path / "play.jsonl"
+    cli._play(settings, play_journal, artifacts_dir=artifacts, max_ticks=None)
+
+    volatile = {"started_at", "latencies_ms", "elapsed_s", "decision_rate_hz"}
+
+    def normalised(path: Path) -> list[str]:
+        records = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            record = json.loads(line)
+            for key in volatile:
+                record.pop(key, None)
+            records.append(json.dumps(record, sort_keys=True))
+        return records
+
+    assert normalised(play_journal) == normalised(run_journal)
+
+
+#: The markers that would let a test in these files quietly stop checking
+#: anything. Each is assembled from two pieces so this scanner's own source cannot
+#: match itself; the plain decorator check also catches its conditional form.
+_DEMO_SKIP_MARKERS = tuple(
+    left + right
+    for left, right in (
+        ("pytest", ".mark.skip"),
+        ("pytest", ".skip("),
+        ("import", "orskip"),
+        ("xf", "ail"),
+    )
+)
+
+
+def _skip_markers_in(source: str) -> list[str]:
+    """Every banned marker the text contains."""
+    return [marker for marker in _DEMO_SKIP_MARKERS if marker in source]
+
+
+def test_the_skip_scanner_catches_every_way_a_test_can_quietly_stop_checking() -> None:
+    """The scanner is only worth its assertion if it catches each marker, so the
+    markers are proven against samples assembled the same self-avoiding way.
+    """
+    samples = [
+        "@pytest" + '.mark.skip(reason="no time")',
+        "@pytest" + '.mark.skipif(True, reason="no time")',
+        "pytest" + '.skip("no time")',
+        "pytest.import" + "orskip('missing')",
+        "@pytest.mark.xf" + "ail",
+    ]
+    for sample in samples:
+        assert _skip_markers_in(sample), sample
+
+
+def test_the_demo_tests_never_skip() -> None:
+    """A skipped test is a claim nobody checked; the only sanctioned skip lives in
+    ``tests/test_jev_client.py`` and is the credential-gated live call, not here.
+    """
+    for name in ("test_cli.py", "test_serve.py"):
+        source = (Path(__file__).parent / name).read_text(encoding="utf-8")
+        for marker in _DEMO_SKIP_MARKERS:
+            assert marker not in source, (name, marker)
+
+
+# -- the derived exit sentence and the failure paths around it ---------------------
+
+
+def _finished_journal(path: Path) -> Path:
+    path.write_text('{"kind": "run"}\n{"kind": "summary", "ticks": 0}\n', encoding="utf-8")
+    return path
+
+
+def _header_only_journal(path: Path) -> Path:
+    path.write_text('{"kind": "run"}\n{"kind": "tick"}\n', encoding="utf-8")
+    return path
+
+
+def test_the_exit_sentence_is_finished_only_when_this_run_returned(tmp_path) -> None:
+    path = _finished_journal(tmp_path / "run.jsonl")
+
+    # ``run_finished`` is the only fact that establishes the trailer as this run's
+    # own; the thread's liveness must not be able to change the answer, and a
+    # trailer on disk while this run returned is still this run's completion.
+    assert (
+        cli._demo_exit_sentence(path, run_finished=True, run_alive=True)
+        == cli.DEMO_FINISHED_LINE
+    )
+    assert (
+        cli._demo_exit_sentence(path, run_finished=True, run_alive=False)
+        == cli.DEMO_FINISHED_LINE
+    )
+
+
+def test_the_exit_sentence_never_claims_a_trailer_this_run_did_not_establish(
+    tmp_path,
+) -> None:
+    path = _finished_journal(tmp_path / "run.jsonl")
+
+    # This run did not return, so the trailer may be this run's own (write_summary
+    # succeeded, close then raised) or an earlier run's at the same path. The
+    # sentence must name the trailer without claiming whose it is, for either
+    # thread state.
+    assert (
+        cli._demo_exit_sentence(path, run_finished=False, run_alive=True)
+        == cli.DEMO_TRAILER_NOT_OURS_LINE
+    )
+    assert (
+        cli._demo_exit_sentence(path, run_finished=False, run_alive=False)
+        == cli.DEMO_TRAILER_NOT_OURS_LINE
+    )
+    assert cli.DEMO_TRAILER_NOT_OURS_LINE != cli.DEMO_FINISHED_LINE
+    assert "may not have written" in cli.DEMO_TRAILER_NOT_OURS_LINE
+    assert "finished" not in cli.DEMO_TRAILER_NOT_OURS_LINE
+
+
+def test_the_exit_sentence_names_in_progress_for_a_readable_trailerless_journal(
+    tmp_path,
+) -> None:
+    path = _header_only_journal(tmp_path / "run.jsonl")
+
+    assert (
+        cli._demo_exit_sentence(path, run_finished=False, run_alive=True)
+        == cli.DEMO_ABANDONED_LINE
+    )
+    assert (
+        cli._demo_exit_sentence(path, run_finished=False, run_alive=False)
+        == cli.DEMO_FAILED_LINE
+    )
+    assert "in progress" in cli.DEMO_ABANDONED_LINE
+    assert "in progress" in cli.DEMO_FAILED_LINE
+
+
+def test_the_exit_sentence_claims_nothing_about_ticks_or_a_trailer_when_it_cannot_read(
+    tmp_path,
+) -> None:
+    missing = tmp_path / "never-written.jsonl"
+
+    assert (
+        cli._demo_exit_sentence(missing, run_finished=False, run_alive=True)
+        == cli.DEMO_ABANDONED_UNWRITTEN_LINE
+    )
+    assert (
+        cli._demo_exit_sentence(missing, run_finished=False, run_alive=False)
+        == cli.DEMO_FAILED_UNWRITTEN_LINE
+    )
+    for line in (cli.DEMO_ABANDONED_UNWRITTEN_LINE, cli.DEMO_FAILED_UNWRITTEN_LINE):
+        assert "in progress" not in line
+        assert "trailer" not in line
+        assert "tick" not in line
+
+
+def test_the_exit_sentence_treats_an_unreadable_journal_as_unwritten(tmp_path) -> None:
+    torn = tmp_path / "torn.jsonl"
+    torn.write_text('{"kind": "run"}\n{"kind": "nonsense"}\n', encoding="utf-8")
+
+    assert (
+        cli._demo_exit_sentence(torn, run_finished=False, run_alive=True)
+        == cli.DEMO_ABANDONED_UNWRITTEN_LINE
+    )
+    assert (
+        cli._demo_exit_sentence(torn, run_finished=False, run_alive=False)
+        == cli.DEMO_FAILED_UNWRITTEN_LINE
+    )
+
+
+def test_the_exit_sentence_never_propagates_a_read_failure(tmp_path) -> None:
+    directory = tmp_path / "not-a-file"
+    directory.mkdir()
+
+    # Reading a directory raises OSError; the sentence must swallow it rather than
+    # turn a working exit into a crash.
+    assert (
+        cli._demo_exit_sentence(directory, run_finished=False, run_alive=False)
+        == cli.DEMO_FAILED_UNWRITTEN_LINE
+    )
+
+
+def test_only_the_readable_trailerless_sentences_mention_in_progress() -> None:
+    assert "in progress" not in cli.DEMO_FINISHED_LINE
+    assert "in progress" not in cli.DEMO_TRAILER_NOT_OURS_LINE
+    assert "in progress" not in cli.DEMO_ABANDONED_UNWRITTEN_LINE
+    assert "in progress" not in cli.DEMO_FAILED_UNWRITTEN_LINE
+
+
+def test_a_trailer_written_before_a_close_failure_claims_no_provenance(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """``write_summary`` succeeds and ``close`` then raises: the trailer on disk is
+    this run's own, but ``run_finished`` is False, so the sentence must not claim
+    completion -- it names the trailer without claiming whose it is, which is true
+    whether the trailer came from this run or an earlier one at the same path.
+    """
+
+    def fake_play(*args, **kwargs):
+        _finished_journal(tmp_path / "demo.jsonl")
+        raise OSError("close failed after the trailer was written")
+
+    def fake_serve(journal, **options):
+        return 0
+
+    _demo_env(monkeypatch)
+    monkeypatch.setattr(cli, "_play", fake_play)
+    monkeypatch.setattr(cli, "serve_journal", fake_serve)
+    monkeypatch.setattr(cli, "_start_run_in_background", _run_inline)
+    monkeypatch.setattr(cli, "_open_browser", lambda url: True)
+
+    code = cli.main(
+        [
+            "demo",
+            "--journal",
+            str(tmp_path / "demo.jsonl"),
+            "--artifacts-dir",
+            str(tmp_path / "artifacts"),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert "run failed" in captured.err
+    assert cli.DEMO_TRAILER_NOT_OURS_LINE in captured.out
+    assert cli.DEMO_FINISHED_LINE not in captured.out
+    assert cli.DEMO_FAILED_LINE not in captured.out
+    # The sentence names the trailer and refuses to own it.
+    assert "may not have written" in captured.out
+    assert "no summary trailer" not in captured.out
+
+
+def test_a_stale_trailer_is_not_reported_as_this_runs_completion(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """A previous completed journal sits at the path and the file is not writable.
+
+    ``JournalWriter`` opens with ``"w"`` and the open itself fails before the old
+    file is truncated, so this invocation never played a tick -- yet the previous
+    run's trailer is still readable. The exit line must name the trailer without
+    attributing it to this run and must never say the run finished.
+    """
+    journal = tmp_path / "demo.jsonl"
+    journal.write_text(
+        '{"kind": "run"}\n{"kind": "tick"}\n{"kind": "summary", "ticks": 1}\n',
+        encoding="utf-8",
+    )
+    journal.chmod(0o444)
+    served: list[str] = []
+
+    def fake_serve(journal_arg, **options):
+        served.append(str(journal_arg))
+        return 0
+
+    _demo_env(monkeypatch)
+    monkeypatch.setattr(cli, "serve_journal", fake_serve)
+    monkeypatch.setattr(cli, "_start_run_in_background", _run_inline)
+    monkeypatch.setattr(cli, "_open_browser", lambda url: True)
+
+    try:
+        # The real ``_cmd_demo`` and the real ``_play``: the failure under test is
+        # the unwritable journal path, not a stubbed one.
+        code = cli.main(
+            [
+                "demo",
+                "--journal",
+                str(journal),
+                "--artifacts-dir",
+                str(tmp_path / "artifacts"),
+            ]
+        )
+    finally:
+        journal.chmod(0o644)
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert "cannot open journal" in captured.err
+    assert "Permission denied" in captured.err
+    assert served == [str(journal)]
+    assert cli.DEMO_TRAILER_NOT_OURS_LINE in captured.out
+    assert cli.DEMO_FINISHED_LINE not in captured.out
+
+
+def test_demo_reports_a_journal_it_cannot_open_and_reads_the_state_from_disk(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    directory = tmp_path / "not-a-file"
+    directory.mkdir()
+    served: list[str] = []
+
+    def fake_serve(journal, **options):
+        served.append(str(journal))
+        return 0
+
+    _demo_env(monkeypatch)
+    monkeypatch.setattr(cli, "serve_journal", fake_serve)
+    monkeypatch.setattr(cli, "_start_run_in_background", _run_inline)
+    monkeypatch.setattr(cli, "_open_browser", lambda url: True)
+
+    code = cli.main(
+        [
+            "demo",
+            "--journal",
+            str(directory),
+            "--artifacts-dir",
+            str(tmp_path / "artifacts"),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert "cannot open journal" in captured.err
+    assert served == [str(directory)]
+    # A directory is not a readable journal, so the sentence claims nothing about
+    # ticks or a trailer and never says "in progress".
+    assert cli.DEMO_FAILED_UNWRITTEN_LINE in captured.out
+    assert "in progress" not in captured.out
+
+
+def test_a_stopped_viewer_reads_the_unfinished_journal_the_run_left_behind(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    def fake_play(*args, **kwargs):
+        _header_only_journal(tmp_path / "demo.jsonl")
+        started.set()
+        release.wait(timeout=30)
+
+    def fake_serve(journal, **options):
+        assert started.wait(timeout=30)
+        return 0
+
+    _demo_env(monkeypatch)
+    monkeypatch.setattr(cli, "_play", fake_play)
+    monkeypatch.setattr(cli, "serve_journal", fake_serve)
+    monkeypatch.setattr(cli, "_open_browser", lambda url: True)
+
+    try:
+        code = cli.main(
+            [
+                "demo",
+                "--journal",
+                str(tmp_path / "demo.jsonl"),
+                "--artifacts-dir",
+                str(tmp_path / "artifacts"),
+            ]
+        )
+        out = capsys.readouterr().out
+
+        assert code == 0
+        assert cli.DEMO_ABANDONED_LINE in out
+        assert "in progress" in out
+    finally:
+        release.set()
+
+
+def test_demo_reports_a_viewer_that_cannot_bind_and_still_prints_the_sentence(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    holder = socket.socket()
+    holder.bind(("127.0.0.1", 0))
+    holder.listen(1)
+    port = holder.getsockname()[1]
+
+    def fake_play(*args, **kwargs):
+        # The run did not return: ``run_finished`` stays False and no journal is on
+        # disk, so the sentence has only the absence to report. A play that
+        # returned would have written a trailer and made FINISHED the honest line.
+        raise JevProtocolError("the run never got to write a trailer")
+
+    _demo_env(monkeypatch)
+    monkeypatch.setattr(cli, "_play", fake_play)
+    monkeypatch.setattr(cli, "_start_run_in_background", _run_inline)
+    monkeypatch.setattr(cli, "_open_browser", lambda url: True)
+
+    try:
+        code = cli.main(
+            [
+                "demo",
+                "--journal",
+                str(tmp_path / "demo.jsonl"),
+                "--artifacts-dir",
+                str(tmp_path / "artifacts"),
+                "--bind",
+                "127.0.0.1",
+                "--port",
+                str(port),
+                "--no-open",
+            ]
+        )
+    finally:
+        holder.close()
+    captured = capsys.readouterr()
+
+    assert code == 1
+    assert "the viewer failed" in captured.err
+    # No journal was written, so the derived sentence says exactly that -- on the
+    # failure path too.
+    assert cli.DEMO_FAILED_UNWRITTEN_LINE in captured.out
+
+
+def test_demo_reports_a_raising_browser_as_a_browser_failure_not_a_serve_failure(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    def fake_serve(journal, **options):
+        options["on_ready"]("http://127.0.0.1:54321/")
+        return 0
+
+    def broken_browser(url):
+        raise OSError("no browser on this box")
+
+    _demo_env(monkeypatch)
+    monkeypatch.setattr(cli, "_play", lambda *args, **kwargs: None)
+    monkeypatch.setattr(cli, "serve_journal", fake_serve)
+    monkeypatch.setattr(cli, "_start_run_in_background", _run_inline)
+    monkeypatch.setattr(cli, "_open_browser", broken_browser)
+
+    code = cli.main(
+        [
+            "demo",
+            "--journal",
+            str(tmp_path / "demo.jsonl"),
+            "--artifacts-dir",
+            str(tmp_path / "artifacts"),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert "the browser did not open for http://127.0.0.1:54321/" in captured.out
+    assert "OSError" in captured.out
+    assert "the viewer failed" not in captured.err
+    assert "cannot serve" not in captured.err
+
+
+def test_play_with_an_explicit_observer_leaves_the_journals_own_writer_out(
+    monkeypatch, tmp_path
+) -> None:
+    _demo_env(monkeypatch)
+    real_build = cli._build_emulator
+    monkeypatch.setattr(
+        cli, "_build_emulator", lambda settings: _EndingEmulator(real_build(settings), terminate_at=2)
+    )
+    monkeypatch.setattr(cli, "_build_planner", lambda settings: _FixedPlanner(_fixed_table()))
+
+    seen: list[object] = []
+    summary = cli._play(
+        cli.Settings.load({}),
+        tmp_path / "observed.jsonl",
+        artifacts_dir=tmp_path / "artifacts",
+        max_ticks=2,
+        observer=seen.append,
+    )
+
+    journal = read_journal(tmp_path / "observed.jsonl")
+    assert len(seen) == 2
+    assert summary.ticks == 2
+    # The injected observer replaced the journal's own per-tick writer, so the
+    # trailer is there but no tick line was written by ``_play``.
+    assert journal.ticks == ()
+    assert journal.summary["ticks"] == 2
