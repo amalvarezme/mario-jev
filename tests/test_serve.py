@@ -18,16 +18,19 @@ from __future__ import annotations
 
 import json
 import socket
-from io import StringIO
+from io import BytesIO, StringIO
 from pathlib import Path
+from typing import Callable
 
 import pytest
+from PIL import Image
 
 from mario_jev import serve as serve_module
 from mario_jev.dashboard import build_live_html
 from mario_jev.journal import Journal, JournalFormatError
 from mario_jev.serve import (
     DEFAULT_BIND,
+    LIVE_FRAME_PATH,
     LIVE_PATH,
     ThreadedViewer,
     Viewer,
@@ -156,6 +159,19 @@ def _live_viewer(path: Path, artifacts_dir: object | None = None) -> Viewer:
         retry_delay_s=0.0,
         live=build_live_html,
     )
+
+
+def _png_bytes() -> bytes:
+    """A real, tiny PNG, so the route's content type is checked against bytes
+    Pillow would actually accept rather than a magic prefix."""
+    buffer = BytesIO()
+    Image.new("RGB", (2, 2), (10, 20, 30)).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def _frame_viewer(path: Path, source: Callable[[], bytes | None]) -> Viewer:
+    """A report viewer that also serves a live frame from ``source``."""
+    return Viewer(journal_path=path, retry_delay_s=0.0, frame_source=source)
 
 
 def _read_all(client: socket.socket) -> bytes:
@@ -843,4 +859,187 @@ def test_a_raising_on_ready_on_the_threaded_path_closes_the_socket(
     # A raising callback is the caller's failure, not a licence to leak the port:
     # the socket is released before the exception leaves ``start``.
     assert servers[0].closed is True  # type: ignore[attr-defined]
+
+
+# -- the live frame route: the game inside the page -------------------------------
+# ``/live/frame.png`` is a second route under the board's own prefix, and the only
+# route that answers an image the run did not write to disk. It is checked before
+# the artifact route so no artifact name can shadow it, and it is *not* gated on the
+# board being configured: the switch is the frame source, and a viewer built without
+# one says so rather than answering an image it does not have.
+
+
+def test_the_frame_route_answers_the_png_and_forbids_caching(tmp_path: Path) -> None:
+    journal = _live_journal(tmp_path / "live.jsonl")
+    payload = _png_bytes()
+
+    status, body, headers = _request(
+        _frame_viewer(journal, lambda: payload), _get(LIVE_FRAME_PATH)
+    )
+
+    assert status == "HTTP/1.0 200 OK"
+    assert headers["content-type"] == "image/png"
+    # The page polls this URL, so a cached answer would freeze the game while the
+    # browser happily reported a hit.
+    assert headers["cache-control"] == "no-store"
+    assert headers["content-length"] == str(len(body))
+    assert body == payload
+
+
+def test_the_frame_route_asks_the_source_for_every_request(tmp_path: Path) -> None:
+    journal = _live_journal(tmp_path / "live.jsonl")
+    frames = [_png_bytes(), _png_bytes()]
+    calls: list[int] = []
+
+    def source() -> bytes | None:
+        calls.append(1)
+        return frames[len(calls) - 1]
+
+    viewer = _frame_viewer(journal, source)
+    first = _request(viewer, _get(LIVE_FRAME_PATH))
+    second = _request(viewer, _get(LIVE_FRAME_PATH))
+
+    # The handler holds no frame of its own: the sink is the one place a frame
+    # lives, so every request asks it. Caching here would need a second copy and
+    # would be a second answer to "which frame is newest".
+    assert len(calls) == 2
+    assert first[1] == frames[0]
+    assert second[1] == frames[1]
+
+
+def test_the_frame_route_says_which_no_it_is_when_there_is_no_frame(
+    tmp_path: Path,
+) -> None:
+    journal = _live_journal(tmp_path / "live.jsonl")
+
+    status, body, headers = _request(
+        _frame_viewer(journal, lambda: None), _get(LIVE_FRAME_PATH)
+    )
+
+    assert status == "HTTP/1.0 404 Not Found"
+    assert headers["content-type"] == "text/plain; charset=utf-8"
+    # A 404 either way, and the sentence says which of the two 404s it is: a run
+    # that has not published a frame yet is a different situation from a viewer
+    # built without a frame source at all, and only one of them fixes itself.
+    assert body == b"not found: no frame has been published yet\n"
+
+
+def test_the_frame_route_says_so_when_no_source_is_configured(tmp_path: Path) -> None:
+    journal = _live_journal(tmp_path / "live.jsonl")
+
+    status, body, _ = _request(_viewer(journal), _get(LIVE_FRAME_PATH))
+
+    assert status == "HTTP/1.0 404 Not Found"
+    assert body == b"not found: this viewer has no live frame source\n"
+
+
+def test_a_raising_frame_source_is_a_500_and_not_a_raised_handler(
+    tmp_path: Path,
+) -> None:
+    journal = _live_journal(tmp_path / "live.jsonl")
+
+    def explode() -> bytes | None:
+        raise RuntimeError("the encoder fell over")
+
+    viewer = _frame_viewer(journal, explode)
+
+    status, body, _ = _request(viewer, _get(LIVE_FRAME_PATH))
+
+    assert status == "HTTP/1.0 500 Internal Server Error"
+    # The failure is named, with the source's own words: a bare 500 leaves a person
+    # with a frozen game and no idea that the fault is on the serving side.
+    assert b"the encoder fell over" in body
+    assert b"RuntimeError" in body
+    assert b"<!DOCTYPE html>" not in body
+
+    # And the handler survived it: the next request is answered normally.
+    payload = _png_bytes()
+    alive_status, alive_body, _ = _request(
+        _frame_viewer(journal, lambda: payload), _get(LIVE_FRAME_PATH)
+    )
+    assert alive_status == "HTTP/1.0 200 OK"
+    assert alive_body == payload
+
+
+def test_the_frame_route_is_checked_before_the_artifact_route(tmp_path: Path) -> None:
+    artifacts = tmp_path / "artifacts"
+    (artifacts / "live").mkdir(parents=True)
+    (artifacts / "live" / "frame.png").write_bytes(b"an artifact that must not win")
+    journal = _live_journal(tmp_path / "live.jsonl", artifacts_dir=artifacts)
+
+    status, body, _ = _request(_viewer(journal, artifacts), _get(LIVE_FRAME_PATH))
+
+    # The reserved path is the route's, always: a file that happens to sit at the
+    # same relative path cannot shadow it and be mistaken for the live game.
+    assert status == "HTTP/1.0 404 Not Found"
+    assert body == b"not found: this viewer has no live frame source\n"
+
+
+def test_a_frame_source_does_not_change_the_report_or_the_board(tmp_path: Path) -> None:
+    journal = _live_journal(tmp_path / "live.jsonl", ticks=1)
+    payload = _png_bytes()
+
+    assert _request(_viewer(journal), _get("/")) == _request(
+        _frame_viewer(journal, lambda: payload), _get("/")
+    )
+    assert _request(_live_viewer(journal), _get(LIVE_PATH)) == _request(
+        Viewer(
+            journal_path=journal,
+            retry_delay_s=0.0,
+            live=build_live_html,
+            frame_source=lambda: payload,
+        ),
+        _get(LIVE_PATH),
+    )
+    # And with no source at all the board is the same 404 it has always been, which
+    # is what keeps every caller that predates this route byte-identical.
+    assert _request(_viewer(journal), _get(LIVE_PATH))[0] == "HTTP/1.0 404 Not Found"
+    assert _request(_viewer(journal), _get(LIVE_PATH))[1] == b"not found\n"
+
+
+def test_serve_passes_the_frame_source_through_to_the_route(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    journal = _live_journal(tmp_path / "live.jsonl")
+    payload = _png_bytes()
+    served: dict[str, object] = {}
+
+    def fake_run(server: ViewerServer, *, once: bool = False) -> int:
+        served["status"], served["body"] = _request_on_open_server(
+            server, LIVE_FRAME_PATH
+        )
+        return 0
+
+    monkeypatch.setattr(serve_module, "run", fake_run)
+
+    code = serve(
+        journal, port=0, once=True, out=StringIO(), frame_source=lambda: payload
+    )
+
+    assert code == 0
+    assert served["status"] == "HTTP/1.0 200 OK"
+    assert served["body"] == payload
+
+
+def test_the_threaded_viewer_passes_the_frame_source_through(tmp_path: Path) -> None:
+    journal = _live_journal(tmp_path / "live.jsonl")
+    payload = _png_bytes()
+    viewer = ThreadedViewer(
+        journal, port=0, out=StringIO(), retry_delay_s=0.0, frame_source=lambda: payload
+    )
+
+    viewer.start()
+    host, port = viewer.address
+    try:
+        client = socket.create_connection((host, port))
+        try:
+            client.sendall(_get(LIVE_FRAME_PATH))
+            response = _read_all(client)
+        finally:
+            client.close()
+        head, _, body = response.partition(b"\r\n\r\n")
+        assert head.startswith(b"HTTP/1.0 200 OK")
+        assert body == payload
+    finally:
+        viewer.stop()
 

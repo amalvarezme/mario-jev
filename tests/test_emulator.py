@@ -377,6 +377,88 @@ def test_the_default_render_mode_draws_nothing(
     assert inner.render_calls == 0
 
 
+# -- the per-frame callback: what a live page is fed from ------------------------
+# ``on_frame`` is how the game reaches the board page. It follows the same rule as
+# the window -- the real timeline only -- but not the same switch: the page can be
+# live with no window open at all, which is why the two are separate options on one
+# presentation method.
+
+
+def test_the_callback_fires_for_the_reset_and_every_real_timeline_step(
+    fake_nes: type[_FakeNes], emulator_factory
+) -> None:
+    frames: list[np.ndarray] = []
+    emulator = emulator_factory(render_mode="human", on_frame=frames.append)
+    inner = fake_nes.built[-1]
+
+    emulator.reset(seed=0)
+    assert len(frames) == 1
+
+    emulator.step(1)
+    emulator.step(0)
+
+    assert len(frames) == 3
+    # One method presents the frame, and it presents it to both: with a window and
+    # a callback asked for, neither is skipped.
+    assert inner.render_calls == 3
+
+
+def test_the_callback_receives_the_frame_the_step_result_carries(
+    fake_nes: type[_FakeNes], emulator_factory
+) -> None:
+    frames: list[np.ndarray] = []
+    emulator = emulator_factory(on_frame=frames.append)
+
+    first = emulator.reset(seed=0)
+    second = emulator.step(1)
+
+    # Handed over, not copied for the callback: the sink decides whether it needs a
+    # private buffer (``LiveFrame`` does). A callback that mutated this array would
+    # therefore mutate the result the caller is about to receive, and that is the
+    # one consequence of the hand-off worth knowing.
+    assert np.shares_memory(frames[0], first.frame)
+    assert np.shares_memory(frames[1], second.frame)
+    assert np.array_equal(frames[0], first.frame)
+    assert np.array_equal(frames[1], second.frame)
+    assert frames[1].shape == SCREEN_SHAPE
+    assert frames[1].dtype.name == "uint8"
+    assert frames[1].flags["C_CONTIGUOUS"]
+
+
+def test_a_suspended_step_publishes_no_frame_and_the_next_real_step_does(
+    fake_nes: type[_FakeNes], emulator_factory
+) -> None:
+    frames: list[np.ndarray] = []
+    emulator = emulator_factory(on_frame=frames.append)
+    emulator.reset(seed=0)
+
+    with emulator.pacer.suspended():
+        emulator.step(1)
+
+    # A suspended step is a simulated future: publishing it would let the page show
+    # the sweep, which is the same lie the window would tell.
+    assert len(frames) == 1
+
+    emulator.step(1)
+
+    assert len(frames) == 2
+
+
+def test_the_callback_fires_with_no_render_mode_and_no_window(
+    fake_nes: type[_FakeNes], emulator_factory
+) -> None:
+    frames: list[np.ndarray] = []
+    emulator = emulator_factory(on_frame=frames.append)
+    inner = fake_nes.built[-1]
+
+    emulator.reset(seed=0)
+    emulator.step(1)
+
+    assert inner.render_mode is None
+    assert inner.render_calls == 0
+    assert len(frames) == 2
+
+
 # -- pacing ----------------------------------------------------------------------
 
 #: 64 fps, not 60. ``1/64`` is exact in binary floating point and so is every

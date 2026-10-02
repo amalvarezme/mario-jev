@@ -20,7 +20,7 @@ from __future__ import annotations
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Iterator, Mapping
+from typing import Any, Callable, Iterator, Mapping
 
 import numpy as np
 
@@ -291,6 +291,7 @@ class MarioEmulator:
         real_time: bool = True,
         target_fps: float = 60.0,
         render_mode: str | None = None,
+        on_frame: Callable[[np.ndarray], None] | None = None,
     ) -> None:
         # Imported lazily so the rest of the package stays importable (and
         # testable) without the native emulator.
@@ -304,6 +305,10 @@ class MarioEmulator:
         # Kept, not just forwarded: the render rule below reads it on every step
         # to decide whether a window exists to draw into.
         self._render_mode = render_mode
+        # Kept for the same reason, and separately from the mode: a live page does
+        # not need a window, so this is a second way to present the same frame
+        # rather than a second render mode.
+        self._on_frame = on_frame
         self._nes = SuperMarioBrosEnv(target=self._target, render_mode=render_mode)
         self._last_info: Mapping[str, Any] = {}
         self._tick = -1
@@ -320,9 +325,13 @@ class MarioEmulator:
         self._pacer.reset()
         self._tick = 0
         self._last_info = dict(info)
-        self._render_live_frame()
+        # One copy for the result and for whoever presents it: ``ascontiguousarray``
+        # is what turns nes-py's non-contiguous live screen view into a frame that
+        # survives the next step, and the presentation is handed that very copy.
+        frame = np.ascontiguousarray(screen)
+        self._present_frame(frame)
         return StepResult(
-            frame=np.ascontiguousarray(screen),
+            frame=frame,
             info=self._last_info,
             reward=0.0,
             terminated=False,
@@ -337,14 +346,15 @@ class MarioEmulator:
         screen, reward, terminated, truncated, info = self._nes.step(bits)
         self._tick += 1
         self._last_info = dict(info)
-        # Draw before the pacing wait, not after: the frame just computed is the
-        # one put on screen, and the wait then keeps it there for the period.
-        # Rendering after the wait would present a frame that already lags the
-        # one being computed.
-        self._render_live_frame()
+        frame = np.ascontiguousarray(screen)
+        # Present before the pacing wait, not after: the frame just computed is the
+        # one the window draws and the sink publishes, and the wait then keeps it
+        # there for the period. Presenting after the wait would show a frame that
+        # already lags the one being computed.
+        self._present_frame(frame)
         self._pacer.wait()
         return StepResult(
-            frame=np.ascontiguousarray(screen),
+            frame=frame,
             info=self._last_info,
             reward=float(reward),
             terminated=bool(terminated),
@@ -352,25 +362,42 @@ class MarioEmulator:
             tick=self._tick,
         )
 
-    def _render_live_frame(self) -> None:
-        """Draw the current frame, on the real timeline only.
+    def _present_frame(self, frame: np.ndarray) -> None:
+        """Present one frame -- the window, the sink, or both -- on the real timeline only.
 
-        ``render_mode="human"`` is the one mode nes-py opens a window for, so it
-        is the only mode this wrapper drives. The suspension check is what keeps
-        the window honest: the planner rolls candidate actions forward on this
-        same emulator inside ``with emulator.pacer.suspended()``
-        (``trajectory/planner.py:562``), so drawing every step would show
-        hundreds of simulated futures per decision tick instead of the game. A
-        suspended step is a simulated future and not the real timeline -- the
-        pacer's own meaning -- so the loop needs no render call of its own, and
-        the display concern stays out of ``policy/loop.py``.
+        This is the one place that decides what the run presents, so the window
+        and the live page cannot disagree about which frames are the game's. The
+        two switches are independent on purpose: ``render_mode="human"`` is the
+        one mode nes-py opens a window for, and ``on_frame`` is whatever a caller
+        wants done with every real-timeline frame. A run with no window can still
+        feed a page, and a run with a window that nobody configured a sink for
+        draws exactly as it did before this callback existed.
 
-        With the default ``render_mode=None`` this draws nothing at all. Any
-        other mode is left to the caller: this wrapper does not invent a render
-        policy nes-py did not ask it to have.
+        The suspension check is what keeps both honest: the planner rolls
+        candidate actions forward on this same emulator inside ``with
+        emulator.pacer.suspended()`` (``trajectory/planner.py:562``), so presenting
+        every step would show hundreds of simulated futures per decision tick
+        instead of the game. A suspended step is a simulated future and not the
+        real timeline -- the pacer's own meaning -- so the loop needs no display
+        call of its own and no render policy lives in ``policy/loop.py``.
+
+        ``frame`` is handed over, not copied for the callback: it is the exact
+        array the ``StepResult`` this call accompanies carries, which is what the
+        callback's contract says. A callback that mutates it therefore mutates
+        that result, so a sink that keeps frames must copy for itself --
+        :class:`~mario_jev.live_frame.LiveFrame` does, for reasons that have
+        nothing to do with politeness.
+
+        With the default ``render_mode=None`` and no callback this does nothing at
+        all. Any other mode is left to the caller: this wrapper does not invent a
+        render policy nes-py did not ask it to have.
         """
-        if self._render_mode == "human" and not self._pacer.is_suspended:
+        if self._pacer.is_suspended:
+            return
+        if self._render_mode == "human":
             self._nes.render()
+        if self._on_frame is not None:
+            self._on_frame(frame)
 
     def close(self) -> None:
         if not self._closed:

@@ -20,6 +20,15 @@ owns it. :class:`ThreadedViewer` is that: the same bind, URL, startup lines and
 stop event and closes its socket on the way out. ``serve`` itself keeps blocking
 the calling thread by design, and its tests are the contract for that path.
 
+A third route, ``/live/frame.png``, answers the newest frame the run published,
+when the viewer was built with a frame source. It is checked before the artifact
+route, so a file that happens to sit at the same relative path cannot shadow the
+live game; the source is optional and ``None`` by default, which is what keeps
+every viewer built before this route existed answering exactly as it did. The
+route never lets the source's failure reach the handler: a source that raises is
+answered ``500`` with the failure named, because the alternative -- an exception
+out of a request handler -- is a dropped connection with nothing on it.
+
 A journal mid-write has a short window in which it is not readable, because a
 line can be half-written when the reader reaches it. The viewer does not paper
 over that: it retries the read once after a short documented delay and, if the
@@ -29,7 +38,7 @@ It never renders a half-read journal as if it were complete and it never skips a
 line it could not parse -- showing part of a run as the whole run is the one
 thing a viewer built for evidence must not do.
 
-Request paths other than ``/`` and, when configured, ``/live`` are resolved
+Request paths other than ``/``, ``/live`` and ``/live/frame.png`` are resolved
 against the run's artifacts directory and served only from inside it; anything
 that is not inside it is answered ``404``, including a path the filesystem
 refuses to look at -- a null
@@ -57,6 +66,7 @@ from mario_jev.journal import Journal, JournalFormatError, read_journal
 __all__ = [
     "DEFAULT_BIND",
     "DEFAULT_PORT",
+    "LIVE_FRAME_PATH",
     "LIVE_PATH",
     "RETRY_DELAY_S",
     "THREADED_JOIN_TIMEOUT_S",
@@ -81,6 +91,11 @@ RETRY_DELAY_S = 0.05
 #: artifact. It is a fixed module-level path, not a per-viewer one, because the
 #: `live` command links to it and the route has to name the same thing everywhere.
 LIVE_PATH = "/live"
+#: The path that serves the newest frame the run published, for the board page's
+#: game image. It sits *under* the board's own prefix on purpose: one page, one
+#: prefix, and a path the router checks before the artifact route so no artifact
+#: name can shadow the live game.
+LIVE_FRAME_PATH = "/live/frame.png"
 #: The one path that serves the report rather than an artifact.
 REPORT_PATH = "/"
 #: How long the threaded entry point's accept loop waits for a connection before
@@ -143,9 +158,13 @@ class Viewer:
     ``read`` and ``report`` are the two seams: the real ones are the journal
     reader and :func:`~mario_jev.dashboard.build_html`, and a test may replace
     either to exercise the handler without a journal on disk. ``live`` is the
-    third, and the only optional one: the decision board's builder, or ``None``
-    when this viewer does not answer ``/live`` -- a viewer without it treats that
-    path exactly like every other path with no artifact behind it.
+    third, and the only one that changes a route: the decision board's builder,
+    or ``None`` when this viewer does not answer ``/live`` -- a viewer without it
+    treats that path exactly like every other path with no artifact behind it.
+    ``frame_source`` is the fourth and is a different kind of option again: not a
+    page builder but the thing ``/live/frame.png`` asks for the newest frame. It
+    defaults to ``None``, and a viewer without one answers that route with a 404
+    saying so.
     """
 
     journal_path: Path
@@ -154,6 +173,7 @@ class Viewer:
     report: Callable[..., str] = build_html
     retry_delay_s: float = RETRY_DELAY_S
     live: Callable[..., str] | None = None
+    frame_source: Callable[[], bytes | None] | None = None
 
 
 class ViewerHandler(BaseHTTPRequestHandler):
@@ -196,8 +216,78 @@ class ViewerHandler(BaseHTTPRequestHandler):
             self._report(with_body=with_body)
         elif target == LIVE_PATH and self.viewer.live is not None:
             self._live_page(with_body=with_body)
+        elif target == LIVE_FRAME_PATH:
+            # Before the artifact route, deliberately: ``live/frame.png`` is also a
+            # path the artifact resolver would happily look up inside the run's
+            # directory, and a file that happened to sit there must not be able to
+            # shadow the live game -- nor the game to shadow an artifact, because
+            # this is the one reserved name under the page's own prefix.
+            self._live_frame(with_body=with_body)
         else:
             self._artifact(target, with_body=with_body)
+
+    # -- the newest frame: the game inside the page --
+
+    def _live_frame(self, *, with_body: bool) -> None:
+        """Answer the newest published frame, or say which 404 this is.
+
+        The source is asked on every request rather than cached here: the sink
+        behind it is the one place a frame lives, and it is the one that knows
+        how to answer without encoding the same frame twice. A second cache in
+        the handler would be a second answer to "which frame is newest".
+
+        ``no-store`` because the page polls this URL: a cached answer would keep
+        showing the same frame while the browser reported a hit, and the game on
+        the page would freeze with nothing failing.
+
+        The two 404s are different sentences because they are different facts.
+        "No source configured" is a viewer that will never serve a frame, and "no
+        frame published yet" is a run that has not started stepping. Only the
+        second one fixes itself by reloading, and a person reading the page is
+        owed the difference.
+        """
+        source = self.viewer.frame_source
+        if source is None:
+            self._send(
+                404,
+                "text/plain; charset=utf-8",
+                b"not found: this viewer has no live frame source\n",
+                with_body=with_body,
+            )
+            return
+        try:
+            data = source()
+        except Exception as exc:
+            # A request must never make this handler raise: an exception here is a
+            # dropped connection with no status line and a traceback on the server,
+            # which tells the person at the page nothing. The source's own words are
+            # included for the same reason the torn-journal 503 includes the
+            # reader's: a bare 500 leaves them with a frozen game and no cause.
+            self._send(
+                500,
+                "text/plain; charset=utf-8",
+                (
+                    "the live frame could not be produced; the frame source "
+                    f"failed: {type(exc).__name__}: {exc}\n"
+                ).encode("utf-8"),
+                with_body=with_body,
+            )
+            return
+        if data is None:
+            self._send(
+                404,
+                "text/plain; charset=utf-8",
+                b"not found: no frame has been published yet\n",
+                with_body=with_body,
+            )
+            return
+        self._send(
+            200,
+            "image/png",
+            data,
+            with_body=with_body,
+            cache_control="no-store",
+        )
 
     # -- the report and the live page --
 
@@ -339,12 +429,20 @@ class ViewerHandler(BaseHTTPRequestHandler):
         *,
         with_body: bool = True,
         allow: str | None = None,
+        cache_control: str | None = None,
     ) -> None:
+        """One response, with the extra headers the caller asked for.
+
+        ``allow`` and ``cache_control`` are ``None`` by default, and ``None`` adds
+        nothing: every answer that predates them is byte-identical to what it was.
+        """
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         if allow is not None:
             self.send_header("Allow", allow)
+        if cache_control is not None:
+            self.send_header("Cache-Control", cache_control)
         self.end_headers()
         if with_body:
             self.wfile.write(body)
@@ -372,19 +470,23 @@ def _viewer_for(
     artifacts_dir: object | None,
     retry_delay_s: float,
     live: bool,
+    frame_source: Callable[[], bytes | None] | None = None,
 ) -> Viewer:
     """The one viewer both entry points build, so they cannot disagree.
 
     ``live`` decides whether ``Viewer.live`` is the decision board's builder or
     ``None``. ``None`` is the default everywhere it is not asked for, which is
     what keeps ``/live`` a plain 404 on every viewer built before this route
-    existed.
+    existed. ``frame_source`` is passed through untouched and defaults to
+    ``None`` for the same reason: a viewer nobody gave a source to must answer
+    ``/live/frame.png`` with its own 404, not with an invented frame.
     """
     return Viewer(
         journal_path=journal_path,
         artifacts_dir=_artifacts_root(journal_path, artifacts_dir),
         retry_delay_s=retry_delay_s,
         live=build_live_html if live else None,
+        frame_source=frame_source,
     )
 
 
@@ -397,6 +499,7 @@ def _bind_server(
     retry_delay_s: float,
     live: bool,
     url_path: str,
+    frame_source: Callable[[], bytes | None] | None = None,
 ) -> tuple[ViewerServer, str]:
     """Bind the socket, compute the URL the OS actually chose, and return both.
 
@@ -411,6 +514,7 @@ def _bind_server(
         artifacts_dir=artifacts_dir,
         retry_delay_s=retry_delay_s,
         live=live,
+        frame_source=frame_source,
     )
     server = ViewerServer((bind, port), viewer)
     host, actual_port = server.server_address[0], server.server_address[1]
@@ -456,6 +560,7 @@ def serve(
     out: TextIO | None = None,
     on_ready: Callable[[str], None] | None = None,
     live: bool = False,
+    frame_source: Callable[[], bytes | None] | None = None,
 ) -> int:
     """Start the viewer for ``journal_path`` and serve until interrupted.
 
@@ -469,6 +574,11 @@ def serve(
     caller: with it off, no live builder is configured and ``/live`` is the same
     404 as any unknown path. With it on, this viewer is the decision board -- the
     route the ``live`` command serves from its background thread.
+
+    ``frame_source`` is the newest frame for ``/live/frame.png``, and is ``None``
+    by default for the same reason: no source means that route answers its own
+    404 instead of an image, so a caller that never passed one sees the same
+    responses as before the route existed.
     """
     stream = sys.stdout if out is None else out
     path = Path(journal_path)
@@ -480,6 +590,7 @@ def serve(
         retry_delay_s=retry_delay_s,
         live=live,
         url_path=LIVE_PATH if live else REPORT_PATH,
+        frame_source=frame_source,
     )
     try:
         # Both prints and the callback sit inside the ``try``: a callback that
@@ -532,6 +643,7 @@ class ThreadedViewer:
         out: TextIO | None = None,
         on_ready: Callable[[str], None] | None = None,
         live: bool = True,
+        frame_source: Callable[[], bytes | None] | None = None,
     ) -> None:
         self._path = Path(journal_path)
         self._stream = sys.stdout if out is None else out
@@ -548,6 +660,7 @@ class ThreadedViewer:
             retry_delay_s=retry_delay_s,
             live=live,
             url_path=url_path,
+            frame_source=frame_source,
         )
 
     @property

@@ -2,7 +2,8 @@
 
 Status: authorized by the user, who chose the native 60 fps game window plus a live scores page over
 an all-browser page and over a panel drawn inside the game window. All four tasks are implemented,
-committed and verified: G1 `b98a274`, G2 `8e3913d`, G3 `b50a152`, G4 `7049063`.
+committed and verified: G1 `b98a274`, G2 `8e3913d`, G3 `b50a152`, G4 `7049063`. The follow-up at the end
+of this document (G5, G6) is authorized by the user too.
 
 ## Why
 
@@ -171,3 +172,74 @@ The limit this run makes plain: **the command ends when the episode does.** The 
 board stops being served, and watching another run means starting another one. That is the honest
 shape of a command whose whole subject is one run's game, and it is why the exit line distinguishes a
 finished run from an abandoned one instead of pretending the viewer outlives the game.
+
+## Follow-up — the game moves into the board page (G5, G6)
+
+The user asked for the real-time view of the controlled game to sit **on the right**, beside the scores
+and buttons, on the same screen. A native window cannot be placed inside a web page and cannot be kept
+above one -- the window order belongs to the operating system, and a click on the browser sends it
+behind -- so the options put to the user were: move the native window over the page, or bring the game
+into the page. The user chose **the game inside the page, panel on the left**, over moving the native
+window and over doing both.
+
+### 1. A one-slot frame sink
+
+`src/mario_jev/live_frame.py` (new) holds :class:`LiveFrame`: the newest frame the run produced, in one
+slot, safe to write from the run's thread and read from the viewer's. ``publish(frame)`` stores a copy
+and bumps a sequence number; ``png()`` returns the newest frame as PNG bytes, encoding **at most once
+per published frame** and never on the publishing thread -- the run must not pay for an encoding nobody
+asked for, and a burst of requests for the same frame must not encode it twice. The slot and the
+cached bytes are guarded; the encoding itself happens outside the lock.
+
+### 2. The emulator publishes every real-timeline frame
+
+`MarioEmulator` gains ``on_frame: Callable[[np.ndarray], None] | None = None``, called from ``reset()``
+and from ``step()`` with the same fresh contiguous frame the ``StepResult`` carries, under the same gate
+the window follows: only on the real timeline, never during a sweep. One method presents the frame -- the
+window when the mode is ``human``, the sink when a callback is given, both or neither -- and the publish
+happens before the pacing wait, as the window's draw does. The callback is independent of
+``render_mode``: the page can be live with the window closed.
+
+### 3. The frame is served at `/live/frame.png`
+
+A second route under the page's own prefix, checked before the artifact route, so no artifact name can
+shadow it and it can shadow no artifact. It asks the frame source and answers ``200``
+``image/png`` with ``Cache-Control: no-store`` -- the page polls this URL, so a cached answer would
+freeze the game -- or ``404`` with a sentence when there is no frame yet or no frame source at all.
+``Viewer`` and ``ThreadedViewer`` take the source as an optional callable, ``None`` by default, which is
+what keeps every current caller byte-identical.
+
+### 4. The page becomes two columns, and the game lives in the right one
+
+The board is one flex row: the **panel on the left** (right now, buttons, Jev scores, rollout,
+decision) and **the game on the right**, an ``<img>`` pointing at ``/live/frame.png``. It wraps to one
+column on a narrow window instead of squeezing both.
+
+The game is polled every ~70 ms and the panel is re-fetched every second; both are small inline
+JavaScript, which is a change from G2's "no JavaScript" and is stated rather than slipped in. Two
+details make the polling honest: the preloaded frame is swapped only once it has decoded (two stacked
+images toggling, one request per frame, no flicker), and a failed request leaves the last frame on
+screen instead of blanking it. The ``<meta http-equiv="refresh">`` stays in the markup as the fallback
+for a browser without JavaScript -- where it reloads the whole page, and the frame with it, at that
+slower rate -- and the script removes it on load, because a reload every second would restart the
+polling and blank the game.
+
+### 5. `--no-window`
+
+The native window stops being compulsory: ``mario_jev live --no-window`` plays headless and lets the
+page carry the game. The default stays the window, which is still the only 60 fps view.
+
+### Non-goals of the follow-up
+
+* No streaming, no websockets, no server-sent events: the page polls two plain URLs.
+* No change to the report at `/`, to the journal, or to what a run records. The live frame is not
+  written to disk and is not evidence; the recorded per-tick PNGs keep their perception overlay and
+  stay the only frames the journal holds.
+* No 60 fps claim for the page: it refreshes at the poll rate, and says so in its own words.
+
+## Tasks (follow-up)
+
+| # | Task | Surfaces | Evidence |
+|---|---|---|---|
+| G5 | The frame sink, the emulator's per-frame callback, and the route that serves it | `src/mario_jev/live_frame.py` (new), `src/mario_jev/emulator/env.py`, `src/mario_jev/serve.py`, `tests/test_live_frame.py` (new), `tests/test_emulator.py`, `tests/test_serve.py` | a published frame comes back as a PNG that decodes to the same pixels; the callback fires on the reset and on every real-timeline step and never inside `pacer.suspended()`; the route answers `200 image/png` with `no-store` when a frame exists, `404` before one does and when no source is configured; repeated requests for one frame encode it once |
+| G6 | The two-column page with the polling game, `--no-window`, and the docs | `src/mario_jev/dashboard/live.py`, `tests/test_live_view.py`, `src/mario_jev/cli.py`, `tests/test_cli.py`, `README.md`, `docs/EVALUATION.md` | the page carries the panel and the game as one row, the game points at `/live/frame.png`, the script removes the meta refresh and polls, the fallback markup and the no-JavaScript sentence are present, `--no-window` builds a headless emulator while the page stays live, and a real browser check shows the frame changing while the panel keeps its place |
