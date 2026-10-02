@@ -1,21 +1,37 @@
-"""The live page: one snapshot of what the agent is doing right now, and why.
+"""The live page: the game on the right, and one snapshot of the decisions beside it.
 
-``mario_jev live`` puts the game in a window and this page beside it. The window
-is the 60 fps view; this page is the one thing the window cannot show -- the
-decision the agent just made and the scores behind it. It is a **snapshot**, not
-a stream: every request reads the journal as it is at that moment, builds the
-page, and sends it. There is no JavaScript, no WebSocket and no polling loop, for
-the same reason the static report has none -- the evidence is the journal, and a
-page that keeps state of its own would be a second source of truth.
+``mario_jev live`` plays the run and this page shows it. The game sits **inside**
+the page now, beside the scores: the newest frame the run published is polled into
+an image on the right, and the decision panel -- the buttons, the Jev scores, the
+rollout candidates and the decision -- sits on the left in the same flex row. The
+native game window is still there and is still the only 60 fps view; the page is
+deliberately not, and says so where the game is.
 
-The page refreshes itself with ``<meta http-equiv="refresh" content="0.5">``.
-Half a second is chosen, not measured: a full second lets a fast run finish
-several decision ticks between refreshes, and a tenth of a second spends the
-viewer rebuilding a page whose newest tick has not changed. Half a second keeps
-the newest tick roughly current for a person sitting next to the game window. It
-is deliberately not 60 fps and says so on the page: the tick rate is the rate the
-agent decides, and the frame the page shows is the one frame the journal recorded
-for that decision.
+JavaScript, and the change of mind
+----------------------------------
+
+G2 built this page with no JavaScript, on the plain reason that a page holding no
+state of its own cannot become a second source of truth beside the journal. The
+game inside the page needs some, and this module states what it is for rather than
+slipping it in:
+
+* the markup still carries ``<meta http-equiv="refresh">``, for a browser that
+  never runs the script;
+* on load the script **removes** that meta: a whole-page reload every second would
+  restart the frame polling and blank the game for the length of a page load;
+* it polls the frame URL with a cache-busting counter every ``FRAME_POLL_MS``,
+  loading into a hidden second ``<img>`` and swapping only once the new frame has
+  decoded, so one frame costs one request and the visible image never flickers and
+  never shows a half-loaded frame;
+* a failed request leaves the last decoded frame on screen instead of blanking it;
+* it re-fetches the page every ``PANEL_REFRESH_MS`` and replaces only the panel
+  subtree, so a panel refresh never touches the game image.
+
+The script holds no state the journal does not: it moves pixels into an image and
+copies rendered HTML into the panel, and the panel it copies is the same page this
+module built. The fallback is the meta refresh, and a ``<noscript>`` sentence says
+so: a browser without the script reloads the whole page, frame included, at that
+slower rate.
 
 What the page answers
 ---------------------
@@ -24,8 +40,8 @@ What the page answers
   is the trailer-derived rule the full report already uses: no summary trailer is
   ``in progress``, and a trailer is its recorded ``termination`` verbatim. It is
   never re-derived and never invented;
-* the newest tick's frame, referenced through that tick's own ``frame_png`` path
-  so the viewer's artifact route serves it;
+* the live game: the newest frame the run published, polled into an image on the
+  right, at twice the NES size and pixelated so the doubled pixels stay square;
 * the buttons the applied action presses, read out of the action set by name --
   never by splitting the recorded name in the template;
 * the Jev scores: every question the tick fired, its choice probabilities with
@@ -42,12 +58,10 @@ Reuse and deliberate differences from the static report
 The escaping, the mapping coercion and the wording for "not recorded", "no call"
 and "in progress" come from :mod:`mario_jev.dashboard.build`; this module does not
 grow a second way to say the same thing. What it deliberately does *not* reuse is
-the report's way of *transporting* a frame: :func:`build_html` embeds the PNG
-bytes as a ``data:`` URI because that report is a self-contained file. This page
-instead references the recorded name as a URL, because it is refreshed over and
-over and because the serve route already knows how to serve one artifact by name.
-The frame is the newest tick's own ``frame_png``; the name is never reconstructed
-from the frame index.
+the report's recorded frames: the per-tick PNGs, perception overlay and all, stay
+where they belong, in the report at ``/``. This page shows the live frame the run
+is publishing now -- the game, not a picture of a past tick -- and a polled image
+of a recorded frame would only be a slow second copy of the report.
 
 The action set
 --------------
@@ -58,23 +72,13 @@ The emulator always builds the default set today: ``_build_emulator`` passes no
 another set, either the set's name has to be recorded in the header or the set has
 to be passed in here -- the name recorded in ``decision.action`` is not enough to
 choose the set it came from, and this page will not guess.
-
-Write order
------------
-
-:class:`~mario_jev.journal.JournalWriter` writes the frame artifact **before** it
-flushes the tick line that names it. A tick the reader can see therefore always
-has its recorded frame already on disk, so no refresh can transiently reference a
-file that is not there yet; no machinery is added for a window that the writer's
-own ordering closes.
 """
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Mapping, Sequence
 
-from mario_jev.emulator import Action, build_actions
+from mario_jev.emulator import SCREEN_SHAPE, Action, build_actions
 from mario_jev.journal import Journal
 
 from .build import (
@@ -88,7 +92,6 @@ from .build import (
     _escape,
     _frame_index,
     _mapping,
-    _resolve_artifacts_dir,
     _risk_text,
     _rows,
     _source_text,
@@ -96,20 +99,75 @@ from .build import (
     _tick_number,
 )
 
-__all__ = ["REFRESH_SECONDS", "build_live_html"]
+__all__ = [
+    "FRAME_POLL_MS",
+    "FRAME_SCALE",
+    "LIVE_FRAME_URL",
+    "PANEL_REFRESH_MS",
+    "REFRESH_SECONDS",
+    "build_live_html",
+]
 
-#: How often the page reloads itself, in seconds. See the module docstring for why
-#: it is half a second and not a frame.
-REFRESH_SECONDS = 0.5
+#: The path the game image points at: the newest frame the run published. It is
+#: written here rather than imported from :mod:`mario_jev.serve` because ``serve``
+#: imports this module, so the import back would be a cycle; a test pins the two
+#: values equal instead. It must stay equal to ``serve.LIVE_FRAME_PATH``, which is
+#: the route that answers it.
+LIVE_FRAME_URL = "/live/frame.png"
+
+#: The NES frame as the emulator defines it, and how many screen pixels each NES
+#: pixel gets. The page shows the game at twice its native size so it can be read
+#: without resizing a 256-pixel-wide image, and ``image-rendering: pixelated``
+#: keeps the doubled pixels square instead of smearing them.
+FRAME_HEIGHT, FRAME_WIDTH = SCREEN_SHAPE[0], SCREEN_SHAPE[1]
+FRAME_SCALE = 2
+
+#: How often the script asks for a new frame, in milliseconds. About 70 ms is
+#: roughly 14 Hz: fast enough to look continuous beside the scores, and slow
+#: enough that a slow viewer thread answers one request before the next is due.
+FRAME_POLL_MS = 70
+
+#: How often the script re-fetches the page and replaces the panel, in
+#: milliseconds. About once a second: the panel is the decision tick rate, and a
+#: faster refresh would spend the viewer rebuilding a page whose tick has not
+#: changed.
+PANEL_REFRESH_MS = 1000
+
+#: How often the page reloads itself without JavaScript, in seconds. It is the
+#: markup's ``<meta http-equiv="refresh">`` and the no-script fallback: the whole
+#: page, the game image included, reloads at this slower rate. The script removes
+#: the meta on load so that fallback cannot blank the polled game.
+REFRESH_SECONDS = 1.0
 
 #: The live page's own title.
 DEFAULT_TITLE = "mario-jev live"
 
-#: The report's stylesheet, plus the few rules only this page needs. Reusing the
-#: report's style keeps the two pages looking like the same artifact; the added
-#: rules are the frame, the joypad pad and the answer line.
+#: The one honest line under the game heading: the rates, and the refusal to claim
+#: 60 fps for a page that polls.
+_GAME_NOTE = (
+    f"the game frame is polled about every {FRAME_POLL_MS} ms and the panel is "
+    "re-fetched about once a second, so this page is not 60 fps; the native game "
+    "window remains the 60 fps view."
+)
+
+#: What a browser without JavaScript gets, and says exactly: the whole page --
+#: this frame included -- reloads at the meta-refresh rate instead of polling.
+_NOSCRIPT_NOTE = (
+    "JavaScript is off: the whole page, this frame included, reloads about every "
+    f"{REFRESH_SECONDS:g} s at the meta-refresh rate instead."
+)
+
+#: The report's stylesheet, plus the rules this page needs. Reusing the report's
+#: style keeps the two pages looking like the same artifact; the added rules are
+#: the two-column board, the stacked game frames and the joypad pad.
 _LIVE_STYLE = _REPORT_STYLE + "\n" + """
-.frame { image-rendering: pixelated; border: 1px solid #ddd; max-width: 100%; }
+.board { display: flex; flex-wrap: wrap; gap: 24px; align-items: flex-start; }
+.panel { flex: 1 1 320px; min-width: 280px; }
+.game { flex: 1 1 520px; }
+.frames { display: grid; max-width: 100%; }
+.game-frame { grid-area: 1 / 1; image-rendering: pixelated; border: 1px solid #ddd;
+              max-width: 100%; height: auto; }
+.game-frame.hidden { visibility: hidden; }
 .pad { display: flex; gap: 8px; margin: 6px 0; }
 .pad-button { border: 1px solid #bbb; border-radius: 4px; padding: 4px 10px;
               background: #f4f4f4; font-size: 13px; }
@@ -118,6 +176,87 @@ _LIVE_STYLE = _REPORT_STYLE + "\n" + """
 tr.applied th { background: #e6f0ff; }
 h4 { margin: 12px 0 2px; }
 """.strip()
+
+#: The whole of the page's JavaScript, inline. It is written with ``%``
+#: placeholders because the script is mostly braces, and it prints the same rates
+#: the constants above name. See the module docstring for what each half is for and
+#: why the meta removal is not optional.
+_LIVE_SCRIPT = """<script>
+(function () {
+  "use strict";
+  var FRAME_POLL_MS = %(frame_poll_ms)d;
+  var PANEL_REFRESH_MS = %(panel_refresh_ms)d;
+  var FRAME_URL = "%(frame_url)s";
+
+  // A whole-page reload every second would restart this polling loop and blank
+  // the game for the length of a load. The markup keeps the meta for a browser
+  // that never runs this script; this removes it for one that does.
+  var meta = document.querySelector('meta[http-equiv="refresh"]');
+  if (meta !== null && meta.parentNode !== null) {
+    meta.parentNode.removeChild(meta);
+  }
+
+  var front = document.getElementById("live-frame-a");
+  var back = document.getElementById("live-frame-b");
+  var sequence = 0;
+
+  function nextFrame() {
+    // One request in flight at a time: the next poll is scheduled only after
+    // this one has decoded or failed, so a slow response cannot race the swap.
+    var incoming = back;
+    incoming.onload = function () {
+      incoming.onload = null;
+      incoming.onerror = null;
+      // Swap only once the new frame has decoded, so the visible image never
+      // shows a half-loaded frame and never blinks.
+      incoming.className = "game-frame";
+      front.className = "game-frame hidden";
+      var previous = front;
+      front = incoming;
+      back = previous;
+      window.setTimeout(nextFrame, FRAME_POLL_MS);
+    };
+    incoming.onerror = function () {
+      incoming.onload = null;
+      incoming.onerror = null;
+      // Leave the last decoded frame on screen: the incoming image was hidden
+      // all along, and a failed request must not blank what is being watched.
+      incoming.removeAttribute("src");
+      window.setTimeout(nextFrame, FRAME_POLL_MS);
+    };
+    // The counter defeats any cache between the browser and the viewer; the
+    // route answers no-store, and this also covers an intermediary's copy.
+    incoming.src = FRAME_URL + "?n=" + (sequence++);
+  }
+
+  function refreshPanel() {
+    // Replace only the panel subtree; the game image is never touched, so a
+    // panel refresh cannot disturb the frame being polled.
+    fetch(window.location.href, { cache: "no-store" })
+      .then(function (response) { return response.text(); })
+      .then(function (text) {
+        var parsed = new DOMParser().parseFromString(text, "text/html");
+        var fresh = parsed.getElementById("panel");
+        var current = document.getElementById("panel");
+        if (fresh !== null && current !== null) {
+          current.innerHTML = fresh.innerHTML;
+        }
+        window.setTimeout(refreshPanel, PANEL_REFRESH_MS);
+      })
+      .catch(function () {
+        // A failed panel fetch leaves the panel it has; the next try is soon.
+        window.setTimeout(refreshPanel, PANEL_REFRESH_MS);
+      });
+  }
+
+  nextFrame();
+  window.setTimeout(refreshPanel, PANEL_REFRESH_MS);
+})();
+</script>""" % {
+    "frame_poll_ms": FRAME_POLL_MS,
+    "panel_refresh_ms": PANEL_REFRESH_MS,
+    "frame_url": LIVE_FRAME_URL,
+}
 
 
 # -- small helpers over the recorded tick -------------------------------------------
@@ -267,31 +406,29 @@ def _now_section(journal: Journal, tick: Mapping[str, object] | None) -> str:
     return f'<table class="facts"><tbody>{_rows(pairs)}</tbody></table>'
 
 
-def _frame_section(base: Path | None, tick: Mapping[str, object] | None) -> str:
-    """The newest tick's frame, referenced by its own recorded path.
+def _game_section() -> str:
+    """The live game: the frame the run publishes now, polled into an image.
 
-    The reference is the viewer-independent URL ``/<frame_png>``: the serve route
-    resolves exactly that shape against the artifacts directory and answers the
-    PNG. A tick with no recorded frame, or one whose file is not on disk, is the
-    words ``not recorded`` -- the report's own rule that a missing picture is
-    text, never a placeholder that could be mistaken for a frame.
+    Two ``<img>`` elements share one grid cell and the script swaps between them:
+    the newest frame loads into the hidden one and becomes visible only once it
+    has decoded, so the picture never blinks and one frame is one request. The
+    first image carries the frame URL in the markup, which gives a browser
+    without JavaScript a frame to show, at the meta-refresh rate.
+
+    The image is twice the NES size because a 256-pixel-wide frame is unreadable
+    on a normal display, and ``pixelated`` keeps the doubled pixels square rather
+    than smearing them; the reported URL is a constant pinned to the serve route
+    by a test, never imported from it.
     """
-    if tick is None:
-        return (
-            '<p class="missing">no tick has been recorded yet, so there is no '
-            "frame to show</p>"
-        )
-    name = tick.get("frame_png")
-    if name is None or str(name) == "":
-        return f'<p class="missing">{NOT_RECORDED}: this tick recorded no frame</p>'
-    if base is not None and not (base / str(name)).is_file():
-        return (
-            f'<p class="missing">{NOT_RECORDED}: the recorded frame is not on '
-            "disk</p>"
-        )
-    label = f"frame tick {_tick_number(tick)}"
+    width = FRAME_WIDTH * FRAME_SCALE
+    height = FRAME_HEIGHT * FRAME_SCALE
     return (
-        f'<img class="frame" alt="{_escape(label)}" src="/{_escape(name)}">'
+        '<div class="frames">'
+        f'<img id="live-frame-a" class="game-frame" src="{LIVE_FRAME_URL}" '
+        f'width="{width}" height="{height}" alt="the live game frame">'
+        f'<img id="live-frame-b" class="game-frame hidden" '
+        f'width="{width}" height="{height}" alt="">'
+        "</div>"
     )
 
 
@@ -444,13 +581,18 @@ def build_live_html(
 ) -> str:
     """Render the live page for ``journal`` as one HTML document.
 
-    ``artifacts_dir`` overrides the directory recorded in the run header, exactly
-    as :func:`~mario_jev.dashboard.build.build_html` uses it: the serve route
-    passes the viewer's own directory, and a journal written without one records
-    none. It is only consulted to tell a recorded frame from a missing one; the
-    reference itself is the tick's recorded ``frame_png`` path.
+    ``artifacts_dir`` is accepted and not consulted. The viewer calls every page
+    builder the same way, ``live(journal, artifacts_dir=...)``, so the parameter
+    stays for that uniform call; this page references no recorded artifact -- the
+    game is the frame the run publishes now -- so there is nothing for it to
+    resolve.
+
+    The panel is one ``id="panel"`` subtree because that is exactly what the
+    script re-fetches and replaces; the game sits outside it, so a panel refresh
+    can never reload the image being polled. The script comes last in the body
+    so every element it reaches for already exists when it runs.
     """
-    base = _resolve_artifacts_dir(journal, artifacts_dir)
+    del artifacts_dir  # accepted for the viewer's uniform call; see above
     tick = journal.ticks[-1] if journal.ticks else None
     applied = _applied_name(tick) if tick is not None else None
     chosen = _chosen_name(tick) if tick is not None else None
@@ -459,22 +601,22 @@ def build_live_html(
         '<html lang="en">',
         "<head>",
         '<meta charset="utf-8">',
-        f'<meta http-equiv="refresh" content="{REFRESH_SECONDS}">',
+        f'<meta http-equiv="refresh" content="{REFRESH_SECONDS:g}">',
         f"<title>{_escape(DEFAULT_TITLE)}</title>",
         f"<style>{_LIVE_STYLE}</style>",
         "</head>",
         "<body>",
         f"<h1>{_escape(DEFAULT_TITLE)}</h1>",
-        '<p class="note">This is a snapshot, refreshed every '
-        f"{REFRESH_SECONDS} s: this is the decision tick rate, not 60 fps. The "
-        "game itself runs in its own window at 60 fps; the frame below is the one "
-        "frame the journal recorded for the newest decision tick.</p>",
+        '<p class="note">The panel on the left is the newest decision tick, '
+        "refreshed about once a second: this is the decision tick rate, not 60 "
+        "fps. The game on the right is the frame the run is publishing now, not a "
+        "frame recorded in the journal; the recorded per-tick frames stay in the "
+        "full report.</p>",
         '<p><a href="/">the full report</a></p>',
+        '<div class="board">',
+        '<div class="panel" id="panel">',
         "<section><h2>Right now</h2>",
         f"{_now_section(journal, tick)}",
-        "</section>",
-        "<section><h2>Newest tick frame</h2>",
-        f"{_frame_section(base, tick)}",
         "</section>",
         "<section><h2>Buttons</h2>",
         f"{_buttons_section(tick)}",
@@ -488,6 +630,16 @@ def build_live_html(
         "<section><h2>Decision</h2>",
         f"{_decision_section(tick)}",
         "</section>",
+        "</div>",
+        '<div class="game">',
+        "<section><h2>The game</h2>",
+        f"{_game_section()}",
+        f'<p class="note">{_escape(_GAME_NOTE)}</p>',
+        f'<noscript><p class="note">{_escape(_NOSCRIPT_NOTE)}</p></noscript>',
+        "</section>",
+        "</div>",
+        "</div>",
+        _LIVE_SCRIPT,
         "</body>",
         "</html>",
     ]

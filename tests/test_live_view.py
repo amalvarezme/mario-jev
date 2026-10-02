@@ -1,12 +1,15 @@
-"""The live page: one snapshot of the newest decision tick.
+"""The live page: the decision panel on the left, the live game on the right.
 
-The page sits beside the game window and answers one question -- what is the
-agent doing right now, and why? What is pinned here is that it answers from the
-journal and nothing else: the frame is the newest tick's own recorded path, the
-buttons come out of the action set by name, the answer's chosen candidate and the
-applied action are each marked for the fact it stands for, a journal without its
-trailer is ``in progress``, and a tick that never asked Jev says ``no call`` rather
-than an invented score.
+The page answers one question -- what is the agent doing right now, and why? --
+beside the game itself. What is pinned here is that the panel answers from the
+journal and nothing else, and that the game is the frame the run publishes now,
+never a recorded one: the panel is one ``#panel`` subtree the script can replace,
+the game image points at the route ``serve`` answers, no recorded ``frame_png``
+leaks into the page, the meta refresh stays for a browser without the script and
+the script removes it, the buttons come out of the action set by name, the
+answer's chosen candidate and the applied action are each marked for the fact it
+stands for, a journal without its trailer is ``in progress``, and a tick that
+never asked Jev says ``no call`` rather than an invented score.
 
 The journal builders are local, exactly as they are in the other test files: a
 dozen lines each, and the test files here do not import one another. They follow
@@ -16,12 +19,18 @@ page reads.
 
 from __future__ import annotations
 
-import types
 from pathlib import Path
 
+from mario_jev import serve
 from mario_jev.dashboard import build_live_html
+from mario_jev.dashboard.live import (
+    FRAME_POLL_MS,
+    FRAME_SCALE,
+    LIVE_FRAME_URL,
+    REFRESH_SECONDS,
+)
+from mario_jev.emulator import SCREEN_SHAPE
 from mario_jev.journal import Journal
-from mario_jev.serve import Viewer, ViewerHandler
 
 
 # -- crafted journals --------------------------------------------------------------
@@ -152,59 +161,102 @@ def _journal(
     )
 
 
-# -- the frame ----------------------------------------------------------------------
+# -- the board: the panel on the left, the game on the right -------------------------
 
 
-def test_the_newest_ticks_frame_is_referenced_and_the_route_resolves_it(
+def _between(html: str, start: str, end: str) -> str:
+    """The text between the first ``start`` and the first ``end`` after it."""
+    head = html.index(start) + len(start)
+    return html[head : html.index(end, head)]
+
+
+def test_the_panel_and_the_game_are_one_board_row_with_the_panel_first() -> None:
+    html = build_live_html(_journal((_tick(0, action="right"),)))
+
+    board = _between(html, '<div class="board">', "<noscript>")
+    # One row, the decisions on the left and the game on the right: the panel
+    # opens before the game column inside the same board.
+    assert board.index('<div class="panel" id="panel">') < board.index(
+        '<div class="game">'
+    )
+    assert html.count('<div class="board">') == 1
+
+
+def test_the_panel_carries_its_id_and_holds_the_sections_in_order() -> None:
+    html = build_live_html(_journal((_tick(0, action="right"),)))
+
+    # ``id="panel"`` is the subtree the script re-fetches and replaces; the game
+    # image must not sit inside it, or a panel refresh would reload the game.
+    panel = _between(html, '<div class="panel" id="panel">', '<div class="game">')
+    assert html.count('id="panel"') == 1
+    assert "<img" not in panel
+    headings = [
+        "<h2>Right now</h2>",
+        "<h2>Buttons</h2>",
+        "<h2>Jev scores</h2>",
+        "<h2>Rollout candidates</h2>",
+        "<h2>Decision</h2>",
+    ]
+    positions = [panel.index(heading) for heading in headings]
+    assert positions == sorted(positions)
+
+
+def test_the_game_image_is_the_live_frame_at_twice_the_nes_size() -> None:
+    html = build_live_html(_journal((_tick(0),)))
+
+    game = html[html.index('<div class="game">') :]
+    width = SCREEN_SHAPE[1] * FRAME_SCALE
+    height = SCREEN_SHAPE[0] * FRAME_SCALE
+    assert (
+        f'<img id="live-frame-a" class="game-frame" src="{LIVE_FRAME_URL}" '
+        f'width="{width}" height="{height}"' in game
+    )
+    # The swap target has no source of its own until the script gives it one.
+    assert (
+        f'<img id="live-frame-b" class="game-frame hidden" '
+        f'width="{width}" height="{height}"' in game
+    )
+
+
+def test_the_live_frame_url_is_the_route_the_viewer_answers() -> None:
+    # ``live`` cannot import ``serve`` (``serve`` imports it), so this pin is
+    # what keeps the image and the route naming the same path.
+    assert LIVE_FRAME_URL == serve.LIVE_FRAME_PATH
+
+
+def test_no_recorded_frame_is_referenced_even_when_one_is_on_disk(
     tmp_path: Path,
 ) -> None:
     artifacts = tmp_path / "artifacts"
     artifacts.mkdir()
     (artifacts / "frame_000000.png").write_bytes(b"\x89PNG\r\n\x1a\nfirst")
-    (artifacts / "frame_000002.png").write_bytes(b"\x89PNG\r\n\x1a\nsecond")
+    (artifacts / "distinctive_frame_000002.png").write_bytes(
+        b"\x89PNG\r\n\x1a\nnewest"
+    )
     journal = _journal(
         (
             _tick(0, frame_png="frame_000000.png"),
-            _tick(2, frame_png="frame_000002.png"),
+            _tick(2, frame_png="distinctive_frame_000002.png"),
         ),
         run=_run_header(artifacts_dir=artifacts),
     )
 
-    html = build_live_html(journal)
+    # The viewer calls the builder with ``artifacts_dir=``; the page accepts it
+    # and does not consult it, so passing it changes nothing.
+    html = build_live_html(journal, artifacts_dir=artifacts)
 
-    # The newest tick is the last one on disk, and it is its own ``frame_png``
-    # that is referenced -- not a name reconstructed from the frame index.
-    assert 'src="/frame_000002.png"' in html
-    assert "/frame_000000.png" not in html
-    # The reference is exactly the path the serve route strips its leading slash
-    # from, so asking the handler to resolve it reaches the recorded file.
-    stand_in = types.SimpleNamespace(
-        viewer=Viewer(journal_path=Path("journal.jsonl"), artifacts_dir=artifacts)
-    )
-    assert ViewerHandler._resolve(stand_in, "/frame_000002.png") == (
-        artifacts / "frame_000002.png"
-    ).resolve()
+    assert "distinctive_frame_000002" not in html
+    assert "frame_000000" not in html
+    assert html == build_live_html(journal)
 
 
-def test_a_recorded_frame_that_is_not_on_disk_is_not_recorded(tmp_path: Path) -> None:
-    artifacts = tmp_path / "artifacts"
-    artifacts.mkdir()
-    journal = _journal(
-        (_tick(0, frame_png="frame_000000.png"),),
-        run=_run_header(artifacts_dir=artifacts),
-    )
-
-    html = build_live_html(journal)
-
-    assert "<img" not in html
-    assert "not recorded" in html
-
-
-def test_a_journal_with_no_tick_says_so_instead_of_showing_a_frame() -> None:
+def test_a_journal_with_no_tick_says_so_and_still_shows_the_game() -> None:
     html = build_live_html(_journal(()))
 
     assert "no tick has been recorded yet" in html
-    assert "<img" not in html
+    # The game is the run's newest published frame, not a journal fact, so an
+    # empty journal still gets the live image.
+    assert f'src="{LIVE_FRAME_URL}"' in html
 
 
 # -- the buttons --------------------------------------------------------------------
@@ -355,22 +407,55 @@ def test_a_tick_with_no_response_says_no_call_instead_of_scores() -> None:
 def test_the_page_carries_the_refresh_meta_and_the_link_to_the_report() -> None:
     html = build_live_html(_journal((_tick(0),)))
 
-    assert '<meta http-equiv="refresh" content="0.5">' in html
+    head = _between(html, "<head>", "</head>")
+    assert f'<meta http-equiv="refresh" content="{REFRESH_SECONDS:g}">' in head
     assert '<a href="/">' in html
 
 
-def test_the_page_says_this_is_the_tick_rate_not_60_fps() -> None:
+def test_the_script_runs_once_at_the_end_and_removes_the_refresh_meta() -> None:
+    html = build_live_html(_journal((_tick(0),)))
+
+    assert html.count("<script>") == 1
+    script = _between(html, "<script>", "</script>")
+    # The meta is the no-script fallback; a browser that runs the script must
+    # drop it, or the whole-page reload would restart the polling every second.
+    assert "document.querySelector('meta[http-equiv=\"refresh\"]')" in script
+    assert "meta.parentNode.removeChild(meta)" in script
+    assert "getElementById(\"panel\")" in script
+    assert f'"{LIVE_FRAME_URL}"' in script
+    # Emitted last in the body, after the markup it reaches for.
+    assert _between(html, "</script>", "</body>").strip() == ""
+
+
+def test_without_javascript_the_noscript_sentence_says_the_whole_page_reloads() -> None:
+    html = build_live_html(_journal((_tick(0),)))
+
+    noscript = _between(html, "<noscript>", "</noscript>")
+    assert "the whole page" in noscript
+    assert "reloads" in noscript
+    assert f"{REFRESH_SECONDS:g} s" in noscript
+
+
+def test_the_page_names_its_rates_and_does_not_claim_60_fps() -> None:
     html = build_live_html(_journal((_tick(0),)))
 
     assert "decision tick rate, not 60 fps" in html
+    assert "this page is not 60 fps" in html
+    assert f"about every {FRAME_POLL_MS} ms" in html
+    # The old claim about the frame is gone: this page shows the frame the run is
+    # publishing now, and the recorded per-tick frames stay in the report.
+    assert "frame the journal recorded" not in html
+    assert "publishing now" in html
 
 
 def test_a_hostile_reason_is_escaped() -> None:
     injected = "danger <script>alert('x')</script>"
     html = build_live_html(_journal((_tick(0, reason=injected),)))
 
-    assert "<script>" not in html
-    assert "&lt;script&gt;" in html
+    # The page's own script is the one ``<script>`` element; the reason is text.
+    assert "<script>alert(" not in html
+    assert "&lt;script&gt;alert(" in html
+    assert html.count("<script>") == 1
 
 
 def test_build_live_html_is_deterministic() -> None:
