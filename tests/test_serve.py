@@ -24,8 +24,17 @@ from pathlib import Path
 import pytest
 
 from mario_jev import serve as serve_module
+from mario_jev.dashboard import build_live_html
 from mario_jev.journal import Journal, JournalFormatError
-from mario_jev.serve import DEFAULT_BIND, Viewer, ViewerServer, run, serve
+from mario_jev.serve import (
+    DEFAULT_BIND,
+    LIVE_PATH,
+    ThreadedViewer,
+    Viewer,
+    ViewerServer,
+    run,
+    serve,
+)
 
 HOST = "127.0.0.1"
 
@@ -137,6 +146,27 @@ def _viewer(path: Path, artifacts_dir: object | None = None) -> Viewer:
         artifacts_dir=None if artifacts_dir is None else Path(artifacts_dir),
         retry_delay_s=0.0,
     )
+
+
+def _live_viewer(path: Path, artifacts_dir: object | None = None) -> Viewer:
+    """The report viewer plus the decision board, for the ``/live`` route tests."""
+    return Viewer(
+        journal_path=path,
+        artifacts_dir=None if artifacts_dir is None else Path(artifacts_dir),
+        retry_delay_s=0.0,
+        live=build_live_html,
+    )
+
+
+def _read_all(client: socket.socket) -> bytes:
+    """Everything the server sends before it closes the ``HTTP/1.0`` connection."""
+    chunks: list[bytes] = []
+    while True:
+        chunk = client.recv(65536)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 # -- the report --------------------------------------------------------------------
@@ -631,5 +661,186 @@ def test_a_raising_on_ready_still_closes_the_socket(
 
     # The callback ran inside the ``try/finally``: the socket it was handed is
     # released even though the callback raised.
+    assert servers[0].closed is True  # type: ignore[attr-defined]
+
+
+# -- the live route: the decision board beside the game ---------------------------
+# ``/live`` is a second report route, not a second read path. What these tests pin
+# is that it answers the live builder, that a viewer without one treats it as the
+# unknown path it is, and that the report route does not change by one byte when
+# the board is configured next to it.
+
+
+def test_the_live_route_serves_the_live_page_over_a_real_socket(tmp_path: Path) -> None:
+    journal = _live_journal(tmp_path / "live.jsonl", ticks=2)
+
+    status, body, headers = _request(_live_viewer(journal), _get(LIVE_PATH))
+
+    assert status == "HTTP/1.0 200 OK"
+    assert headers["content-type"] == "text/html; charset=utf-8"
+    assert headers["content-length"] == str(len(body))
+    assert body.startswith(b"<!DOCTYPE html>")
+    # The board's own two marks: it refreshes itself at the tick rate and links to
+    # the full report, rather than being the report under another name.
+    assert b'http-equiv="refresh"' in body
+    assert b'<a href="/">' in body
+    assert b"not 60 fps" in body
+
+
+def test_live_is_a_404_when_no_live_builder_is_configured(tmp_path: Path) -> None:
+    journal = _live_journal(tmp_path / "live.jsonl", ticks=1)
+
+    status, body, _ = _request(_viewer(journal), _get(LIVE_PATH))
+
+    # The same 404 every unknown path gets: a viewer that was never asked to serve
+    # the board must not pretend there is one.
+    assert status == "HTTP/1.0 404 Not Found"
+    assert body == b"not found\n"
+
+
+def test_configuring_live_does_not_change_the_report_route(tmp_path: Path) -> None:
+    journal = _live_journal(tmp_path / "live.jsonl", ticks=1)
+
+    without = _request(_viewer(journal), _get("/"))
+    with_live = _request(_live_viewer(journal), _get("/"))
+
+    # ``/`` is byte-identical whether or not the live builder is configured. The
+    # route is one more branch, not a change to the report.
+    assert without == with_live
+
+
+def test_a_torn_journal_on_the_live_route_is_the_same_503_once(tmp_path: Path) -> None:
+    journal = _live_journal(tmp_path / "live.jsonl")
+    calls: list[int] = []
+
+    def always_torn(path: object, *, allow_partial: bool = False) -> Journal:
+        calls.append(1)
+        raise JournalFormatError(2, "not valid JSON (Expecting value)")
+
+    viewer = Viewer(
+        journal_path=journal, read=always_torn, retry_delay_s=0.0, live=build_live_html
+    )
+
+    status, body, _ = _request(viewer, _get(LIVE_PATH))
+
+    assert status == "HTTP/1.0 503 Service Unavailable"
+    # The live page goes through the report's own read-retry-503 path, so the body
+    # is exactly the one the report route already promises.
+    assert body == (
+        b"the journal could not be read at this moment: it may be mid-write, in "
+        b"which case reloading will help. The reader said:\n"
+        b"journal line 2: not valid JSON (Expecting value)\n"
+    )
+    # One read, one retry: the live route does not grow a second, longer loop.
+    assert len(calls) == 2
+
+
+def test_a_real_torn_journal_on_the_live_route_is_a_503(tmp_path: Path) -> None:
+    journal = tmp_path / "torn.jsonl"
+    journal.write_text('{"kind": "run"}\n{"kind": "tick"', encoding="utf-8")
+
+    status, body, _ = _request(_live_viewer(journal), _get(LIVE_PATH))
+
+    assert status == "HTTP/1.0 503 Service Unavailable"
+    assert b"journal line 2: not valid JSON" in body
+    assert b"<!DOCTYPE html>" not in body
+
+
+def test_serve_with_live_serves_the_board_and_the_default_still_404s(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    journal = _live_journal(tmp_path / "live.jsonl", ticks=1)
+    served: dict[str, object] = {}
+
+    def fake_run(server: ViewerServer, *, once: bool = False) -> int:
+        served["status"], served["body"] = _request_on_open_server(server, LIVE_PATH)
+        return 0
+
+    monkeypatch.setattr(serve_module, "run", fake_run)
+
+    assert serve(journal, port=0, once=True, out=StringIO(), live=True) == 0
+    assert served["status"] == "HTTP/1.0 200 OK"
+    assert bytes(served["body"]).startswith(b"<!DOCTYPE html>")  # type: ignore[arg-type]
+
+    # And with the default ``live=False`` the same route is refused, proving the
+    # flag is the live route's switch and not decoration.
+    assert serve(journal, port=0, once=True, out=StringIO()) == 0
+    assert served["status"] == "HTTP/1.0 404 Not Found"
+    assert served["body"] == b"not found\n"
+
+
+# -- the threaded entry point: serving while the game owns the main thread -------
+
+
+def test_the_threaded_viewer_serves_live_from_another_thread_and_stops(
+    tmp_path: Path,
+) -> None:
+    journal = _live_journal(tmp_path / "live.jsonl", ticks=2)
+    out = StringIO()
+    ready: list[str] = []
+    viewer = ThreadedViewer(
+        journal, port=0, out=out, retry_delay_s=0.0, on_ready=ready.append
+    )
+
+    url = viewer.start()
+    host, port = viewer.address
+    try:
+        # The URL on_ready saw is the one the socket really answers on, live path
+        # and all: the same bind-and-compute serve uses, reused rather than recopied.
+        assert ready == [url]
+        assert url == f"http://{host}:{port}{LIVE_PATH}"
+
+        # The request is sent from this thread; the page is built on the daemon.
+        client = socket.create_connection((host, port))
+        try:
+            client.sendall(_get(LIVE_PATH))
+            response = _read_all(client)
+        finally:
+            client.close()
+        head, _, body = response.partition(b"\r\n\r\n")
+        assert head.startswith(b"HTTP/1.0 200 OK")
+        assert body.startswith(b"<!DOCTYPE html>")
+    finally:
+        viewer.stop()
+
+    lines = out.getvalue().splitlines()
+    assert lines[0] == f"serving {journal} at {url}"
+    # The honest second line: the game is the window at 60 fps, this page is the
+    # board at the decision tick rate. Different from serve's line, on purpose.
+    assert "60 fps" in lines[1]
+    assert "decision" in lines[1]
+
+    # Stop closed the socket: the port it bound now refuses a further connection.
+    with pytest.raises(OSError):
+        socket.create_connection((host, port), timeout=0.5).close()
+
+
+def test_a_raising_on_ready_on_the_threaded_path_closes_the_socket(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    journal = _live_journal(tmp_path / "live.jsonl")
+    servers: list[object] = []
+
+    class _RecordingServer:
+        def __init__(self, address: tuple[str, int], handler: object) -> None:
+            self.server_address = ("127.0.0.1", 8000)
+            self.closed = False
+            servers.append(self)
+
+        def server_close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(serve_module, "ViewerServer", _RecordingServer)
+
+    def explode(url: str) -> None:
+        raise RuntimeError("the callback is the caller's business, not the viewer's")
+
+    viewer = ThreadedViewer(journal, port=0, out=StringIO(), on_ready=explode)
+
+    with pytest.raises(RuntimeError):
+        viewer.start()
+
+    # A raising callback is the caller's failure, not a licence to leak the port:
+    # the socket is released before the exception leaves ``start``.
     assert servers[0].closed is True  # type: ignore[attr-defined]
 

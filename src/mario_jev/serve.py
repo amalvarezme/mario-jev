@@ -1,11 +1,24 @@
-"""A local viewer for one run, live: the report, regenerated per request.
+"""A local viewer for one run: the report and the live board, regenerated per request.
 
-``mario_jev serve <journal>`` starts a **single-threaded** HTTP server whose only
-job is to answer ``GET /`` with ``build_html(read_journal(path,
-allow_partial=True))``. There is no streaming, no server-sent events, no polling
+``mario_jev serve <journal>`` starts a **single-threaded** HTTP server whose job
+is to answer ``GET /`` with ``build_html(read_journal(path,
+allow_partial=True))`` and, when it is configured for it, ``GET /live`` with
+``build_live_html(...)``. There is no streaming, no server-sent events, no polling
 loop and no worker thread: a request reads the journal as it is at that moment,
 builds one page, sends it, and the next request starts over. One request is
 handled at a time, on purpose -- a second viewer tab waits for the first.
+
+The two report routes are one read path: ``/live`` uses the same partial read,
+the same single retry after the same delay, and the same ``503`` with the reader's
+own words. It is a second page, deliberately not a second way to read a journal.
+A viewer built without the live builder -- the default -- does not answer
+``/live`` at all: that path is then the same ``404`` as every unknown path.
+
+``mario_jev live`` needs the viewer off the main thread, because the game window
+owns it. :class:`ThreadedViewer` is that: the same bind, URL, startup lines and
+``on_ready`` promise as :func:`serve`, serving from a daemon thread that polls its
+stop event and closes its socket on the way out. ``serve`` itself keeps blocking
+the calling thread by design, and its tests are the contract for that path.
 
 A journal mid-write has a short window in which it is not readable, because a
 line can be half-written when the reader reaches it. The viewer does not paper
@@ -16,9 +29,10 @@ It never renders a half-read journal as if it were complete and it never skips a
 line it could not parse -- showing part of a run as the whole run is the one
 thing a viewer built for evidence must not do.
 
-Request paths other than ``/`` are resolved against the run's artifacts
-directory and served only from inside it; anything that is not inside it is
-answered ``404``, including a path the filesystem refuses to look at -- a null
+Request paths other than ``/`` and, when configured, ``/live`` are resolved
+against the run's artifacts directory and served only from inside it; anything
+that is not inside it is answered ``404``, including a path the filesystem
+refuses to look at -- a null
 byte makes ``resolve`` raise rather than fail to match, and no request may make
 this handler raise. What is *not* necessarily a 404 is a request the standard
 library rejects before dispatching here at all: a verb with no handler, or a
@@ -28,6 +42,7 @@ malformed request line, gets the library's own ``501``/``400`` and never a file.
 from __future__ import annotations
 
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler
@@ -36,13 +51,17 @@ from socketserver import TCPServer
 from typing import Callable, TextIO
 from urllib.parse import unquote, urlsplit
 
-from mario_jev.dashboard import build_html
+from mario_jev.dashboard import build_html, build_live_html
 from mario_jev.journal import Journal, JournalFormatError, read_journal
 
 __all__ = [
     "DEFAULT_BIND",
     "DEFAULT_PORT",
+    "LIVE_PATH",
     "RETRY_DELAY_S",
+    "THREADED_JOIN_TIMEOUT_S",
+    "THREADED_POLL_S",
+    "ThreadedViewer",
     "Viewer",
     "ViewerServer",
     "run",
@@ -58,8 +77,32 @@ DEFAULT_PORT = 8000
 #: How long the viewer waits before its single retry of an unreadable journal.
 #: Short enough not to be felt, long enough to cover the write of one line.
 RETRY_DELAY_S = 0.05
+#: The path that serves the live decision board rather than the report or an
+#: artifact. It is a fixed module-level path, not a per-viewer one, because the
+#: `live` command links to it and the route has to name the same thing everywhere.
+LIVE_PATH = "/live"
 #: The one path that serves the report rather than an artifact.
 REPORT_PATH = "/"
+#: How long the threaded entry point's accept loop waits for a connection before
+#: looking at its stop event again. Short enough that a stop is felt in well under
+#: a human blink, long enough not to spin the CPU while serving nobody.
+THREADED_POLL_S = 0.05
+#: How long ``ThreadedViewer.stop`` waits for its accept loop to notice the stop
+#: before giving up on the join. Generous compared with ``THREADED_POLL_S`` so a
+#: working thread always finishes well inside it, and bounded so a thread that
+#: somehow does not cannot hang the process trying to shut down.
+THREADED_JOIN_TIMEOUT_S = 2.0
+#: The startup lines. Two pages, two second lines: `serve` answers the run's
+#: evidence, `live` answers the decision board beside the game window, and each
+#: says which one it is rather than one sentence pretending to fit both.
+REPORT_STARTUP_NOTE = (
+    "this is the run's evidence, not the game: the loop advances one frame per "
+    "tick, so the page grows at the tick rate, not at 60 fps"
+)
+LIVE_STARTUP_NOTE = (
+    "this is the decision board, not the game: the game plays in its own window "
+    "at 60 fps, and this page refreshes at the decision tick rate, not at 60 fps"
+)
 #: Content types named for the artifact kinds this project writes. Anything else
 #: is served as bytes: the extension is the only claim the viewer can check.
 CONTENT_TYPES: dict[str, str] = {
@@ -99,7 +142,10 @@ class Viewer:
 
     ``read`` and ``report`` are the two seams: the real ones are the journal
     reader and :func:`~mario_jev.dashboard.build_html`, and a test may replace
-    either to exercise the handler without a journal on disk.
+    either to exercise the handler without a journal on disk. ``live`` is the
+    third, and the only optional one: the decision board's builder, or ``None``
+    when this viewer does not answer ``/live`` -- a viewer without it treats that
+    path exactly like every other path with no artifact behind it.
     """
 
     journal_path: Path
@@ -107,6 +153,7 @@ class Viewer:
     read: Callable[..., Journal] = read_journal
     report: Callable[..., str] = build_html
     retry_delay_s: float = RETRY_DELAY_S
+    live: Callable[..., str] | None = None
 
 
 class ViewerHandler(BaseHTTPRequestHandler):
@@ -147,14 +194,49 @@ class ViewerHandler(BaseHTTPRequestHandler):
         target = unquote(urlsplit(self.path).path)
         if target == REPORT_PATH:
             self._report(with_body=with_body)
+        elif target == LIVE_PATH and self.viewer.live is not None:
+            self._live_page(with_body=with_body)
         else:
             self._artifact(target, with_body=with_body)
 
-    # -- the report --
+    # -- the report and the live page --
 
     def _report(self, *, with_body: bool) -> None:
+        self._read_page(
+            lambda journal: self.viewer.report(
+                journal, artifacts_dir=self.viewer.artifacts_dir
+            ),
+            with_body=with_body,
+        )
+
+    def _live_page(self, *, with_body: bool) -> None:
+        """The decision board, through the report's own read-retry-503 path.
+
+        Deliberately the *same* path: the live page is the same journal read the
+        same partial way, retried the same single time after the same delay, and
+        answered with the same 503 and the same reader's words when it still
+        cannot be read. A second copy would be a second chance for the two pages
+        to disagree about a torn journal, and there is only one journal.
+        """
+        assert self.viewer.live is not None  # routed only when configured
+        self._read_page(
+            lambda journal: self.viewer.live(  # type: ignore[misc]
+                journal, artifacts_dir=self.viewer.artifacts_dir
+            ),
+            with_body=with_body,
+        )
+
+    def _read_page(
+        self, build: Callable[[Journal], str], *, with_body: bool
+    ) -> None:
+        """Read the journal, build the page, and answer 200 or the shared 503.
+
+        The retry and the 503 live here once so ``/`` and ``/live`` cannot drift:
+        the error path is the contract, and duplicating it would let one page keep
+        a fix the other lost.
+        """
         try:
-            page = self._render()
+            page = self._render(build)
         except (JournalFormatError, OSError) as exc:
             # The reader's own words, not a summary of them: the line number and
             # the reason are the only useful thing a viewer can say about a
@@ -176,7 +258,7 @@ class ViewerHandler(BaseHTTPRequestHandler):
             200, "text/html; charset=utf-8", page.encode("utf-8"), with_body=with_body
         )
 
-    def _render(self) -> str:
+    def _render(self, build: Callable[[Journal], str]) -> str:
         """The page for the journal as it is now, with exactly one retry.
 
         The retry covers the window in which the writer has flushed part of a
@@ -185,14 +267,14 @@ class ViewerHandler(BaseHTTPRequestHandler):
         the file becomes readable would hide a journal that is genuinely broken.
         """
         try:
-            return self._page()
+            return self._page(build)
         except (JournalFormatError, OSError):
             time.sleep(self.viewer.retry_delay_s)
-            return self._page()
+            return self._page(build)
 
-    def _page(self) -> str:
+    def _page(self, build: Callable[[Journal], str]) -> str:
         journal = self.viewer.read(self.viewer.journal_path, allow_partial=True)
-        return self.viewer.report(journal, artifacts_dir=self.viewer.artifacts_dir)
+        return build(journal)
 
     # -- artifacts --
 
@@ -284,6 +366,69 @@ class ViewerServer(TCPServer):
         super().__init__(address, ViewerHandler)
 
 
+def _viewer_for(
+    journal_path: Path,
+    *,
+    artifacts_dir: object | None,
+    retry_delay_s: float,
+    live: bool,
+) -> Viewer:
+    """The one viewer both entry points build, so they cannot disagree.
+
+    ``live`` decides whether ``Viewer.live`` is the decision board's builder or
+    ``None``. ``None`` is the default everywhere it is not asked for, which is
+    what keeps ``/live`` a plain 404 on every viewer built before this route
+    existed.
+    """
+    return Viewer(
+        journal_path=journal_path,
+        artifacts_dir=_artifacts_root(journal_path, artifacts_dir),
+        retry_delay_s=retry_delay_s,
+        live=build_live_html if live else None,
+    )
+
+
+def _bind_server(
+    journal_path: Path,
+    *,
+    artifacts_dir: object | None,
+    bind: str,
+    port: int,
+    retry_delay_s: float,
+    live: bool,
+    url_path: str,
+) -> tuple[ViewerServer, str]:
+    """Bind the socket, compute the URL the OS actually chose, and return both.
+
+    Shared by :func:`serve` and :class:`ThreadedViewer` so the two entry points
+    reuse one binding and one URL computation; a second copy is a second place
+    for ``port=0`` to be handled differently. The URL always names the page this
+    viewer actually answers -- ``/`` for the report, ``/live`` for the board -- and
+    never a path the router would 404.
+    """
+    viewer = _viewer_for(
+        journal_path,
+        artifacts_dir=artifacts_dir,
+        retry_delay_s=retry_delay_s,
+        live=live,
+    )
+    server = ViewerServer((bind, port), viewer)
+    host, actual_port = server.server_address[0], server.server_address[1]
+    return server, f"http://{host}:{actual_port}{url_path}"
+
+
+def _startup_lines(path: Path, url: str, *, live: bool) -> tuple[str, str]:
+    """The two lines either entry point prints, shared so they cannot drift.
+
+    The first names the journal and the bound URL. The second says what the page
+    is, and the two paths say different things because they are different pages:
+    ``serve`` shows the run's evidence, ``live`` shows the decision board beside
+    the game window.
+    """
+    note = LIVE_STARTUP_NOTE if live else REPORT_STARTUP_NOTE
+    return f"serving {path} at {url}", note
+
+
 def run(server: ViewerServer, *, once: bool = False) -> int:
     """Serve until interrupted, or exactly one request when ``once`` is set.
 
@@ -310,6 +455,7 @@ def serve(
     retry_delay_s: float = RETRY_DELAY_S,
     out: TextIO | None = None,
     on_ready: Callable[[str], None] | None = None,
+    live: bool = False,
 ) -> int:
     """Start the viewer for ``journal_path`` and serve until interrupted.
 
@@ -318,30 +464,150 @@ def serve(
     act on the address the OS actually chose (``port=0``). ``serve`` prints its
     own startup lines unconditionally and decides nothing on the callback's
     behalf; passing ``None`` keeps every current caller unchanged.
+
+    ``live`` is ``False`` by default and changes not one byte for every current
+    caller: with it off, no live builder is configured and ``/live`` is the same
+    404 as any unknown path. With it on, this viewer is the decision board -- the
+    route the ``live`` command serves from its background thread.
     """
     stream = sys.stdout if out is None else out
     path = Path(journal_path)
-    viewer = Viewer(
-        journal_path=path,
-        artifacts_dir=_artifacts_root(path, artifacts_dir),
+    server, url = _bind_server(
+        path,
+        artifacts_dir=artifacts_dir,
+        bind=bind,
+        port=port,
         retry_delay_s=retry_delay_s,
+        live=live,
+        url_path=LIVE_PATH if live else REPORT_PATH,
     )
-    server = ViewerServer((bind, port), viewer)
-    host, actual_port = server.server_address[0], server.server_address[1]
-    url = f"http://{host}:{actual_port}/"
     try:
         # Both prints and the callback sit inside the ``try``: a callback that
         # raises, or a stream that fails (a closed pipe, say), must not skip
         # ``server_close`` and leak the socket the viewer just bound. A failing
         # print is the caller's environment failing, not swallowed here.
-        print(f"serving {path} at {url}", file=stream)
-        print(
-            "this is the run's evidence, not the game: the loop advances one frame per "
-            "tick, so the page grows at the tick rate, not at 60 fps",
-            file=stream,
-        )
+        first, note = _startup_lines(path, url, live=live)
+        print(first, file=stream)
+        print(note, file=stream)
         if on_ready is not None:
             on_ready(url)
         return run(server, once=once)
     finally:
         server.server_close()
+
+
+class ThreadedViewer:
+    """The viewer on a daemon thread, for a command that owns the main one.
+
+    ``live`` plays the game on the main thread, because nes-py refuses to render
+    anywhere else, so the page beside the window has to be served from a
+    background thread or not at all. This is that thread and the small surface
+    around it: it binds the socket and computes the URL exactly as :func:`serve`
+    does (through the same helpers), prints the same first line and the live
+    page's own second line, calls ``on_ready`` before the first request can be
+    served, and then loops over :meth:`~socketserver.BaseServer.handle_request`
+    with a short server timeout until :meth:`stop` asks it to quit.
+
+    Reusing :func:`serve` itself is impossible here and that is not an oversight:
+    its ``run`` blocks the calling thread by design, and blocking the calling
+    thread is the one thing this path cannot do. What is shared is everything
+    that must not differ -- the bind, the URL, the startup lines and
+    ``on_ready`` -- while the loop is the one piece a background thread needs.
+
+    ``stop`` closes the socket and joins the thread with a bounded wait. The wait
+    is bounded because the accept loop polls its stop event every
+    ``THREADED_POLL_S``; a socket close from another thread can also surface as
+    ``OSError`` inside the loop, which is treated as the stop it is rather than
+    as a failure to print.
+    """
+
+    def __init__(
+        self,
+        journal_path: object,
+        *,
+        artifacts_dir: object | None = None,
+        bind: str = DEFAULT_BIND,
+        port: int = DEFAULT_PORT,
+        retry_delay_s: float = RETRY_DELAY_S,
+        out: TextIO | None = None,
+        on_ready: Callable[[str], None] | None = None,
+        live: bool = True,
+    ) -> None:
+        self._path = Path(journal_path)
+        self._stream = sys.stdout if out is None else out
+        self._on_ready = on_ready
+        self._live = live
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        url_path = LIVE_PATH if live else REPORT_PATH
+        self._server, self.url = _bind_server(
+            self._path,
+            artifacts_dir=artifacts_dir,
+            bind=bind,
+            port=port,
+            retry_delay_s=retry_delay_s,
+            live=live,
+            url_path=url_path,
+        )
+
+    @property
+    def address(self) -> tuple[str, int]:
+        """The host and port the socket is bound to, as the OS chose them."""
+        return self._server.server_address
+
+    def start(self) -> str:
+        """Print, call ``on_ready``, then serve on a daemon thread. Returns the URL.
+
+        The prints and the callback are wrapped so a raising callback still closes
+        the socket this instance bound: exactly the promise :func:`serve` makes on
+        the blocking path, and for the same reason -- a callback is the caller's
+        business, not a licence to leak a port.
+        """
+        try:
+            first, note = _startup_lines(self._path, self.url, live=self._live)
+            print(first, file=self._stream)
+            print(note, file=self._stream)
+            if self._on_ready is not None:
+                self._on_ready(self.url)
+        except BaseException:
+            self._server.server_close()
+            raise
+        self._server.timeout = THREADED_POLL_S
+        self._thread = threading.Thread(
+            target=self._serve, name="mario-jev-viewer", daemon=True
+        )
+        self._thread.start()
+        return self.url
+
+    def _serve(self) -> None:
+        """Accept one request at a time until ``stop`` sets the event.
+
+        ``handle_request`` returns after the server timeout when nobody connects,
+        so the event is seen promptly without a busy loop. ``OSError`` is the
+        socket closing under a blocked ``accept`` during ``stop``; that is the
+        stop, not an error, and is not printed.
+        """
+        while not self._stop.is_set():
+            try:
+                self._server.handle_request()
+            except OSError:
+                return
+
+    def stop(self) -> None:
+        """Close the socket and join the thread with a bounded wait.
+
+        Closing first is what unblocks a thread waiting in ``accept``; the join is
+        bounded so a thread that somehow does not notice cannot hang the caller
+        that is trying to shut the process down.
+        """
+        self._stop.set()
+        self._server.server_close()
+        if self._thread is not None:
+            self._thread.join(timeout=THREADED_JOIN_TIMEOUT_S)
+
+    def __enter__(self) -> ThreadedViewer:
+        self.start()
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.stop()
