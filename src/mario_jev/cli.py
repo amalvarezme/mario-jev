@@ -24,9 +24,11 @@ broken configuration becomes an actionable message, not a traceback.
   run's evidence (the journal, with the per-tick frame and trajectory artifacts),
   and serves the page for it while the run goes.
 * ``live`` inverts that arrangement for a viewer: the game owns the main thread
-  (nes-py refuses to render a window anywhere else) and the live decision board
-  is served from a daemon thread. Its ``--max-ticks`` defaults to 900 and its
-  journal to ``artifacts/live.jsonl``.
+  (nes-py refuses to render a window anywhere else, and the run is the part that
+  cannot be a daemon) and the live decision board is served from a daemon thread,
+  fed the game's own frames. Its ``--max-ticks`` defaults to 900, its journal to
+  ``artifacts/live.jsonl``, and ``--no-window`` drops the native window without
+  taking the game off the page.
 * ``doctor`` reports the environment and dependency readiness, with an exit code
   that the optional advisor stack can never change.
 
@@ -48,12 +50,15 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
+import numpy as np
+
 from mario_jev.advisor import PlayJevAdvisor
 from mario_jev.config import Settings, redact_url_userinfo
 from mario_jev.dashboard import render_text, write_html
 from mario_jev.emulator import MarioEmulator
 from mario_jev.jev import JevClient, JevError
 from mario_jev.journal import JournalFormatError, JournalWriter, read_journal
+from mario_jev.live_frame import LiveFrame
 from mario_jev.policy import (
     ExecutionLoop,
     RecordedAnswerFeed,
@@ -87,14 +92,24 @@ OPTIONAL_MODULES: tuple[str, ...] = ("torch", "transformers")
 # -- collaborator factories (the seams a test may replace) -------------------------
 
 
-def _build_emulator(settings: Settings, *, render_mode: str | None = None) -> MarioEmulator:
+def _build_emulator(
+    settings: Settings,
+    *,
+    render_mode: str | None = None,
+    on_frame: Callable[[np.ndarray], None] | None = None,
+) -> MarioEmulator:
     """A reset real emulator for ``settings``.
 
-    ``render_mode`` is a display choice, so it is handed straight to the
-    emulator and nowhere else: it is deliberately not a ``Settings`` field and
-    not written to the journal header, because a window changes nothing the run
-    measured. ``None`` -- what every current caller passes -- keeps the run
-    headless, exactly as before the mode was threaded through.
+    ``render_mode`` and ``on_frame`` are both display choices, so they are handed
+    straight to the emulator and nowhere else: neither is a ``Settings`` field and
+    neither is written to the journal header, because a window and a watched page
+    change nothing the run measured. ``None`` for both -- what ``run`` and ``demo``
+    pass -- keeps the run headless and silent, exactly as before either was
+    threaded through.
+
+    They are independent on purpose, and the emulator keeps them that way:
+    ``on_frame`` fires on the real timeline whatever the mode is, so the live page
+    can carry the game with no window open.
     """
     emulator = MarioEmulator(
         stage=settings.stage,
@@ -102,6 +117,7 @@ def _build_emulator(settings: Settings, *, render_mode: str | None = None) -> Ma
         real_time=settings.real_time,
         target_fps=settings.target_fps,
         render_mode=render_mode,
+        on_frame=on_frame,
     )
     emulator.reset()
     return emulator
@@ -468,6 +484,7 @@ def _play(
     observer: Callable[[TickRecord], None] | None = None,
     fed: _FedRun | None = None,
     render_mode: str | None = None,
+    on_frame: Callable[[np.ndarray], None] | None = None,
 ) -> RunSummary:
     """Play one run into ``journal_path`` and return its summary.
 
@@ -487,11 +504,12 @@ def _play(
     -- ``run`` pre-reads it so it can print its own refusal, and ``demo`` (which has
     no ``--answers`` flag but honours the environment) reaches this branch.
 
-    ``render_mode`` is the display choice the ``live`` command will pass down to
-    the emulator; ``run`` and ``demo`` pass nothing and stay headless. It changes
-    only what is drawn, never what is recorded: the emulator draws the real
-    timeline and nothing else, so the mode is no evidence and no caller that did
-    not ask for a window sees one.
+    ``render_mode`` and ``on_frame`` are the display choices ``live`` passes down
+    to the emulator; ``run`` and ``demo`` pass neither and stay headless and
+    silent. They change only what is presented, never what is recorded: the
+    emulator presents the real timeline and nothing else, so neither is evidence,
+    no caller that did not ask for a window sees one, and no caller that did not
+    ask for a sink pays for a frame copy.
 
     The header is written from ``settings``, never from the ``loop_settings``
     below: a fed run with no credential still records ``jev_available: false`` and
@@ -512,13 +530,18 @@ def _play(
     try:
         emulator = None
         try:
-            # Only a caller that asked for a window passes the mode, so the
-            # default path builds the emulator with the exact call it always
-            # made -- same keyword set, same seam every test double replaces.
+            # Only a caller that asked for a window or a sink passes either, so
+            # the default path builds the emulator with the exact call it always
+            # made -- same keyword set, same seam every test double replaces. The
+            # doubles are the reason this is not one call with both keywords:
+            # several of them are ``lambda settings: ...``, and handing them a
+            # keyword they never took would fail where nothing is being asked for.
             emulator = (
                 _build_emulator(settings)
-                if render_mode is None
-                else _build_emulator(settings, render_mode=render_mode)
+                if render_mode is None and on_frame is None
+                else _build_emulator(
+                    settings, render_mode=render_mode, on_frame=on_frame
+                )
             )
             loop_settings = settings
             if fed is None:
@@ -970,10 +993,29 @@ def _cmd_live(args: argparse.Namespace) -> int:
     a viewer means to sit and watch and 300 ticks is about 45 seconds, and
     ``--journal`` defaults to ``artifacts/live.jsonl``.
 
-    The arrangement inverts ``demo``'s and that is the whole point: the run owns
-    the main thread because nes-py refuses to render a window anywhere else, and
-    the viewer is the daemon thread. The viewer starts -- configured with the live
-    route -- before the first frame is played, and is stopped on every exit path.
+    The window is the default and not the command's whole point: ``--no-window``
+    plays the run headless and the live page still carries the game, because the
+    frame sink below is independent of the render mode. What the window buys is
+    the refresh rate -- it is the only 60 fps view, while the page shows whatever
+    frame it last polled -- so it stays on unless asked away.
+
+    The arrangement inverts ``demo``'s, and it holds for two reasons rather than
+    one. The first is nes-py's: ``ImageViewer.__init__`` raises "rendering from
+    python threads is not supported" off the main thread, so a windowed run has
+    nowhere else to live. That reason lapses under ``--no-window``, where nothing
+    is rendered at all; the second one does not. One command drives one emulator,
+    the emulator synchronises nothing and is driven from whichever thread calls
+    it, and the viewer is the half that can be a daemon and be stopped from
+    outside. So the run keeps the main thread under either mode: the flag changes
+    what is drawn, not who drives, and the exit paths below stay one set.
+
+    One :class:`LiveFrame` is the whole of what the two threads share: its
+    ``publish`` goes to the run as ``on_frame`` and its ``png`` to the viewer as
+    ``frame_source``, and it is built before the viewer starts so the route has a
+    source from the first request rather than a 404 and a race.
+
+    The viewer starts -- configured with the live route -- before the first frame
+    is played, and is stopped on every exit path.
     The exit line is ``demo``'s own :func:`_demo_exit_sentence`, with the three
     outcomes mapped deliberately: a clean return is finished; a ``(JevError,
     OSError)`` out of ``_play`` is printed as ``run failed`` and means the run did
@@ -1010,6 +1052,11 @@ def _cmd_live(args: argparse.Namespace) -> int:
             return
         _open_in_browser(url)
 
+    # Built before the viewer so no request can arrive before the route has its
+    # source. Nothing has been published yet, which ``png()`` answers as ``None``
+    # and the route turns into an honest 404 until the run's first frame.
+    live_frame = LiveFrame()
+
     try:
         viewer = ThreadedViewer(
             journal_path,
@@ -1018,6 +1065,7 @@ def _cmd_live(args: argparse.Namespace) -> int:
             port=args.port,
             on_ready=on_ready,
             live=True,
+            frame_source=live_frame.png,
         )
     except OSError as exc:
         # Binding failed before anything ran. The message names the address and the
@@ -1042,14 +1090,16 @@ def _cmd_live(args: argparse.Namespace) -> int:
         try:
             viewer.start()
             try:
-                # The run owns the main thread: ``human`` mode opens the game
-                # window, which is this command's point and is not optional.
+                # The run owns the main thread (see the docstring for both
+                # reasons). The sink is handed over whatever the mode is: that is
+                # what makes ``--no-window`` leave the page with the game.
                 _play(
                     settings,
                     journal_path,
                     artifacts_dir=artifacts_dir,
                     max_ticks=args.max_ticks,
-                    render_mode="human",
+                    render_mode=None if args.no_window else "human",
+                    on_frame=live_frame.publish,
                 )
             except KeyboardInterrupt:
                 # The run was still going when the interrupt arrived, which is what
@@ -1295,6 +1345,16 @@ def _build_parser() -> argparse.ArgumentParser:
         "--no-open",
         action="store_true",
         help="print the URL but do not open a browser window",
+    )
+    # A different window from ``--no-open``'s, so the help says which one each
+    # turns off: this is the native game window, that one is the browser.
+    live.add_argument(
+        "--no-window",
+        action="store_true",
+        help=(
+            "play without the native game window; the live page still shows the "
+            "game, at the page's own refresh rate"
+        ),
     )
     live.set_defaults(handler=_cmd_live)
 

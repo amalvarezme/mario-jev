@@ -108,15 +108,23 @@ THREADED_POLL_S = 0.05
 #: somehow does not cannot hang the process trying to shut down.
 THREADED_JOIN_TIMEOUT_S = 2.0
 #: The startup lines. Two pages, two second lines: `serve` answers the run's
-#: evidence, `live` answers the decision board beside the game window, and each
+#: evidence, `live` answers the decision board that carries the game, and each
 #: says which one it is rather than one sentence pretending to fit both.
 REPORT_STARTUP_NOTE = (
     "this is the run's evidence, not the game: the loop advances one frame per "
     "tick, so the page grows at the tick rate, not at 60 fps"
 )
+#: The live line says only what holds in **both** modes. It used to assert that
+#: "the game plays in its own window at 60 fps", which ``--no-window`` makes
+#: false -- that mode opens no window at all -- and it used to say "not the
+#: game", which the two-column board makes false the other way, since the board
+#: now carries the game. What survives either mode is the pair of rates, so that
+#: is all this claims; the native window, when there is one, is still the only
+#: 60 fps view, and the page's own copy says so where the game is.
 LIVE_STARTUP_NOTE = (
-    "this is the decision board, not the game: the game plays in its own window "
-    "at 60 fps, and this page refreshes at the decision tick rate, not at 60 fps"
+    "this is the decision board with the game beside it: the game frame is "
+    "polled and the panel refreshes at the decision tick rate, so neither is "
+    "60 fps; a native game window, when one is open, is the 60 fps view"
 )
 #: Content types named for the artifact kinds this project writes. Anything else
 #: is served as bytes: the extension is the only claim the viewer can check.

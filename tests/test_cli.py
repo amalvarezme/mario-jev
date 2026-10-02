@@ -15,13 +15,16 @@ is escaped so it cannot inject markup.
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import socket
 import threading
 from pathlib import Path
 from typing import Callable
 
+import numpy as np
 import pytest
+from PIL import Image
 
 from mario_jev import cli
 from mario_jev.dashboard import build_html, render_text
@@ -2178,9 +2181,35 @@ def _live_play(events: list[str] | None = None):
         max_ticks=None,
         observer=None,
         render_mode=None,
+        on_frame=None,
     ):
         if events is not None:
             events.append("play")
+        return None
+
+    return play
+
+
+def _capturing_play(seen: dict[str, object]):
+    """A ``_play`` stand-in that keeps the two display keywords it was handed.
+
+    ``on_frame`` is kept as the callable itself, not as a flag that one arrived:
+    the wiring tests call it, which is the only way to tell the command's sink
+    from any other callable that happens to be in that slot.
+    """
+
+    def play(
+        settings,
+        journal_path,
+        *,
+        artifacts_dir,
+        max_ticks=None,
+        observer=None,
+        render_mode=None,
+        on_frame=None,
+    ):
+        seen["render_mode"] = render_mode
+        seen["on_frame"] = on_frame
         return None
 
     return play
@@ -2226,6 +2255,7 @@ def test_live_builds_the_run_with_the_human_render_mode(monkeypatch, tmp_path) -
         max_ticks=None,
         observer=None,
         render_mode=None,
+        on_frame=None,
     ):
         seen["render_mode"] = render_mode
         return None
@@ -2243,8 +2273,151 @@ def test_live_builds_the_run_with_the_human_render_mode(monkeypatch, tmp_path) -
     )
 
     assert code == 0
-    # The game window is the point of the command and is not optional: the run is
-    # always built in ``human`` mode.
+    # The window is the default because it is the only 60 fps view of the run;
+    # ``--no-window`` is what makes it optional, and it was not given here.
+    assert seen["render_mode"] == "human"
+
+
+def test_live_no_window_plays_the_run_headless(monkeypatch, tmp_path) -> None:
+    _install_live_viewer(monkeypatch)
+    _live_env(monkeypatch)
+    seen: dict[str, object] = {}
+    monkeypatch.setattr(cli, "_play", _capturing_play(seen))
+
+    code = cli.main(
+        [
+            "live",
+            "--journal",
+            str(tmp_path / "live.jsonl"),
+            "--artifacts-dir",
+            str(tmp_path / "artifacts"),
+            "--no-window",
+        ]
+    )
+
+    assert code == 0
+    # No native window at all, and the sink is still handed down: the page keeps
+    # the game even when nothing is drawn locally.
+    assert seen["render_mode"] is None
+    assert callable(seen["on_frame"])
+
+
+def test_live_gives_the_page_a_frame_source_before_the_run_publishes(
+    monkeypatch, tmp_path
+) -> None:
+    viewer_type = _install_live_viewer(monkeypatch)
+    _live_env(monkeypatch)
+    sources: list[object] = []
+
+    def fake_play(settings, journal_path, **options):
+        # Read inside the run, which is the first instant a browser could poll:
+        # the route must already have its source and must answer honestly that
+        # no frame exists yet, rather than have no source and answer 404.
+        sources.append(viewer_type.instances[0].options["frame_source"]())
+        return None
+
+    monkeypatch.setattr(cli, "_play", fake_play)
+
+    code = cli.main(
+        [
+            "live",
+            "--journal",
+            str(tmp_path / "live.jsonl"),
+            "--artifacts-dir",
+            str(tmp_path / "artifacts"),
+        ]
+    )
+
+    assert code == 0
+    assert sources == [None]
+
+
+def test_live_connects_the_runs_frames_to_the_pages_frame_route(
+    monkeypatch, tmp_path
+) -> None:
+    viewer_type = _install_live_viewer(monkeypatch)
+    _live_env(monkeypatch)
+    seen: dict[str, object] = {}
+    monkeypatch.setattr(cli, "_play", _capturing_play(seen))
+
+    code = cli.main(
+        [
+            "live",
+            "--journal",
+            str(tmp_path / "live.jsonl"),
+            "--artifacts-dir",
+            str(tmp_path / "artifacts"),
+        ]
+    )
+
+    assert code == 0
+    on_frame = seen["on_frame"]
+    frame_source = viewer_type.instances[0].options["frame_source"]
+    assert callable(on_frame) and callable(frame_source)
+    assert frame_source() is None
+
+    frame = np.zeros((4, 6, 3), dtype=np.uint8)
+    frame[1, 2] = (10, 20, 30)
+    on_frame(frame)
+
+    # The round trip is the assertion that matters: two callables being present
+    # proves nothing, and only a frame published through the run's end and read
+    # back through the page's end proves they are the ends of one sink.
+    png = frame_source()
+    assert png is not None
+    assert png[:8] == b"\x89PNG\r\n\x1a\n"
+    decoded = np.asarray(Image.open(io.BytesIO(png)).convert("RGB"))
+    assert np.array_equal(decoded, frame)
+
+
+def test_live_no_window_still_opens_the_browser(monkeypatch, tmp_path) -> None:
+    viewer_type = _install_live_viewer(monkeypatch)
+    _live_env(monkeypatch)
+    opened: list[str] = []
+    seen: dict[str, object] = {}
+    monkeypatch.setattr(cli, "_play", _capturing_play(seen))
+    monkeypatch.setattr(cli, "_open_browser", lambda url: opened.append(url) or True)
+
+    code = cli.main(
+        [
+            "live",
+            "--journal",
+            str(tmp_path / "live.jsonl"),
+            "--artifacts-dir",
+            str(tmp_path / "artifacts"),
+            "--no-window",
+        ]
+    )
+
+    assert code == 0
+    # The flags name different windows and neither implies the other: closing the
+    # game window leaves the browser exactly as it was.
+    assert seen["render_mode"] is None
+    assert opened == [viewer_type.LIVE_URL]
+
+
+def test_live_no_open_keeps_the_native_game_window(monkeypatch, tmp_path) -> None:
+    _install_live_viewer(monkeypatch)
+    _live_env(monkeypatch)
+    opened: list[str] = []
+    seen: dict[str, object] = {}
+    monkeypatch.setattr(cli, "_play", _capturing_play(seen))
+    monkeypatch.setattr(cli, "_open_browser", lambda url: opened.append(url) or True)
+
+    code = cli.main(
+        [
+            "live",
+            "--journal",
+            str(tmp_path / "live.jsonl"),
+            "--artifacts-dir",
+            str(tmp_path / "artifacts"),
+            "--no-open",
+        ]
+    )
+
+    assert code == 0
+    # The other direction of the same independence.
+    assert opened == []
     assert seen["render_mode"] == "human"
 
 
@@ -2261,6 +2434,7 @@ def test_live_flags_reach_the_viewer_and_the_run(monkeypatch, tmp_path) -> None:
         max_ticks=None,
         observer=None,
         render_mode=None,
+        on_frame=None,
     ):
         seen.update(
             stage=settings.stage,
@@ -2368,6 +2542,7 @@ def test_live_abandons_and_stops_a_viewer_on_ctrl_c(monkeypatch, tmp_path, capsy
         max_ticks=None,
         observer=None,
         render_mode=None,
+        on_frame=None,
     ):
         # The run really got going: a readable header and a tick, no trailer. The
         # abandoned sentence is read from that, and from the interrupt.
@@ -2412,6 +2587,7 @@ def test_live_reports_a_failed_run_and_still_stops_the_viewer(
         max_ticks=None,
         observer=None,
         render_mode=None,
+        on_frame=None,
     ):
         (tmp_path / "live.jsonl").write_text(
             '{"kind": "run"}\n{"kind": "tick"}\n', encoding="utf-8"
@@ -2453,6 +2629,7 @@ def test_live_keeps_runs_own_message_for_a_journal_it_cannot_open(
         max_ticks=None,
         observer=None,
         render_mode=None,
+        on_frame=None,
     ):
         raise cli._JournalOpenError("the handle could not be opened")
 
@@ -2513,6 +2690,9 @@ def test_the_live_parser_carries_the_documented_defaults() -> None:
     assert args.port == DEFAULT_PORT
     assert args.bind == DEFAULT_BIND
     assert args.no_open is False
+    # Off by default: the window is the only 60 fps view, so it has to be asked
+    # away rather than asked for.
+    assert args.no_window is False
     assert args.handler is cli._cmd_live
 
 
@@ -2542,6 +2722,25 @@ def test_live_help_names_the_two_deliberate_differences(capsys) -> None:
     assert "(default: artifacts/live.jsonl)" in out
     assert "deliberate differences" in out
     assert "45 seconds" in out
+
+
+def test_live_help_tells_the_two_windows_apart(capsys) -> None:
+    parser = cli._build_parser()
+
+    with pytest.raises(SystemExit) as exit_info:
+        parser.parse_args(["live", "--help"])
+    # argparse wraps help at the terminal width, so the text is compared with its
+    # line breaks collapsed rather than line by line.
+    out = " ".join(capsys.readouterr().out.split())
+
+    assert exit_info.value.code == 0
+    # Two flags, two different windows. Each one's own help has to name the thing
+    # it turns off, or the pair reads as one option spelled twice.
+    assert "--no-open print the URL but do not open a browser window" in out
+    assert (
+        "--no-window play without the native game window; the live page still "
+        "shows the game, at the page's own refresh rate"
+    ) in out
 
 
 # -- the extraction did not change ``run`` ------------------------------------------
@@ -3096,15 +3295,36 @@ def test_build_emulator_carries_the_human_render_mode(monkeypatch) -> None:
     assert emulator.resets == 1
 
 
+def test_build_emulator_carries_the_frame_sink_without_a_window(monkeypatch) -> None:
+    # The last link of the live chain: the builder is the only place the sink can
+    # reach the emulator, and it reaches it with no mode set -- which is what makes
+    # ``--no-window`` a page with the game on it rather than a page with nothing.
+    def build(**options: object) -> _RecordingEmulator:
+        return _RecordingEmulator(**options)
+
+    monkeypatch.setattr(cli, "MarioEmulator", build)
+
+    def sink(frame: object) -> None:
+        """A plain function, so its identity can be followed across the seam."""
+
+    emulator = cli._build_emulator(cli.Settings.load({}), on_frame=sink)
+
+    assert emulator.options["on_frame"] is sink
+    assert emulator.options["render_mode"] is None
+    assert emulator.resets == 1
+
+
 def test_play_threads_a_render_mode_to_the_emulator_builder(monkeypatch, tmp_path) -> None:
     # ``_play`` is the only caller of the builder, so this is where the mode
     # crosses from the command into the emulator. The wrapped emulator stays
     # headless: the mode is recorded, never opened.
     recorded: list[object] = []
+    sinks: list[object] = []
     real_build = cli._build_emulator
 
-    def record(settings, *, render_mode=None):
+    def record(settings, *, render_mode=None, on_frame=None):
         recorded.append(render_mode)
+        sinks.append(on_frame)
         return _EndingEmulator(real_build(settings), terminate_at=1)
 
     _demo_env(monkeypatch)
@@ -3120,6 +3340,9 @@ def test_play_threads_a_render_mode_to_the_emulator_builder(monkeypatch, tmp_pat
     )
 
     assert recorded == ["human"]
+    # The two display keywords travel the same path and stay independent: asking
+    # for a window asks for no sink.
+    assert sinks == [None]
 
 
 def test_the_run_and_demo_paths_build_a_headless_emulator(monkeypatch, tmp_path) -> None:

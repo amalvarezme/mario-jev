@@ -84,8 +84,14 @@ export JEV_API_KEY="sk_jev_..."
 ```
 
 `mario_jev live` plays the stage in its own window at 60 fps and opens the browser at the live
-decision board (`/live`), which shows what the agent is doing and why. Pass `--no-open` to print the
-address instead of opening a window.
+decision board (`/live`), which shows what the agent is doing and why. The board carries the game
+too, beside the scores: the run publishes every real-timeline frame to a one-slot sink, the page
+polls it at `/live/frame.png`. The page is not 60 fps and says its own rate rather than claiming one
+it does not have; when a native window is open, that window is the 60 fps view.
+
+Two flags turn off two different windows. `--no-open` prints the board's address instead of opening
+a browser. `--no-window` plays headless and lets the page carry the game on its own; the frame sink
+is independent of the native window, so the board stays live either way.
 
 ## Tests
 

@@ -65,10 +65,19 @@ PYTHONPATH=src scripts/jev-env.sh .venv/bin/python -m mario_jev live --max-ticks
 ```
 
 Two windows open. The game plays in its own window at 60 fps, and the browser opens the decision
-board at `/live`; `--no-open` prints that address instead of opening a window. The board shows the
-newest tick's frame, the buttons the agent pressed, the Jev scores with the chosen answer marked, the
-rollout candidates, and the decision with its `reason` — a snapshot at the decision tick rate, not
-60 fps, so a fast run means some refreshes skip ticks. The game window holds 60 fps only while the
+board at `/live`; `--no-open` prints that address instead of opening a window, and `--no-window`
+plays headless and leaves the board as the only view.
+
+The board is two columns. On the left, the decision panel: the buttons the agent pressed, the Jev
+scores with the chosen answer marked, the rollout candidates, and the decision with its `reason` —
+re-fetched about once a second, which is a snapshot at the decision tick rate, so a fast run means
+some refreshes skip ticks. On the right, the game: every real-timeline frame the run produces is
+published to a one-slot sink and polled from `/live/frame.png` at about 70 ms, roughly 14 Hz. That is
+not 60 fps and the page says so where the game is. The polled frame is **not** evidence — it is
+never written to disk and never enters the journal; the recorded per-tick PNGs, perception overlay
+and all, stay in the full report at `/`.
+
+The game window holds 60 fps only while the
 pacing keeps up, and the run's own timing is the record of what the machine really did. Like `demo`,
 `live` writes no summary trailer when it is interrupted, so the readers report that run as **in
 progress**, which is the honest reading and not a claim that it completed.
