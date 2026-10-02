@@ -243,3 +243,58 @@ page carry the game. The default stays the window, which is still the only 60 fp
 |---|---|---|---|
 | G5 | The frame sink, the emulator's per-frame callback, and the route that serves it | `src/mario_jev/live_frame.py` (new), `src/mario_jev/emulator/env.py`, `src/mario_jev/serve.py`, `tests/test_live_frame.py` (new), `tests/test_emulator.py`, `tests/test_serve.py` | a published frame comes back as a PNG that decodes to the same pixels; the callback fires on the reset and on every real-timeline step and never inside `pacer.suspended()`; the route answers `200 image/png` with `no-store` when a frame exists, `404` before one does and when no source is configured; repeated requests for one frame encode it once |
 | G6 | The two-column page with the polling game, `--no-window`, and the docs | `src/mario_jev/dashboard/live.py`, `tests/test_live_view.py`, `src/mario_jev/cli.py`, `tests/test_cli.py`, `README.md`, `docs/EVALUATION.md` | the page carries the panel and the game as one row, the game points at `/live/frame.png`, the script removes the meta refresh and polls, the fallback markup and the no-JavaScript sentence are present, `--no-window` builds a headless emulator while the page stays live, and a real browser check shows the frame changing while the panel keeps its place |
+
+## Closed — commits and the evidence that closed them
+
+| # | Commit | State |
+|---|---|---|
+| G1–G4 | `b98a274`, `8e3913d`, `b50a152`, `7049063`, `00fb53a` | closed earlier |
+| G5 | `3e2a5be` | closed |
+| G6 — the page | `5a26a1a` | closed |
+| G6 — the wiring, the flag, the docs | `76c1720` | closed |
+
+G6 was split in two work units because one commit over six files is a worse
+review than two over three. The split is the page (what it renders) and the
+wiring (what feeds it), which is also the seam the defect sat on.
+
+**The gap the task table did not name.** G5 built the sink, the emulator
+callback and the route; the table's G6 row says nothing about connecting them,
+and nothing did. `_cmd_live` never built a `LiveFrame` and never passed
+`frame_source` to the viewer, so `/live/frame.png` answered 404 on every real
+run. The page would have rendered an empty game column forever. That wiring is
+the substance of `76c1720`.
+
+**Verified by execution** (full suite `735 passed`, 0 skipped — the one
+`live_jev` test really calls the endpoint when the Keychain key is present):
+
+* the route answers 404 with *"no frame has been published yet"* for 817
+  consecutive polls — so the source was wired from the first request and the
+  404s were honest — then flips to 200 at t+0.144 s;
+* `200 image/png` with `Cache-Control: no-store`, decoding to `(240, 256, 3)`,
+  which matches `SCREEN_SHAPE`;
+* three polls a second apart differ, and the differing pixels sit in rows
+  193–208, the ground line where Mario stands, **not** the HUD — so the sprite
+  is animating and the run is advancing, which is the strongest available
+  evidence that the page would show a moving game;
+* the script's cache-busting `?n=` does not break the route;
+* `--no-window` imports zero pyglet under `-X importtime`. nes-py constructs
+  its `ImageViewer` lazily, so that is a precise witness for "no window was
+  ever requested", not merely "no window appeared";
+* the artifacts directory holds exactly the 30 files the journal names and
+  nothing resembling a polled frame: the live frame is not evidence and never
+  touches disk;
+* the `/live` body references exactly two URLs, `/` and `/live/frame.png`, so
+  no recorded `frame_png` path leaks into the page;
+* `live.LIVE_FRAME_URL == serve.LIVE_FRAME_PATH`, and the import runs one way
+  only, so the cycle the docstring claims to avoid is really avoided.
+
+**One defect the verification caught, fixed in `76c1720`.**
+`serve.LIVE_STARTUP_NOTE` asserted "the game plays in its own window at 60 fps"
+— false under the `--no-window` this task added — and "this is the decision
+board, not the game" — false for a board that now carries the game. It now
+claims only the two rates, which hold in both modes.
+
+**Not verified.** No JavaScript engine ever ran the inline script. Its text,
+URLs and constants were checked against the live response, but the decode-then-
+swap behaviour and the panel-subtree replacement are unexercised end to end.
+A browser check is the one piece of G6's stated evidence still outstanding.
