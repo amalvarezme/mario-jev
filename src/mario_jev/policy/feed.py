@@ -83,6 +83,16 @@ or a scored legend naming a level the question never asked about. A record that
 answers *extra* questions the build did not ask is **not** a mismatch: it answers
 the same question whoever asked it.
 
+This is deliberately **stricter** than the live path on one malformed input, and
+it is worth naming because "the same parser" reads as "identical behaviour".
+:meth:`~mario_jev.jev.JevClient._parse` builds its id -> ``type`` map with
+``str(question["type"])``, so a question whose ``type`` is not a string (say the
+number ``3``) is coerced and accepted there; :func:`_asked_expectations` refuses
+that question, because a question it cannot read is not one it can bind a record
+to. The two paths agree on every well-formed question set -- which is every
+question set :func:`~mario_jev.jev.build_questions` builds -- and the feed refuses
+malformed input the live parser would silently coerce.
+
 Refusing is the point. Delivering on a mismatch would journal this build's
 ``questions`` beside a ``response`` that answered someone else's -- evidence whose
 origin is not established, presented as this build's own reasoning -- and an A/B
@@ -223,12 +233,16 @@ def _response_from_record(record: Mapping[str, object]) -> JevResponse:
 def _asked_expectations(
     questions: Mapping[str, Mapping[str, object]],
 ) -> tuple[dict[str, str], dict[str, list[str]]]:
-    """How the live client reads a question set, mirrored exactly.
+    """How the live client reads a question set, with one deliberate exception.
 
     ``JevClient._parse`` turns a question set into an id -> ``type`` map plus, for
     every ``choice`` question keyed by criteria, the candidate names it offered.
-    The feed asks the same of a record, so the two paths agree by construction
-    about what a question expects.
+    The feed asks the same of a record, so the two paths agree about what a
+    well-formed question expects. They do **not** agree on a malformed one: the
+    live parser stringifies ``question["type"]`` and coerces a non-string, while
+    this function refuses it. The feed is the stricter of the two, and that is the
+    honest word for it -- see the module docstring's "Only the question it
+    answers".
 
     Raises:
         JevProtocolError: a question is not an object, or does not carry a string
@@ -310,9 +324,11 @@ def _bind_to_questions(
     """Read a recorded body as the answer to ``questions``, or raise.
 
     The record is read the way the live client reads a reply: the same parser, the
-    same expected ``type`` per asked id, the same choice criteria. So the returned
-    response answers exactly the ids this build asked -- no more, and never fewer --
-    and anything that stops it is a mismatch.
+    same expected ``type`` per asked id, the same choice criteria -- with the one
+    documented difference that the feed refuses a malformed question the live
+    parser would coerce (see the module docstring's "Only the question it
+    answers"). So the returned response answers exactly the ids this build asked
+    -- no more, and never fewer -- and anything that stops it is a mismatch.
 
     Raises:
         JevProtocolError: the asked ids and the recorded answers do not line up --

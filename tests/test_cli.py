@@ -28,6 +28,7 @@ from mario_jev.dashboard import build_html, render_text
 from mario_jev.emulator import StepResult, build_actions
 from mario_jev.jev import HttpResult, JevClient, JevProtocolError
 from mario_jev.journal import Journal, read_journal
+from mario_jev.policy import loop as loop_module
 from mario_jev.serve import DEFAULT_BIND, DEFAULT_PORT
 from mario_jev.state import TerminalOutcome
 from mario_jev.trajectory import CandidateRollout, CostSource, RolloutTable
@@ -272,6 +273,7 @@ def _run_real_journal(
     *,
     max_ticks: int = 3,
     key: str | None = SENTINEL_KEY,
+    name: str = "run.jsonl",
 ) -> tuple[int, Path, Responder]:
     monkeypatch.setenv("MARIO_DECISION_CADENCE", "1")
     if key is None:
@@ -280,7 +282,7 @@ def _run_real_journal(
         monkeypatch.setenv("JEV_API_KEY", key)
     responder = Responder()
     monkeypatch.setattr(cli, "_build_client", lambda settings: _client_with(settings, responder))
-    journal_path = tmp_path / "run.jsonl"
+    journal_path = tmp_path / name
     code = cli.main(
         [
             "run",
@@ -669,6 +671,360 @@ def test_a_close_failure_after_a_run_is_a_diagnosis_not_a_traceback(
     assert "run failed: OSError:" in captured.err
     # The failure never propagated out of the handler.
     assert "Traceback" not in captured.err
+
+
+# -- fed runs: ``run --answers`` ---------------------------------------------------
+
+
+def _fed_transcript(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    max_ticks: int = 4,
+    name: str = "transcript.jsonl",
+) -> Path:
+    """A real journal, with real applied answers, that a fed run can replay."""
+    code, journal_path, _ = _run_real_journal(
+        monkeypatch, tmp_path, max_ticks=max_ticks, name=name
+    )
+    assert code == 0
+    recorded = read_journal(journal_path)
+    assert recorded.summary["answers_applied"] >= 1
+    return journal_path
+
+
+def _explode(*args: object, **kwargs: object) -> object:
+    raise AssertionError("a fed run must not build or enter a Jev client")
+
+
+class _ExplodingJevClient:
+    """A ``JevClient`` stand-in that fails if the loop ever builds one."""
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        raise AssertionError("a fed run must not construct a JevClient")
+
+    @classmethod
+    def from_settings(cls, *args: object, **kwargs: object) -> object:
+        raise AssertionError("a fed run must not construct a JevClient")
+
+
+def test_run_answers_replays_the_transcript_without_building_or_entering_a_client(
+    monkeypatch, capsys, tmp_path
+) -> None:
+    transcript = _fed_transcript(monkeypatch, tmp_path, max_ticks=4)
+    capsys.readouterr()  # drop the transcript run's own report
+
+    # A fed run needs no credential -- the answers are the transcript's -- so the
+    # key is unset, and every route to a client is made fatal. If the flag fell
+    # back to a live run, one of these would fire instead of replaying.
+    monkeypatch.delenv("JEV_API_KEY", raising=False)
+    monkeypatch.setattr(cli, "_build_client", _explode)
+    monkeypatch.setattr(loop_module, "JevClient", _ExplodingJevClient)
+
+    journal_path = tmp_path / "fed.jsonl"
+    code = cli.main(
+        [
+            "run",
+            "--answers",
+            str(transcript),
+            "--journal",
+            str(journal_path),
+            "--artifacts-dir",
+            str(tmp_path / "fed-artifacts"),
+            "--fast",
+            # Bounded for the same reason every other ``run`` test is bounded: a
+            # fed run replays the answers it was given and then keeps going on the
+            # no-answer fallback, exactly as a live run does, so without a limit it
+            # would play 1-1 to its end and the test would never finish.
+            "--max-ticks",
+            "8",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert code == 0
+    journal = read_journal(journal_path)
+    assert journal.ticks
+    # Every tick carries the stamp: its ``jev_call_ms`` is the transcript's
+    # recorded latency, never a measurement of this machine.
+    assert all("transcript_answers" in tick["degradations"] for tick in journal.ticks)
+    assert journal.run["settings"]["answers_journal"] == str(transcript)
+    # No credential: the no-key fallback never ran, because the transcript answered.
+    assert "fallback_no_key" not in captured.out
+    assert f"fed run from {transcript}" in captured.out
+
+
+def test_run_answers_missing_transcript_fails_and_never_falls_back(
+    monkeypatch, capsys, tmp_path
+) -> None:
+    monkeypatch.delenv("JEV_API_KEY", raising=False)
+    # Both collaborators are made fatal: if the refusal were skipped, the run
+    # would start here and the test would fail loudly rather than go live.
+    monkeypatch.setattr(cli, "_build_client", _explode)
+    monkeypatch.setattr(cli, "_build_emulator", _explode)
+    journal_path = tmp_path / "never.jsonl"
+
+    code = cli.main(
+        [
+            "run",
+            "--answers",
+            str(tmp_path / "absent.jsonl"),
+            "--journal",
+            str(journal_path),
+            "--fast",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert code == 1
+    assert "transcript not found" in captured.err
+    assert captured.out == ""
+    assert not journal_path.exists()
+
+
+def test_run_answers_unreadable_transcript_fails(monkeypatch, capsys, tmp_path) -> None:
+    monkeypatch.setattr(cli, "_build_emulator", _explode)
+    broken = tmp_path / "broken.jsonl"
+    broken.write_text('{"kind": "run"}\nnot valid json\n', encoding="utf-8")
+
+    code = cli.main(
+        ["run", "--answers", str(broken), "--journal", str(tmp_path / "j.jsonl"), "--fast"]
+    )
+    captured = capsys.readouterr()
+
+    assert code == 1
+    assert "transcript is unreadable" in captured.err
+    assert captured.out == ""
+
+
+def test_run_answers_transcript_without_applied_answers_fails(
+    monkeypatch, capsys, tmp_path
+) -> None:
+    monkeypatch.setattr(cli, "_build_emulator", _explode)
+    transcript = _write_journal(
+        tmp_path / "empty.jsonl",
+        _journal((_tick(0, source="fallback_no_key"),)),
+    )
+
+    code = cli.main(
+        [
+            "run",
+            "--answers",
+            str(transcript),
+            "--journal",
+            str(tmp_path / "j.jsonl"),
+            "--fast",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert code == 1
+    assert "holds no applied answers" in captured.err
+    assert captured.out == ""
+
+
+def test_the_run_header_marks_a_fed_run_and_leaves_a_live_header_alone(
+    monkeypatch, capsys, tmp_path
+) -> None:
+    live_code, live_path, _ = _run_real_journal(
+        monkeypatch, tmp_path, max_ticks=2, name="live.jsonl"
+    )
+    assert live_code == 0
+    capsys.readouterr()
+    live = read_journal(live_path)
+    # This is what makes the addition safe for every existing journal: a live run
+    # gets no such key at all, not a null one.
+    assert "answers_journal" not in live.run["settings"]
+
+    transcript = _fed_transcript(monkeypatch, tmp_path, max_ticks=3, name="transcript.jsonl")
+    capsys.readouterr()
+    fed_path = tmp_path / "fed.jsonl"
+    fed_code = cli.main(
+        [
+            "run",
+            "--answers",
+            str(transcript),
+            "--journal",
+            str(fed_path),
+            "--artifacts-dir",
+            str(tmp_path / "a"),
+            "--fast",
+            "--max-ticks",
+            "2",
+        ]
+    )
+    assert fed_code == 0
+    capsys.readouterr()
+    fed = read_journal(fed_path)
+
+    assert fed.run["settings"]["answers_journal"] == str(transcript)
+    # The transcript path is the only header key a fed run adds: the header still
+    # describes the same run, with the source of its answers named.
+    assert set(fed.run["settings"]) - set(live.run["settings"]) == {"answers_journal"}
+
+
+def test_a_fed_run_prints_the_transcript_counts_beside_its_own(
+    monkeypatch, capsys, tmp_path
+) -> None:
+    transcript = _fed_transcript(monkeypatch, tmp_path, max_ticks=6, name="long.jsonl")
+    capsys.readouterr()
+    recorded = read_journal(transcript)
+
+    fed_path = tmp_path / "short.jsonl"
+    code = cli.main(
+        [
+            "run",
+            "--answers",
+            str(transcript),
+            "--journal",
+            str(fed_path),
+            "--artifacts-dir",
+            str(tmp_path / "a"),
+            "--fast",
+            "--max-ticks",
+            "3",
+        ]
+    )
+    out = capsys.readouterr().out
+    assert code == 0
+    fed = read_journal(fed_path)
+
+    assert (
+        f"transcript recorded: {recorded.summary['decisions']} calls fired, "
+        f"{recorded.summary['answers_applied']} answers applied"
+    ) in out
+    assert (
+        f"this run: {fed.summary['decisions']} calls fired, "
+        f"{fed.summary['answers_applied']} answers applied"
+    ) in out
+    # Firing fewer calls than the transcript holds is the silent case: the unused
+    # tail is never asked for, so no tick records mismatch or exhaustion. Only the
+    # printed counts show that the alignment is now an assumption.
+    assert fed.summary["degradations"].get("answers_exhausted", 0) == 0
+    assert fed.summary["degradations"].get("transcript_mismatch", 0) == 0
+
+
+def test_the_fidelity_line_separates_the_recordings_fired_and_applied_counts(
+    tmp_path, capsys
+) -> None:
+    # A recording with a call that fired and then failed: it left a ``jev_call_ms``
+    # but no response, so it has no slot in the transcript. The recording's fired
+    # count and its applied count therefore differ -- the misalignment the fidelity
+    # line exists to make visible without reading the source.
+    fired_only = _tick(0, source="fallback_degraded", jev_called=True, jev_call_ms=9.0)
+    applied = _tick(
+        1,
+        source="jev",
+        action="right",
+        confidence=0.9,
+        jev_called=True,
+        probabilities={"right": 0.7, "NOOP": 0.3},
+        choice="right",
+        jev_latency=3.0,
+    )
+    response = applied["response"]
+    assert isinstance(response, dict)
+    response["answers"] = {
+        "best_action": {
+            "type": "choice",
+            "choice": "right",
+            "confidence": 0.9,
+            "probabilities": {"right": 0.7, "NOOP": 0.3},
+        },
+        "risk": {
+            "type": "score",
+            "score": 0.2,
+            "confidence": 0.9,
+            "legend": {"0": "safe"},
+            "probabilities": {"0": 1.0},
+        },
+        "lethal_ahead": {"type": "noul", "noul": 0.1},
+        "gap_severity": {
+            "type": "score",
+            "score": 0.0,
+            "confidence": 0.9,
+            "legend": {"0": "no gap"},
+            "probabilities": {"0": 1.0},
+        },
+    }
+    transcript = _write_journal(tmp_path / "mixed.jsonl", _journal((fired_only, applied)))
+
+    code = cli.main(
+        [
+            "run",
+            "--answers",
+            str(transcript),
+            "--journal",
+            str(tmp_path / "fed.jsonl"),
+            "--artifacts-dir",
+            str(tmp_path / "a"),
+            "--fast",
+            "--max-ticks",
+            "1",
+        ]
+    )
+    out = capsys.readouterr().out
+
+    assert code == 0
+    assert "transcript recorded: 2 calls fired, 1 answers applied" in out
+    assert "note: the recording fired 2 calls and this run fired" in out
+
+
+def test_run_answers_with_a_measured_horizon_warns_it_is_not_reproducible(
+    monkeypatch, capsys, tmp_path
+) -> None:
+    transcript = _fed_transcript(monkeypatch, tmp_path, max_ticks=2, name="t.jsonl")
+    capsys.readouterr()
+    monkeypatch.delenv("MARIO_ROLLOUT_COST_SOURCE", raising=False)
+
+    code = cli.main(
+        [
+            "run",
+            "--answers",
+            str(transcript),
+            "--journal",
+            str(tmp_path / "fed.jsonl"),
+            "--artifacts-dir",
+            str(tmp_path / "a"),
+            "--fast",
+            "--max-ticks",
+            "2",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert "measured cost source" in captured.err
+    assert "not reproducible" in captured.err
+
+
+def test_run_answers_with_a_fixed_horizon_does_not_warn_about_the_machine(
+    monkeypatch, capsys, tmp_path
+) -> None:
+    monkeypatch.setenv("MARIO_ROLLOUT_COST_SOURCE", "fixed")
+    monkeypatch.setenv("MARIO_ROLLOUT_FIXED_BASE_MS", "0.5")
+    monkeypatch.setenv("MARIO_ROLLOUT_FIXED_PER_FRAME_MS", "1.1")
+    transcript = _fed_transcript(monkeypatch, tmp_path, max_ticks=2, name="t.jsonl")
+    capsys.readouterr()
+
+    code = cli.main(
+        [
+            "run",
+            "--answers",
+            str(transcript),
+            "--journal",
+            str(tmp_path / "fed.jsonl"),
+            "--artifacts-dir",
+            str(tmp_path / "a"),
+            "--fast",
+            "--max-ticks",
+            "2",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert "measured cost source" not in captured.err
 
 
 # 4. dashboard ---------------------------------------------------------------------

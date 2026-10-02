@@ -9,7 +9,11 @@ broken configuration becomes an actionable message, not a traceback.
 * ``run`` plays the stage with the real emulator and the Jev client, records a
   journal, and prints the report for the run it just wrote. It works with no
   credential (degrading to ``fallback_no_key`` on every tick) and with no
-  advisor, and it stops cleanly when the episode ends.
+  advisor, and it stops cleanly when the episode ends. With ``--answers`` it is
+  instead driven from a recorded transcript: the same emulator and planner run
+  live, but every Jev answer comes from the transcript, so no socket is opened,
+  no worker thread starts, and the run header names the journal its answers came
+  from.
 * ``replay`` reads a journal and prints the report. It constructs no client, no
   emulator and no planner, and touches no network; replaying the same file twice
   is byte-identical.
@@ -36,9 +40,9 @@ import platform
 import sys
 import threading
 import webbrowser
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Callable, Mapping, Sequence
 
 from mario_jev.advisor import PlayJevAdvisor
 from mario_jev.config import Settings, redact_url_userinfo
@@ -46,7 +50,13 @@ from mario_jev.dashboard import render_text, write_html
 from mario_jev.emulator import MarioEmulator
 from mario_jev.jev import JevClient, JevError
 from mario_jev.journal import JournalFormatError, JournalWriter, read_journal
-from mario_jev.policy import ExecutionLoop, RunSummary, TickRecord
+from mario_jev.policy import (
+    ExecutionLoop,
+    RecordedAnswerFeed,
+    RunSummary,
+    TickRecord,
+    recorded_answers_from_ticks,
+)
 from mario_jev.serve import DEFAULT_BIND, DEFAULT_PORT
 from mario_jev.serve import serve as serve_journal
 from mario_jev.trajectory import TrajectoryPlanner
@@ -248,6 +258,10 @@ def _apply_overrides(settings: Settings, args: argparse.Namespace) -> Settings:
         changes["artifacts_dir"] = Path(args.artifacts_dir)
     if getattr(args, "seed", None) is not None:
         changes["seed"] = args.seed
+    if getattr(args, "answers", None) is not None:
+        # The flag wins over ``MARIO_ANSWERS_JOURNAL``: ``Settings.load`` already
+        # read the environment, and this is the operator asking for this file.
+        changes["answers_journal"] = Path(args.answers)
     if not changes:
         return settings
     updated = replace(settings, **changes)
@@ -270,6 +284,169 @@ class _JournalOpenError(OSError):
     """
 
 
+#: The value a fed run substitutes for ``Settings.jev_api_key`` when the operator
+#: configured none. ``ExecutionLoop`` fires a call only when ``settings.jev_available``
+#: is true, and a fed run's call is answered by the transcript, so without a value
+#: here the run would never fire and the transcript would never be replayed -- the
+#: exact silent non-replay ``--answers`` exists to prevent. It is not a credential
+#: and never reaches one: a fed run builds no client at all. The journal's header
+#: records the operator's own settings, so a no-key fed run still reads
+#: ``jev_available: false`` there and names its source under ``answers_journal``.
+TRANSCRIPT_CREDENTIAL = "transcript-answers"
+
+
+class _TranscriptError(OSError):
+    """The ``--answers`` journal cannot drive a run.
+
+    An ``OSError`` like the file failures it wraps, so ``demo``'s existing
+    ``except (JevError, OSError)`` reports a bad transcript as a failed run rather
+    than letting it escape a daemon thread; ``run`` catches it first and gives it a
+    message of its own. Nothing here ever falls back to a live call: the whole
+    point of the check is that a fed run either replays a transcript or stops.
+    """
+
+
+class _UnenteredClient:
+    """The stand-in ``ExecutionLoop`` stores as its client on a fed run.
+
+    ``ExecutionLoop`` keeps a ``client`` attribute but only ever hands it to the
+    dispatcher it builds *itself*; with a recorded-answer feed injected as the call
+    source the loop never reads it. A fed run must enter no client and open no
+    socket, so the CLI passes this object rather than letting
+    ``JevClient.from_settings`` build the real one: any attribute access raises,
+    which makes "the client was entered after all" a loud failure instead of a
+    silent live call. The loop types that slot as ``JevClient``; this object is
+    passed precisely because the slot is never reached, and the test that makes
+    every client factory raise is what keeps that true.
+    """
+
+    __slots__ = ()
+
+    def __getattr__(self, name: str) -> object:
+        raise AssertionError(
+            "a fed run must not enter a Jev client; the answers come from the "
+            f"transcript, and something reached for client.{name}"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _FedRun:
+    """A validated transcript, the feed built from it, and the transcript's counts.
+
+    ``calls_fired`` and ``answers_applied`` are read from the transcript's own
+    bytes: the first counts its tick lines whose ``decision.jev_called`` is true,
+    the second counts its tick lines that carry a non-null ``response`` -- exactly
+    the lines :func:`recorded_answers_from_ticks` keeps. They are kept here because
+    a fed run's summary counts *this* run, and a reader comparing the two run's
+    numbers needs the transcript's beside them.
+    """
+
+    feed: RecordedAnswerFeed
+    path: Path
+    calls_fired: int
+    answers_applied: int
+
+
+def _load_fed_run(path: object) -> _FedRun:
+    """Read and validate the ``--answers`` transcript, or fail with a clear reason.
+
+    Three things make a transcript unusable, and each is refused *before* the run
+    starts, because a fed run that quietly does nothing -- or, worse, falls back to
+    a live call -- is the failure this flag exists to prevent:
+
+    * the path does not exist;
+    * it cannot be read, or is not a finished, well-formed journal (the strict
+      reader is used, so a transcript without its summary trailer is refused);
+    * it holds no applied answers -- every tick line has a ``null`` response, so
+      there is nothing to replay and the feed would refuse every call.
+
+    A transcript that holds *some* answers but runs out mid-run is a different case
+    and is not refused here: the feed records ``answers_exhausted`` on the tick that
+    tried, and the fidelity line printed after the run shows the transcript's
+    counts beside the run's.
+    """
+    try:
+        journal = read_journal(path)
+    except FileNotFoundError as exc:
+        raise _TranscriptError(f"transcript not found: {path}") from exc
+    except JournalFormatError as exc:
+        raise _TranscriptError(f"transcript is unreadable: {exc}") from exc
+    except OSError as exc:
+        raise _TranscriptError(f"cannot read transcript {path}: {exc}") from exc
+    try:
+        answers = recorded_answers_from_ticks(journal.ticks)
+        feed = RecordedAnswerFeed(answers)
+    except (ValueError, JevError) as exc:
+        # A line that carries a response but loses its ``answer_age_ticks`` or
+        # ``jev_call_ms``, or a response body the parser refuses. A fabricated
+        # latency or a guessed answer would be worse than a refused transcript.
+        raise _TranscriptError(f"transcript {path} is malformed: {exc}") from exc
+    if not answers:
+        raise _TranscriptError(
+            f"transcript {path} holds no applied answers: every tick line has a "
+            "null response, so there is nothing to replay"
+        )
+    fired = 0
+    for tick in journal.ticks:
+        decision = tick.get("decision")
+        if isinstance(decision, Mapping) and decision.get("jev_called"):
+            fired += 1
+    return _FedRun(
+        feed=feed,
+        path=Path(path),
+        calls_fired=fired,
+        answers_applied=len(answers),
+    )
+
+
+def _summary_count(summary: object, key: str) -> object:
+    """A summary count, or the words the readers use when it was not recorded."""
+    if isinstance(summary, Mapping):
+        value = summary.get(key)
+        if value is not None:
+            return value
+    return "not recorded"
+
+
+def _fidelity_report(fed: _FedRun, journal: object) -> str:
+    """The transcript's own counts beside this run's, so a misalignment is visible.
+
+    A transcript is built from the tick lines that **applied** an answer, because
+    only those carry a ``response``. A call the recording fired but could not apply
+    -- it failed, or its answer arrived too stale to use -- has no slot in the
+    transcript, so the k-th recorded answer is the k-th answer the recording
+    *applied*, not the k-th call it *fired*. A replay that fires its k-th call on a
+    different tick can therefore receive another original call's answer, and when
+    the replay fires **fewer** calls than the transcript holds the unused tail is
+    never asked for: no mismatch and no exhaustion signal fires. That silent case is
+    why these numbers are printed rather than left to the source.
+
+    What a reader compares: ``transcript recorded`` against ``this run``. The
+    transcript's two counts coming apart says the recording itself lost calls
+    between firing and applying; the two fired counts coming apart says the replay
+    asked a different number of questions. Either makes the positional alignment an
+    assumption rather than a fact, and neither is named by any degradation on the
+    ticks.
+    """
+    summary = getattr(journal, "summary", None)
+    run_fired = _summary_count(summary, "decisions")
+    run_applied = _summary_count(summary, "answers_applied")
+    lines = [
+        f"fed run from {fed.path}: this run's answers came from the transcript, "
+        "not the API",
+        f"  transcript recorded: {fed.calls_fired} calls fired, "
+        f"{fed.answers_applied} answers applied",
+        f"  this run: {run_fired} calls fired, {run_applied} answers applied",
+    ]
+    if fed.calls_fired != run_fired:
+        lines.append(
+            f"  note: the recording fired {fed.calls_fired} calls and this run "
+            f"fired {run_fired}, so the k-th recorded answer need not be the k-th "
+            "original call, and that misalignment is recorded nowhere else"
+        )
+    return "\n".join(lines)
+
+
 def _play(
     settings: Settings,
     journal_path: object,
@@ -277,6 +454,7 @@ def _play(
     artifacts_dir: object | None,
     max_ticks: int | None = None,
     observer: Callable[[TickRecord], None] | None = None,
+    fed: _FedRun | None = None,
 ) -> RunSummary:
     """Play one run into ``journal_path`` and return its summary.
 
@@ -288,7 +466,23 @@ def _play(
     ``observer`` replaces the journal's own per-tick writer when given; ``None``
     keeps that writer, which is what both commands want. ``max_ticks`` overrides
     ``settings.max_ticks`` for the loop, as it does for ``run``.
+
+    ``fed`` drives the run from a transcript instead of the live client: the loop's
+    call source is the feed and its ``client`` slot holds :class:`_UnenteredClient`,
+    so no client is built and none can be entered. When ``fed`` is ``None`` but
+    ``settings.answers_journal`` is set, the transcript is read and validated here
+    -- ``run`` pre-reads it so it can print its own refusal, and ``demo`` (which has
+    no ``--answers`` flag but honours the environment) reaches this branch.
+
+    The header is written from ``settings``, never from the ``loop_settings``
+    below: a fed run with no credential still records ``jev_available: false`` and
+    names its transcript under ``answers_journal``. The loop receives a substituted
+    credential only because it refuses to fire a call when none is configured, and
+    a fed run's call is answered by the transcript; the value reaches no client,
+    because a fed run builds none.
     """
+    if fed is None and settings.answers_journal is not None:
+        fed = _load_fed_run(settings.answers_journal)
     try:
         writer = JournalWriter(
             journal_path, settings=settings, artifacts_dir=artifacts_dir
@@ -300,12 +494,27 @@ def _play(
         emulator = None
         try:
             emulator = _build_emulator(settings)
+            loop_settings = settings
+            if fed is None:
+                client = _build_client(settings)
+                dispatcher = None
+            else:
+                # A fed run opens no socket and enters no client. Any attempt to
+                # reach one through this stand-in raises instead of quietly
+                # calling Jev, which is the guarantee the flag exists to make.
+                client = _UnenteredClient()
+                if not settings.jev_available:
+                    loop_settings = replace(
+                        settings, jev_api_key=TRANSCRIPT_CREDENTIAL
+                    )
+                dispatcher = fed.feed
             loop = ExecutionLoop(
-                settings,
+                loop_settings,
                 emulator=emulator,
-                planner=_build_planner(settings),
-                client=_build_client(settings),
-                advisor=_build_advisor(settings),
+                planner=_build_planner(loop_settings),
+                client=client,
+                advisor=_build_advisor(loop_settings),
+                dispatcher=dispatcher,
             )
             summary = loop.run(
                 max_ticks=max_ticks,
@@ -330,7 +539,31 @@ def _cmd_run(args: argparse.Namespace) -> int:
     journal_path = Path(args.journal)
     artifacts_dir = Path(settings.artifacts_dir)
 
-    if not settings.jev_available:
+    # A fed run is validated before anything is written, so a bad transcript
+    # cannot leave a half-started journal behind or, worse, let the run proceed
+    # against the live client. ``_play`` re-checks only when ``run`` did not pass
+    # a feed; here the check is what produces this command's message.
+    fed: _FedRun | None = None
+    if settings.answers_journal is not None:
+        try:
+            fed = _load_fed_run(settings.answers_journal)
+        except _TranscriptError as exc:
+            print(f"cannot replay recorded answers: {exc}", file=sys.stderr)
+            return 1
+        if settings.rollout_cost_source != "fixed":
+            # The flag replays the answers; it does not make the horizon
+            # clock-free. A user could otherwise believe the flag alone bought
+            # reproducibility and get two runs that differ in the horizon.
+            print(
+                "warning: --answers replays the recorded Jev answers, but the "
+                "rollout horizon still comes from the measured cost source, so it "
+                "still follows this machine and two such runs are not "
+                "reproducible. Also set MARIO_ROLLOUT_COST_SOURCE=fixed with "
+                "MARIO_ROLLOUT_FIXED_BASE_MS and MARIO_ROLLOUT_FIXED_PER_FRAME_MS "
+                "to make the horizon clock-free",
+                file=sys.stderr,
+            )
+    elif not settings.jev_available:
         print(
             "warning: no JEV_API_KEY is configured; every decision will use the "
             "local fallback (fallback_no_key) and no Jev request will be sent",
@@ -338,9 +571,12 @@ def _cmd_run(args: argparse.Namespace) -> int:
         )
 
     try:
-        _play(settings, journal_path, artifacts_dir=artifacts_dir)
+        _play(settings, journal_path, artifacts_dir=artifacts_dir, fed=fed)
     except _JournalOpenError as exc:
         print(f"cannot open journal {journal_path}: {exc}", file=sys.stderr)
+        return 1
+    except _TranscriptError as exc:
+        print(f"cannot replay recorded answers: {exc}", file=sys.stderr)
         return 1
     except (JevError, OSError) as exc:
         print(f"run failed: {type(exc).__name__}: {exc}", file=sys.stderr)
@@ -352,6 +588,13 @@ def _cmd_run(args: argparse.Namespace) -> int:
         print(f"the journal just written could not be read back: {exc}", file=sys.stderr)
         return 1
     print(render_text(journal))
+    if fed is not None:
+        # The fidelity counts go beside the report, not inside it: the dashboard
+        # is a separate, read-only reader, and this is the surface a ``run`` user
+        # actually sees. A fed run that replayed a misaligned transcript must be
+        # visible here without anyone opening the source.
+        print()
+        print(_fidelity_report(fed, journal))
     return 0
 
 
@@ -567,7 +810,7 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     journal_path = Path(args.journal)
     artifacts_dir = Path(settings.artifacts_dir)
 
-    if not settings.jev_available:
+    if settings.answers_journal is None and not settings.jev_available:
         print(
             "warning: no JEV_API_KEY is configured; every decision will use the "
             "local fallback (fallback_no_key) and no Jev request will be sent",
@@ -703,6 +946,15 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument(
         "--artifacts-dir", default=None, help="directory for per-tick PNG artifacts"
+    )
+    run.add_argument(
+        "--answers",
+        default=None,
+        help=(
+            "replay the recorded Jev answers in this journal instead of calling "
+            "Jev: no network and no worker thread. Every tick is marked "
+            "transcript_answers and the run header names this journal"
+        ),
     )
     pacing = run.add_mutually_exclusive_group()
     pacing.add_argument(

@@ -553,6 +553,98 @@ dashboard redacts what it prints.
   and this API latency produced; the design target of 7.5 Hz remains unreached and, at a 416 ms
   round trip, unreachable without decoupling the call from the tick.
 
+## A reproducible run: what the fed harness proves, and what it does not
+
+Every comparison in this report carries the same excuse, and it is stated twice above: *"the same
+seed does not reproduce the same run"*. Two causes sat behind that, and both had to go before any A/B
+claim could be made.
+
+1. **The horizon was sized from a wall-clock measurement.** `TrajectoryPlanner` calibrates the
+   machine with `perf_counter` and sizes later horizons from what it measured; the same measurement
+   drives the overrun correction and the learning branches. Under load the agent plans a different
+   depth, so it takes different actions.
+2. **Which tick applies an answer was decided by thread timing.** `JevDispatcher.take` never blocks,
+   and the answer is applied on the tick that observes it. Two runs fed the same answers at different
+   wall-clock moments execute different actions -- and one of them can even discard an answer as
+   `jev_stale`.
+
+### What it is for
+
+`mario_jev run --answers <journal>` replays a recorded journal's Jev answers instead of calling the
+API: the feed serves the k-th recorded answer to the k-th fired call after that answer's recorded
+delay in ticks, through the same four members the loop already used on the dispatcher, with **no
+socket and no worker thread**. Combined with `rollout_cost_source=fixed` (a horizon sized from two
+constants, which consults no clock on the horizon path at all), the trajectory becomes a function of
+its inputs.
+
+This is deliberately **not** action replay. Replaying recorded *actions* would prove the emulator
+physics and nothing about the deciding build -- the two builds would be indistinguishable by
+construction. Replaying recorded *answers* keeps each build's planner, policy, guardrail and fallback
+live, which is exactly what an A/B comparison needs.
+
+```sh
+# record a transcript once, live (network and credential required)
+PYTHONPATH=src scripts/jev-env.sh .venv/bin/python -m mario_jev run --fast \
+    --max-ticks 200 --stage 1-1 --journal artifacts/transcript-1-1.jsonl
+
+# replay it for one build, offline: no credential, no request
+MARIO_ROLLOUT_COST_SOURCE=fixed MARIO_ROLLOUT_FIXED_BASE_MS=0.5 \
+MARIO_ROLLOUT_FIXED_PER_FRAME_MS=1.1 \
+PYTHONPATH=src .venv/bin/python -m mario_jev run --fast \
+    --max-ticks 200 --stage 1-1 --journal artifacts/fed-a.jsonl \
+    --answers artifacts/transcript-1-1.jsonl
+
+# and once more for the build you are comparing it against
+PYTHONPATH=src .venv/bin/python -m mario_jev replay artifacts/fed-a.jsonl
+```
+
+### What it proves
+
+**Two runs, same seed, same fixed cost source, same transcript, produce identical action sequences.**
+`tests/test_reproducibility.py` drives that end to end through `main([...])` with the real emulator and
+compares the journals **field by field**, excluding exactly the genuine measurements of the replaying
+machine and naming them: each tick's `latencies_ms`, the sweep's own `elapsed_ms`/`sweep_ms`, the cost
+model those produced (`base_ms`, `per_frame_ms`, `calibration_frames`), and the summary's `elapsed_s`
+and `decision_rate_hz`. Everything left -- the horizons, every candidate row, the applied answers with
+their ages, the decisions -- must match, and does. The same test checks that the transcript was really
+replayed rather than both runs holding in fallback, and that every tick of a fed run carries the
+`transcript_answers` stamp.
+
+**And the proof can fail.** The negative control in the same file takes the default `measured` source,
+feeds the same transcript, and injects two different clock readings -- the planner's own `time` module
+replaced by an advancing fake, never a slow machine and never a sleep. The horizon moves (48 frames
+against 6 in the recorded run), the executed actions move with it (`right+B` against `right`), and the
+same field-by-field comparison is unequal. The equality above is therefore a property of the fixed
+cost source, not an artefact of a comparison that cannot fail.
+
+### What it still does not
+
+* **The Jev service's own determinism is unmeasured.** The transcript is a recording of what the API
+  answered once; nothing here says it would answer the same way again. That needs a network
+  measurement, and this work makes no claim either way. A transcript is a fixture, and a stale one is
+  a trap.
+* **Every millisecond figure stays a load-dependent sample.** The fixed cost source removes the clock
+  from the *decision*; it does not turn a measurement into a constant. A fed journal still records the
+  replaying machine's real `elapsed_ms`/`sweep_ms`/`latencies_ms`, and they are as load-dependent as
+  every other timing number in this report.
+* **A fed run cannot exhibit the dispatcher race, so it must never be used to claim that race is
+  fixed.** There is no worker and no future on the fed path: the race is *absent*, not *repaired*. The
+  live path is still `JevDispatcher` with its one worker, and its correctness is witnessed by the live
+  runs above and by its own tests -- never by a fed run.
+* **A fed run is not automatically a reproducible one.** The flag alone replays the answers; it leaves
+  the horizon on the measured source unless it is told otherwise, so the CLI prints a warning for
+  `--answers` without `rollout_cost_source=fixed`. A reader who believed the flag alone bought
+  reproducibility would compare two builds and measure the machine again.
+* **The transcript's own counts are printed, not assumed aligned.** A transcript holds the answers the
+  recording *applied*, not the calls it *fired*: a call that failed, or whose answer was discarded as
+  stale, left a `jev_call_ms` but no response and therefore no slot in the transcript. The k-th
+  recorded answer is then not the k-th original call, and a replay that fires **fewer** calls than the
+  transcript holds never reaches the unused tail, so **no mismatch and no exhaustion signal fires**.
+  That silence is why the CLI prints the transcript's fired/applied counts next to the run's after
+  every fed run, and says so on the line when the two fired counts differ. `answers_exhausted` and
+  `transcript_mismatch` remain the recorded signals for the two cases that *do* fire (the replay asked
+  for more calls than the transcript holds, or the record answers a different question).
+
 ## Findings worth acting on
 
 In the order I would act on them, each with the evidence above:

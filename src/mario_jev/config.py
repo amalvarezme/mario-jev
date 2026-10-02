@@ -72,6 +72,22 @@ def _float_env(env: Mapping[str, str], name: str, default: float) -> float:
         raise ValueError(f"{name} must be a number, got {raw!r}") from exc
 
 
+def _path_env(env: Mapping[str, str], name: str) -> Path | None:
+    """A filesystem path from the environment, or ``None`` when unset or blank.
+
+    An unset variable and an empty one both mean "not configured": ``Path("")``
+    is ``Path(".")``, and silently treating the current directory as a journal
+    path is exactly the kind of guess this module refuses to make. Whether the
+    named file exists or is readable is deliberately *not* checked here -- this
+    module never touches the filesystem -- so the command that consumes it can
+    report the real failure with its own message.
+    """
+    raw = env.get(name)
+    if raw is None or not raw.strip():
+        return None
+    return Path(raw)
+
+
 def _bool_env(env: Mapping[str, str], name: str, default: bool) -> bool:
     raw = env.get(name)
     if raw is None or raw == "":
@@ -106,6 +122,16 @@ class Settings:
     # Below this confidence the Jev answer is not trusted and the deterministic
     # safe fallback runs instead.
     confidence_threshold: float = 0.6
+
+    # --- recorded answers (a fed run) ---------------------------------------
+    # The journal whose recorded Jev answers drive this run instead of the live
+    # client. ``None`` means a live run. It is a *path*, not a secret, and it is
+    # recorded in the run header so a reader can see where the answers came
+    # from: a fed run never opens a socket, so its responses and its
+    # ``jev_call_ms`` are the transcript's and not this machine's measurements.
+    # The file's existence and readability are the command's business, not this
+    # pure settings object's.
+    answers_journal: Path | None = None
 
     # --- trajectory rollout -------------------------------------------------
     # Wall-clock budget for the whole candidate rollout sweep. The horizon is
@@ -164,6 +190,7 @@ class Settings:
             jev_max_attempts=_int_env(source, "JEV_MAX_ATTEMPTS", 3),
             decision_cadence_frames=_int_env(source, "MARIO_DECISION_CADENCE", 8),
             confidence_threshold=_float_env(source, "MARIO_CONFIDENCE_THRESHOLD", 0.6),
+            answers_journal=_path_env(source, "MARIO_ANSWERS_JOURNAL"),
             rollout_budget_ms=_float_env(source, "MARIO_ROLLOUT_BUDGET_MS", 120.0),
             rollout_max_frames=_int_env(source, "MARIO_ROLLOUT_MAX_FRAMES", 48),
             rollout_min_frames=_int_env(source, "MARIO_ROLLOUT_MIN_FRAMES", 6),
@@ -256,8 +283,14 @@ class Settings:
         but this view is written into the journal header and printed by the
         dashboard, so emitting it verbatim would put a password in a log. The
         guarantee is about what gets **written**, not about what is accepted.
+
+        ``answers_journal`` is added **only when it is set**, so a live run's
+        header is byte-for-byte what it always was and a fed run's header names
+        the transcript its answers came from. The key is absent, not ``null``,
+        on a live run: a present-but-null key would invite a reader to compare
+        two headers and conclude the live run had a transcript it did not.
         """
-        return {
+        view: dict[str, object] = {
             "jev_endpoint": redact_url_userinfo(self.jev_endpoint),
             "jev_model": self.jev_model,
             "jev_available": self.jev_available,
@@ -280,3 +313,6 @@ class Settings:
             "advisor_model_id": self.advisor_model_id,
             "artifacts_dir": str(self.artifacts_dir),
         }
+        if self.answers_journal is not None:
+            view["answers_journal"] = str(self.answers_journal)
+        return view

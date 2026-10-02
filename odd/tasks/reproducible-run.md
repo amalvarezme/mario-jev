@@ -1,6 +1,7 @@
 # Feature — a reproducible run, so an A/B comparison measures the build and not the machine
 
-Status: proposed. Not started. Each task is one work-unit commit.
+Status: T1 and T2 committed (`0273b4a`, `98efd37`). T3 implemented in the working tree, its
+work-unit commit pending the user's go-ahead. Each task is one work-unit commit.
 
 ## Why
 
