@@ -58,6 +58,21 @@ so the demo says only that the trailer is there and may not be its own — this 
 (for instance because it is not writable) — and stopping the viewer does not finish a run. A run that
 **fails** prints its error and the viewer keeps serving the ticks up to the failure.
 
+`mario_jev live` is the same idea with the game visible:
+
+```sh
+PYTHONPATH=src scripts/jev-env.sh .venv/bin/python -m mario_jev live --max-ticks 900
+```
+
+Two windows open. The game plays in its own window at 60 fps, and the browser opens the decision
+board at `/live`; `--no-open` prints that address instead of opening a window. The board shows the
+newest tick's frame, the buttons the agent pressed, the Jev scores with the chosen answer marked, the
+rollout candidates, and the decision with its `reason` — a snapshot at the decision tick rate, not
+60 fps, so a fast run means some refreshes skip ticks. The game window holds 60 fps only while the
+pacing keeps up, and the run's own timing is the record of what the machine really did. Like `demo`,
+`live` writes no summary trailer when it is interrupted, so the readers report that run as **in
+progress**, which is the honest reading and not a claim that it completed.
+
 A journal **without** its summary trailer — a run still in progress — is readable through this path
 (`read_journal(..., allow_partial=True)`) and every reader then says the run is **in progress** rather
 than `not recorded`, which is the label for a *finished* run that lost a key. The strictness that

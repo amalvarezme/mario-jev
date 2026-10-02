@@ -80,7 +80,12 @@ export JEV_API_KEY="sk_jev_..."
 .venv/bin/mario-jev run       # play, recording evidence
 .venv/bin/mario-jev replay    # rebuild the view from a recorded trace
 .venv/bin/mario-jev dashboard # live view
+.venv/bin/mario-jev live      # play in a window and watch the decision board
 ```
+
+`mario_jev live` plays the stage in its own window at 60 fps and opens the browser at the live
+decision board (`/live`), which shows what the agent is doing and why. Pass `--no-open` to print the
+address instead of opening a window.
 
 ## Tests
 

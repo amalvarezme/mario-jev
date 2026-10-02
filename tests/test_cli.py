@@ -2106,6 +2106,444 @@ def test_the_demo_run_is_a_daemon_thread() -> None:
     assert ran.is_set()
 
 
+# -- live, the game in its own window -----------------------------------------------
+# ``live`` inverts ``demo``'s arrangement: the run owns the main thread because
+# nes-py refuses to render a window anywhere else, and the viewer is the daemon
+# thread. These tests pin the composition -- order, the render mode, the browser
+# seam and the exit line -- with the viewer, the run and the browser all replaced
+# by seams. No window is opened and no real run is played.
+
+
+def _live_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No credential and no ``MARIO_*`` override: live's own defaults govern."""
+    for name in (
+        "JEV_API_KEY",
+        "MARIO_STAGE",
+        "MARIO_MAX_TICKS",
+        "MARIO_SEED",
+        "MARIO_ARTIFACTS_DIR",
+        "MARIO_REAL_TIME",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+class _RecordingViewer:
+    """A ``ThreadedViewer`` stand-in that records its construction and calls.
+
+    ``start`` hands ``on_ready`` the same ``/live`` URL the real viewer computes
+    before its thread begins, so the browser seam and the ordering the command
+    promises are exercised without binding a socket. ``events`` is reset per test
+    by :func:`_install_live_viewer`.
+    """
+
+    LIVE_URL = "http://127.0.0.1:54321/live"
+    instances: list["_RecordingViewer"] = []
+    events: list[str] = []
+
+    def __init__(self, journal_path: object, **options: object) -> None:
+        self.journal_path = Path(str(journal_path))
+        self.options = options
+        self.started = False
+        self.stopped = False
+        _RecordingViewer.instances.append(self)
+
+    def start(self) -> str:
+        self.started = True
+        _RecordingViewer.events.append("viewer.start")
+        on_ready = self.options.get("on_ready")
+        if callable(on_ready):
+            on_ready(self.LIVE_URL)
+        return self.LIVE_URL
+
+    def stop(self) -> None:
+        self.stopped = True
+        _RecordingViewer.events.append("viewer.stop")
+
+
+def _install_live_viewer(monkeypatch: pytest.MonkeyPatch) -> type[_RecordingViewer]:
+    _RecordingViewer.instances = []
+    _RecordingViewer.events = []
+    monkeypatch.setattr(cli, "ThreadedViewer", _RecordingViewer)
+    return _RecordingViewer
+
+
+def _live_play(events: list[str] | None = None):
+    """A ``_play`` stand-in that records the call and returns cleanly."""
+
+    def play(
+        settings,
+        journal_path,
+        *,
+        artifacts_dir,
+        max_ticks=None,
+        observer=None,
+        render_mode=None,
+    ):
+        if events is not None:
+            events.append("play")
+        return None
+
+    return play
+
+
+def test_live_starts_the_viewer_with_the_live_route_before_the_run_and_stops_it(
+    monkeypatch, tmp_path
+) -> None:
+    viewer_type = _install_live_viewer(monkeypatch)
+    _live_env(monkeypatch)
+    monkeypatch.setattr(cli, "_play", _live_play(viewer_type.events))
+
+    code = cli.main(
+        [
+            "live",
+            "--journal",
+            str(tmp_path / "live.jsonl"),
+            "--artifacts-dir",
+            str(tmp_path / "artifacts"),
+        ]
+    )
+
+    assert code == 0
+    # The viewer starts (with the live route) before the first frame is played,
+    # and is stopped on the clean path too.
+    assert viewer_type.events == ["viewer.start", "play", "viewer.stop"]
+    viewer = viewer_type.instances[0]
+    assert viewer.started is True and viewer.stopped is True
+    assert viewer.options["live"] is True
+    assert viewer.journal_path == tmp_path / "live.jsonl"
+
+
+def test_live_builds_the_run_with_the_human_render_mode(monkeypatch, tmp_path) -> None:
+    _install_live_viewer(monkeypatch)
+    _live_env(monkeypatch)
+    seen: dict[str, object] = {}
+
+    def fake_play(
+        settings,
+        journal_path,
+        *,
+        artifacts_dir,
+        max_ticks=None,
+        observer=None,
+        render_mode=None,
+    ):
+        seen["render_mode"] = render_mode
+        return None
+
+    monkeypatch.setattr(cli, "_play", fake_play)
+
+    code = cli.main(
+        [
+            "live",
+            "--journal",
+            str(tmp_path / "live.jsonl"),
+            "--artifacts-dir",
+            str(tmp_path / "artifacts"),
+        ]
+    )
+
+    assert code == 0
+    # The game window is the point of the command and is not optional: the run is
+    # always built in ``human`` mode.
+    assert seen["render_mode"] == "human"
+
+
+def test_live_flags_reach_the_viewer_and_the_run(monkeypatch, tmp_path) -> None:
+    viewer_type = _install_live_viewer(monkeypatch)
+    _live_env(monkeypatch)
+    seen: dict[str, object] = {}
+
+    def fake_play(
+        settings,
+        journal_path,
+        *,
+        artifacts_dir,
+        max_ticks=None,
+        observer=None,
+        render_mode=None,
+    ):
+        seen.update(
+            stage=settings.stage,
+            seed=settings.seed,
+            max_ticks=max_ticks,
+            journal=Path(str(journal_path)),
+            artifacts_dir=Path(str(artifacts_dir)),
+        )
+        return None
+
+    monkeypatch.setattr(cli, "_play", fake_play)
+
+    code = cli.main(
+        [
+            "live",
+            "--stage",
+            "1-2",
+            "--seed",
+            "7",
+            "--max-ticks",
+            "5",
+            "--journal",
+            str(tmp_path / "live.jsonl"),
+            "--artifacts-dir",
+            str(tmp_path / "artifacts"),
+            "--port",
+            "9123",
+            "--bind",
+            "0.0.0.0",
+        ]
+    )
+
+    assert code == 0
+    assert seen == {
+        "stage": "1-2",
+        "seed": 7,
+        "max_ticks": 5,
+        "journal": tmp_path / "live.jsonl",
+        "artifacts_dir": tmp_path / "artifacts",
+    }
+    viewer = viewer_type.instances[0]
+    assert viewer.options["port"] == 9123
+    assert viewer.options["bind"] == "0.0.0.0"
+    assert viewer.options["artifacts_dir"] == tmp_path / "artifacts"
+
+
+def test_live_opens_the_browser_once_at_the_live_url(monkeypatch, tmp_path) -> None:
+    viewer_type = _install_live_viewer(monkeypatch)
+    _live_env(monkeypatch)
+    opened: list[str] = []
+    monkeypatch.setattr(cli, "_play", _live_play())
+    monkeypatch.setattr(cli, "_open_browser", lambda url: opened.append(url) or True)
+
+    code = cli.main(
+        [
+            "live",
+            "--journal",
+            str(tmp_path / "live.jsonl"),
+            "--artifacts-dir",
+            str(tmp_path / "artifacts"),
+        ]
+    )
+
+    assert code == 0
+    assert opened == [viewer_type.LIVE_URL]
+
+
+def test_live_no_open_skips_the_browser_and_prints_the_address(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    viewer_type = _install_live_viewer(monkeypatch)
+    _live_env(monkeypatch)
+    opened: list[str] = []
+    monkeypatch.setattr(cli, "_play", _live_play())
+    monkeypatch.setattr(cli, "_open_browser", lambda url: opened.append(url) or True)
+
+    code = cli.main(
+        [
+            "live",
+            "--journal",
+            str(tmp_path / "live.jsonl"),
+            "--artifacts-dir",
+            str(tmp_path / "artifacts"),
+            "--no-open",
+        ]
+    )
+    out = capsys.readouterr().out
+
+    assert code == 0
+    assert opened == []
+    # No window appears, and the address is still said out loud.
+    assert viewer_type.LIVE_URL in out
+    assert "not opening a browser" in out
+
+
+def test_live_abandons_and_stops_a_viewer_on_ctrl_c(monkeypatch, tmp_path, capsys) -> None:
+    viewer_type = _install_live_viewer(monkeypatch)
+    _live_env(monkeypatch)
+
+    def fake_play(
+        settings,
+        journal_path,
+        *,
+        artifacts_dir,
+        max_ticks=None,
+        observer=None,
+        render_mode=None,
+    ):
+        # The run really got going: a readable header and a tick, no trailer. The
+        # abandoned sentence is read from that, and from the interrupt.
+        (tmp_path / "live.jsonl").write_text(
+            '{"kind": "run"}\n{"kind": "tick"}\n', encoding="utf-8"
+        )
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli, "_play", fake_play)
+
+    code = cli.main(
+        [
+            "live",
+            "--journal",
+            str(tmp_path / "live.jsonl"),
+            "--artifacts-dir",
+            str(tmp_path / "artifacts"),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    # Ctrl-C is the run still going when the viewer stopped, not a failure: it
+    # exits zero and the sentence says reader sees the run still in progress.
+    assert code == 0
+    assert viewer_type.instances[0].stopped is True
+    assert cli.DEMO_ABANDONED_LINE in captured.out
+    assert "in progress" in captured.out
+    assert "Traceback" not in captured.err
+
+
+def test_live_reports_a_failed_run_and_still_stops_the_viewer(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    viewer_type = _install_live_viewer(monkeypatch)
+    _live_env(monkeypatch)
+
+    def fake_play(
+        settings,
+        journal_path,
+        *,
+        artifacts_dir,
+        max_ticks=None,
+        observer=None,
+        render_mode=None,
+    ):
+        (tmp_path / "live.jsonl").write_text(
+            '{"kind": "run"}\n{"kind": "tick"}\n', encoding="utf-8"
+        )
+        raise JevProtocolError("the server answered 2xx with a body of the wrong shape")
+
+    monkeypatch.setattr(cli, "_play", fake_play)
+
+    code = cli.main(
+        [
+            "live",
+            "--journal",
+            str(tmp_path / "live.jsonl"),
+            "--artifacts-dir",
+            str(tmp_path / "artifacts"),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert code == 1
+    assert "run failed" in captured.err
+    assert "JevProtocolError" in captured.err
+    assert viewer_type.instances[0].stopped is True
+    assert cli.DEMO_FAILED_LINE in captured.out
+    assert "in progress" in captured.out
+
+
+def test_live_keeps_runs_own_message_for_a_journal_it_cannot_open(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    _install_live_viewer(monkeypatch)
+    _live_env(monkeypatch)
+
+    def fake_play(
+        settings,
+        journal_path,
+        *,
+        artifacts_dir,
+        max_ticks=None,
+        observer=None,
+        render_mode=None,
+    ):
+        raise cli._JournalOpenError("the handle could not be opened")
+
+    monkeypatch.setattr(cli, "_play", fake_play)
+
+    code = cli.main(
+        [
+            "live",
+            "--journal",
+            str(tmp_path / "live.jsonl"),
+            "--artifacts-dir",
+            str(tmp_path / "artifacts"),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert code == 1
+    assert "cannot open journal" in captured.err
+    assert "run failed" not in captured.err
+
+
+def test_live_reports_a_viewer_that_cannot_bind(monkeypatch, tmp_path, capsys) -> None:
+    _live_env(monkeypatch)
+
+    def explode(*args: object, **kwargs: object) -> object:
+        raise OSError("address already in use")
+
+    monkeypatch.setattr(cli, "ThreadedViewer", explode)
+
+    code = cli.main(
+        [
+            "live",
+            "--journal",
+            str(tmp_path / "live.jsonl"),
+            "--artifacts-dir",
+            str(tmp_path / "artifacts"),
+            "--no-open",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert code == 1
+    assert "the viewer failed" in captured.err
+    # No journal was written, so the derived sentence says exactly that.
+    assert cli.DEMO_FAILED_UNWRITTEN_LINE in captured.out
+
+
+def test_the_live_parser_carries_the_documented_defaults() -> None:
+    parser = cli._build_parser()
+
+    args = parser.parse_args(["live"])
+
+    assert args.stage == "1-1"
+    assert args.max_ticks == 900
+    assert args.journal == "artifacts/live.jsonl"
+    assert args.artifacts_dir is None
+    assert args.seed is None
+    assert args.port == DEFAULT_PORT
+    assert args.bind == DEFAULT_BIND
+    assert args.no_open is False
+    assert args.handler is cli._cmd_live
+
+
+def test_live_is_registered_in_the_parsers_subcommands(capsys) -> None:
+    parser = cli._build_parser()
+
+    # Registration is what makes ``live`` reachable at all; parsing it is the
+    # proof, and the help is the command's own text.
+    assert parser.parse_args(["live"]).handler is cli._cmd_live
+    with pytest.raises(SystemExit) as exit_info:
+        parser.parse_args(["live", "--help"])
+    out = capsys.readouterr().out
+    assert exit_info.value.code == 0
+    assert "live" in out
+
+
+def test_live_help_names_the_two_deliberate_differences(capsys) -> None:
+    parser = cli._build_parser()
+
+    with pytest.raises(SystemExit) as exit_info:
+        parser.parse_args(["live", "--help"])
+    out = capsys.readouterr().out
+
+    assert exit_info.value.code == 0
+    # Boundary-exact defaults, and the prose that says why they differ from demo.
+    assert "(default: 900)" in out
+    assert "(default: artifacts/live.jsonl)" in out
+    assert "deliberate differences" in out
+    assert "45 seconds" in out
+
+
 # -- the extraction did not change ``run`` ------------------------------------------
 
 

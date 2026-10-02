@@ -1,7 +1,7 @@
-"""The command line: play, replay, render the dashboard, serve it live, and check
-readiness.
+"""The command line: play, replay, render the dashboard, serve it, watch it live,
+and check readiness.
 
-Six subcommands, one entry point. :func:`main` takes an explicit ``argv`` so the
+Seven subcommands, one entry point. :func:`main` takes an explicit ``argv`` so the
 tests drive every path in-process and never spawn a subprocess, and it returns an
 exit code rather than raising: a missing journal, an unreadable journal or a
 broken configuration becomes an actionable message, not a traceback.
@@ -23,6 +23,10 @@ broken configuration becomes an actionable message, not a traceback.
 * ``demo`` is the whole thing in one command: it plays world 1-1, writes the
   run's evidence (the journal, with the per-tick frame and trajectory artifacts),
   and serves the page for it while the run goes.
+* ``live`` inverts that arrangement for a viewer: the game owns the main thread
+  (nes-py refuses to render a window anywhere else) and the live decision board
+  is served from a daemon thread. Its ``--max-ticks`` defaults to 900 and its
+  journal to ``artifacts/live.jsonl``.
 * ``doctor`` reports the environment and dependency readiness, with an exit code
   that the optional advisor stack can never change.
 
@@ -57,7 +61,7 @@ from mario_jev.policy import (
     TickRecord,
     recorded_answers_from_ticks,
 )
-from mario_jev.serve import DEFAULT_BIND, DEFAULT_PORT
+from mario_jev.serve import DEFAULT_BIND, DEFAULT_PORT, ThreadedViewer
 from mario_jev.serve import serve as serve_journal
 from mario_jev.trajectory import TrajectoryPlanner
 
@@ -746,6 +750,12 @@ def _demo_exit_sentence(
 ) -> str:
     """The one honest exit line, decided by this run's own return and the journal.
 
+    ``demo`` and ``live`` share this sentence unchanged. They differ only in where
+    ``run_alive`` comes from: ``demo`` reads it off its background run thread,
+    while ``live`` runs the game on the main thread and answers it from the
+    interrupt -- a Ctrl-C that ends the run means the journal was still being
+    written when the viewer stopped.
+
     FINISHED is derived from this run's own return, never from a trailer found on
     disk: ``run_finished`` is set only once ``_play`` returned, which happens only
     after ``write_summary`` wrote this run's trailer. A trailer found while this
@@ -821,6 +831,37 @@ def _open_browser(url: str) -> bool:
     return webbrowser.open(url)
 
 
+def _open_in_browser(url: str) -> None:
+    """Open ``url`` behind the seam and report only what this process observed.
+
+    A browser that raises did not open, and neither did one that returned false;
+    both are said on stdout, and the URL the viewer already printed stands as the
+    fallback. Neither is a viewer failure, so nothing here propagates. ``demo`` and
+    ``live`` share this so the two commands cannot report the same failure two
+    different ways.
+    """
+    try:
+        opened = _open_browser(url)
+    except Exception as exc:  # noqa: BLE001 - the browser is outside our control
+        # A browser that raises did not open. That is the browser seam failing,
+        # never the viewer: say the observed failure and leave the already-printed
+        # URL as the fallback.
+        print(
+            f"the browser did not open for {url}: {type(exc).__name__}: {exc}; "
+            "open that address yourself",
+            file=sys.stdout,
+        )
+        return
+    if not opened:
+        # The URL has already been printed by the viewer. A claim that a window
+        # appeared would be about the user's machine and was not observed; this
+        # says only what was observed.
+        print(
+            f"the browser did not open for {url}; open that address yourself",
+            file=sys.stdout,
+        )
+
+
 def _cmd_demo(args: argparse.Namespace) -> int:
     """Play world 1-1, write the evidence, and serve the page, in one command."""
     try:
@@ -867,26 +908,7 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     def on_ready(url: str) -> None:
         if args.no_open:
             return
-        try:
-            opened = _open_browser(url)
-        except Exception as exc:  # noqa: BLE001 - the browser is outside our control
-            # A browser that raises did not open. That is the browser seam
-            # failing, never the viewer: say the observed failure and leave the
-            # already-printed URL as the fallback.
-            print(
-                f"the browser did not open for {url}: {type(exc).__name__}: {exc}; "
-                "open that address yourself",
-                file=sys.stdout,
-            )
-            return
-        if not opened:
-            # The URL has already been printed by ``serve``. A claim that a window
-            # appeared would be about the user's machine and was not observed;
-            # this says only what was observed.
-            print(
-                f"the browser did not open for {url}; open that address yourself",
-                file=sys.stdout,
-            )
+        _open_in_browser(url)
 
     try:
         code = serve_journal(
@@ -935,6 +957,134 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         file=sys.stdout,
     )
     return code
+
+
+# -- live --------------------------------------------------------------------------
+
+
+def _cmd_live(args: argparse.Namespace) -> int:
+    """Play the stage in its own window while the live board is served beside it.
+
+    The same settings and overrides as ``demo``, with two deliberate differences
+    that the parser's help states too: ``--max-ticks`` defaults to **900**, because
+    a viewer means to sit and watch and 300 ticks is about 45 seconds, and
+    ``--journal`` defaults to ``artifacts/live.jsonl``.
+
+    The arrangement inverts ``demo``'s and that is the whole point: the run owns
+    the main thread because nes-py refuses to render a window anywhere else, and
+    the viewer is the daemon thread. The viewer starts -- configured with the live
+    route -- before the first frame is played, and is stopped on every exit path.
+    The exit line is ``demo``'s own :func:`_demo_exit_sentence`, with the three
+    outcomes mapped deliberately: a clean return is finished; a ``(JevError,
+    OSError)`` out of ``_play`` is printed as ``run failed`` and means the run did
+    not finish; and Ctrl-C means the run was still going when the viewer stopped,
+    so ``live`` answers ``run_alive`` from the interrupt rather than from a thread.
+    A failing journal open keeps ``run``'s own message.
+    """
+    try:
+        settings = _apply_overrides(Settings.load(), args)
+    except ValueError as exc:
+        print(f"configuration error: {exc}", file=sys.stderr)
+        return 2
+
+    journal_path = Path(args.journal)
+    artifacts_dir = Path(settings.artifacts_dir)
+
+    # The same warning on the same condition as ``demo``: no credential and no
+    # transcript means every decision degrades to the local fallback.
+    if settings.answers_journal is None and not settings.jev_available:
+        print(
+            "warning: no JEV_API_KEY is configured; every decision will use the "
+            "local fallback (fallback_no_key) and no Jev request will be sent",
+            file=sys.stderr,
+        )
+
+    def on_ready(url: str) -> None:
+        if args.no_open:
+            # No window is opened, so say the address as the thing to open rather
+            # than let the user wait for one that will never appear.
+            print(
+                f"not opening a browser; open {url} to watch the decision board",
+                file=sys.stdout,
+            )
+            return
+        _open_in_browser(url)
+
+    try:
+        viewer = ThreadedViewer(
+            journal_path,
+            artifacts_dir=artifacts_dir,
+            bind=args.bind,
+            port=args.port,
+            on_ready=on_ready,
+            live=True,
+        )
+    except OSError as exc:
+        # Binding failed before anything ran. The message names the address and the
+        # error and asserts no cause it did not establish, exactly as ``demo`` does
+        # for its viewer; the sentence is the journal-derived one.
+        print(
+            f"the viewer failed on {args.bind}:{args.port}: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        print(
+            _demo_exit_sentence(
+                journal_path, run_finished=False, run_alive=False
+            ),
+            file=sys.stdout,
+        )
+        return 1
+
+    run_finished = False
+    run_interrupted = False
+    try:
+        try:
+            viewer.start()
+            try:
+                # The run owns the main thread: ``human`` mode opens the game
+                # window, which is this command's point and is not optional.
+                _play(
+                    settings,
+                    journal_path,
+                    artifacts_dir=artifacts_dir,
+                    max_ticks=args.max_ticks,
+                    render_mode="human",
+                )
+            except KeyboardInterrupt:
+                # The run was still going when the interrupt arrived, which is what
+                # run_alive asks; the journal has no trailer of this run's.
+                run_interrupted = True
+            except _JournalOpenError as exc:
+                # ``run``'s own message for the one failure that happens before the
+                # run proper starts.
+                print(
+                    f"cannot open journal {journal_path}: {exc}", file=sys.stderr
+                )
+            except (JevError, OSError) as exc:
+                print(f"run failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+            else:
+                run_finished = True
+        except KeyboardInterrupt:
+            # Ctrl-C before or during ``start``: the viewer was coming up and the
+            # run never got going, which is the abandoned state too.
+            run_interrupted = True
+    finally:
+        # Every path out stops the viewer: the socket and its daemon thread must
+        # not outlive the command that opened them.
+        viewer.stop()
+
+    print(
+        _demo_exit_sentence(
+            journal_path,
+            run_finished=run_finished,
+            run_alive=run_interrupted,
+        ),
+        file=sys.stdout,
+    )
+    # The run is the point of this command: finishing or being interrupted is a
+    # clean exit, and a run that never finished is a failure.
+    return 0 if (run_finished or run_interrupted) else 1
 
 
 # -- doctor command ----------------------------------------------------------------
@@ -1087,6 +1237,66 @@ def _build_parser() -> argparse.ArgumentParser:
         help="print the URL but do not open a browser window",
     )
     demo.set_defaults(handler=_cmd_demo)
+
+    live = subparsers.add_parser(
+        "live",
+        help=(
+            "play the stage in its own window while serving the live decision "
+            "board beside it"
+        ),
+        description=(
+            "Play the stage with a real game window and serve the live decision "
+            "board at /live from a background thread. Two deliberate differences "
+            "from demo: --max-ticks defaults to 900, because a viewer means to sit "
+            "and watch and 300 ticks is about 45 seconds; and --journal defaults "
+            "to artifacts/live.jsonl."
+        ),
+    )
+    live.add_argument(
+        "--stage", default="1-1", help="world-stage to play (default: 1-1)"
+    )
+    live.add_argument(
+        "--max-ticks",
+        type=int,
+        default=900,
+        help="stop after N decision ticks (default: 900)",
+    )
+    live.add_argument(
+        "--journal",
+        default="artifacts/live.jsonl",
+        help="journal path to write (default: artifacts/live.jsonl)",
+    )
+    live.add_argument(
+        "--artifacts-dir",
+        default=None,
+        help="directory for per-tick PNG artifacts (default: the configured one)",
+    )
+    live.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="emulator seed (default: the configured one)",
+    )
+    live.add_argument(
+        "--port",
+        type=int,
+        default=DEFAULT_PORT,
+        help=f"TCP port to listen on (default: {DEFAULT_PORT}; 0 picks a free one)",
+    )
+    live.add_argument(
+        "--bind",
+        default=DEFAULT_BIND,
+        help=(
+            f"address to listen on (default: {DEFAULT_BIND}, loopback only; "
+            "another address publishes this machine's run to the network)"
+        ),
+    )
+    live.add_argument(
+        "--no-open",
+        action="store_true",
+        help="print the URL but do not open a browser window",
+    )
+    live.set_defaults(handler=_cmd_live)
 
     doctor = subparsers.add_parser("doctor", help="report environment readiness")
     doctor.set_defaults(handler=_cmd_doctor)
