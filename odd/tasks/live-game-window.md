@@ -1,8 +1,8 @@
 # Feature — the game in a window, and the Jev scores beside it (`mario_jev live`)
 
 Status: authorized by the user, who chose the native 60 fps game window plus a live scores page over
-an all-browser page and over a panel drawn inside the game window. One work-unit commit per task, each
-needing the user's go-ahead.
+an all-browser page and over a panel drawn inside the game window. All four tasks are implemented,
+committed and verified: G1 `b98a274`, G2 `8e3913d`, G3 `b50a152`, G4 `7049063`.
 
 ## Why
 
@@ -153,3 +153,21 @@ the viewer keeps serving, exactly as `demo` does.
   ticks. The page's own numbers make that visible instead of hiding it.
 * The frames land in the configured artifacts directory, where an earlier run's frames may already
   live. `live` does not move or rename them; pass `--artifacts-dir` to keep runs apart.
+
+## Observed on this machine
+
+One real run, `mario-jev live --journal artifacts/live.jsonl --artifacts-dir artifacts/live
+--max-ticks 900`, with the credential from the Keychain:
+
+* the two startup lines printed, and the game window opened -- no traceback anywhere in the log;
+* `/live` answered `200` while the browser refreshed it every 0.5 s and `/frame_*.png` answered
+  alongside it, so the page and its frame kept up with the run;
+* the board read `status in progress`, `pressed: right+B`, the Jev scores for the newest tick, the
+  rollout rows with the applied candidate marked, and the decision row;
+* the run ended on its own summary trailer with `termination: death` after 233 ticks (39 s), and the
+  command then printed the finished sentence and exited 0.
+
+The limit this run makes plain: **the command ends when the episode does.** The window closes, the
+board stops being served, and watching another run means starting another one. That is the honest
+shape of a command whose whole subject is one run's game, and it is why the exit line distinguishes a
+finished run from an abandoned one instead of pretending the viewer outlives the game.
