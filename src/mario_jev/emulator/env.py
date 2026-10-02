@@ -140,6 +140,18 @@ class FramePacer:
         return self._enabled
 
     @property
+    def is_suspended(self) -> bool:
+        """Whether a :meth:`suspended` block is currently held.
+
+        A step taken while it is held is a simulated future, not the real
+        timeline (see :meth:`suspended`), so the display follows this flag and
+        draws only the frames the game actually plays. The state is read-only:
+        the only way to raise it is to hold the context, and the only way to
+        lower it is to leave the outermost one.
+        """
+        return self._suspend_depth > 0
+
+    @property
     def last_lag_s(self) -> float:
         """How far behind schedule the previous frame finished."""
         return self._last_lag
@@ -289,6 +301,9 @@ class MarioEmulator:
         self.actions: tuple[Action, ...] = build_actions(action_set)
         self.action_set = action_set
         self._seed = seed
+        # Kept, not just forwarded: the render rule below reads it on every step
+        # to decide whether a window exists to draw into.
+        self._render_mode = render_mode
         self._nes = SuperMarioBrosEnv(target=self._target, render_mode=render_mode)
         self._last_info: Mapping[str, Any] = {}
         self._tick = -1
@@ -305,6 +320,7 @@ class MarioEmulator:
         self._pacer.reset()
         self._tick = 0
         self._last_info = dict(info)
+        self._render_live_frame()
         return StepResult(
             frame=np.ascontiguousarray(screen),
             info=self._last_info,
@@ -321,6 +337,11 @@ class MarioEmulator:
         screen, reward, terminated, truncated, info = self._nes.step(bits)
         self._tick += 1
         self._last_info = dict(info)
+        # Draw before the pacing wait, not after: the frame just computed is the
+        # one put on screen, and the wait then keeps it there for the period.
+        # Rendering after the wait would present a frame that already lags the
+        # one being computed.
+        self._render_live_frame()
         self._pacer.wait()
         return StepResult(
             frame=np.ascontiguousarray(screen),
@@ -330,6 +351,26 @@ class MarioEmulator:
             truncated=bool(truncated),
             tick=self._tick,
         )
+
+    def _render_live_frame(self) -> None:
+        """Draw the current frame, on the real timeline only.
+
+        ``render_mode="human"`` is the one mode nes-py opens a window for, so it
+        is the only mode this wrapper drives. The suspension check is what keeps
+        the window honest: the planner rolls candidate actions forward on this
+        same emulator inside ``with emulator.pacer.suspended()``
+        (``trajectory/planner.py:562``), so drawing every step would show
+        hundreds of simulated futures per decision tick instead of the game. A
+        suspended step is a simulated future and not the real timeline -- the
+        pacer's own meaning -- so the loop needs no render call of its own, and
+        the display concern stays out of ``policy/loop.py``.
+
+        With the default ``render_mode=None`` this draws nothing at all. Any
+        other mode is left to the caller: this wrapper does not invent a render
+        policy nes-py did not ask it to have.
+        """
+        if self._render_mode == "human" and not self._pacer.is_suspended:
+            self._nes.render()
 
     def close(self) -> None:
         if not self._closed:

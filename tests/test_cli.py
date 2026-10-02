@@ -2621,3 +2621,108 @@ def test_play_with_an_explicit_observer_leaves_the_journals_own_writer_out(
     # trailer is there but no tick line was written by ``_play``.
     assert journal.ticks == ()
     assert journal.summary["ticks"] == 2
+
+
+# -- the render-mode seam -----------------------------------------------------------
+# The mode is a display choice, not evidence: it reaches the emulator and stops
+# there. ``run`` and ``demo`` pass nothing, so their emulator stays headless; the
+# later ``live`` command is the one caller that asks for a window.
+
+
+class _RecordingEmulator:
+    """The emulator surface ``_build_emulator`` touches, recording its options."""
+
+    def __init__(self, **options: object) -> None:
+        self.options = options
+        self.resets = 0
+
+    def reset(self) -> None:
+        self.resets += 1
+
+
+def test_build_emulator_carries_the_human_render_mode(monkeypatch) -> None:
+    # A real ``human`` emulator would open a window, so the emulator class itself
+    # is replaced and only the options it was built with are observed.
+    built: list[_RecordingEmulator] = []
+
+    def build(**options: object) -> _RecordingEmulator:
+        instance = _RecordingEmulator(**options)
+        built.append(instance)
+        return instance
+
+    monkeypatch.setattr(cli, "MarioEmulator", build)
+
+    emulator = cli._build_emulator(cli.Settings.load({}), render_mode="human")
+
+    assert emulator.options["render_mode"] == "human"
+    assert emulator.resets == 1
+
+
+def test_play_threads_a_render_mode_to_the_emulator_builder(monkeypatch, tmp_path) -> None:
+    # ``_play`` is the only caller of the builder, so this is where the mode
+    # crosses from the command into the emulator. The wrapped emulator stays
+    # headless: the mode is recorded, never opened.
+    recorded: list[object] = []
+    real_build = cli._build_emulator
+
+    def record(settings, *, render_mode=None):
+        recorded.append(render_mode)
+        return _EndingEmulator(real_build(settings), terminate_at=1)
+
+    _demo_env(monkeypatch)
+    monkeypatch.setattr(cli, "_build_emulator", record)
+    monkeypatch.setattr(cli, "_build_planner", lambda settings: _FixedPlanner(_fixed_table()))
+
+    cli._play(
+        cli.Settings.load({}),
+        tmp_path / "play.jsonl",
+        artifacts_dir=tmp_path / "artifacts",
+        max_ticks=1,
+        render_mode="human",
+    )
+
+    assert recorded == ["human"]
+
+
+def test_the_run_and_demo_paths_build_a_headless_emulator(monkeypatch, tmp_path) -> None:
+    # Both commands call ``_play`` with no mode, so the builder is asked for no
+    # window and the emulator keeps its headless default. This is the behaviour
+    # every existing run/demo test relies on, pinned at the seam the mode uses.
+    recorded: list[object] = []
+    real_build = cli._build_emulator
+
+    def record(settings, **options):
+        recorded.append(options.get("render_mode"))
+        return _EndingEmulator(real_build(settings), terminate_at=1)
+
+    _demo_env(monkeypatch)
+    monkeypatch.setattr(cli, "_build_emulator", record)
+    monkeypatch.setattr(cli, "_build_planner", lambda settings: _FixedPlanner(_fixed_table()))
+    monkeypatch.setattr(cli, "serve_journal", lambda journal, **options: 0)
+    monkeypatch.setattr(cli, "_start_run_in_background", _run_inline)
+    monkeypatch.setattr(cli, "_open_browser", lambda url: True)
+
+    run_code = cli.main(
+        [
+            "run",
+            "--journal",
+            str(tmp_path / "run.jsonl"),
+            "--artifacts-dir",
+            str(tmp_path / "run-artifacts"),
+            "--fast",
+            "--max-ticks",
+            "1",
+        ]
+    )
+    demo_code = cli.main(
+        [
+            "demo",
+            "--journal",
+            str(tmp_path / "demo.jsonl"),
+            "--artifacts-dir",
+            str(tmp_path / "demo-artifacts"),
+        ]
+    )
+
+    assert (run_code, demo_code) == (0, 0)
+    assert recorded == [None, None]

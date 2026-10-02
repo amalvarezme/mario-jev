@@ -83,13 +83,21 @@ OPTIONAL_MODULES: tuple[str, ...] = ("torch", "transformers")
 # -- collaborator factories (the seams a test may replace) -------------------------
 
 
-def _build_emulator(settings: Settings) -> MarioEmulator:
-    """A reset real emulator for ``settings``."""
+def _build_emulator(settings: Settings, *, render_mode: str | None = None) -> MarioEmulator:
+    """A reset real emulator for ``settings``.
+
+    ``render_mode`` is a display choice, so it is handed straight to the
+    emulator and nowhere else: it is deliberately not a ``Settings`` field and
+    not written to the journal header, because a window changes nothing the run
+    measured. ``None`` -- what every current caller passes -- keeps the run
+    headless, exactly as before the mode was threaded through.
+    """
     emulator = MarioEmulator(
         stage=settings.stage,
         seed=settings.seed,
         real_time=settings.real_time,
         target_fps=settings.target_fps,
+        render_mode=render_mode,
     )
     emulator.reset()
     return emulator
@@ -455,6 +463,7 @@ def _play(
     max_ticks: int | None = None,
     observer: Callable[[TickRecord], None] | None = None,
     fed: _FedRun | None = None,
+    render_mode: str | None = None,
 ) -> RunSummary:
     """Play one run into ``journal_path`` and return its summary.
 
@@ -473,6 +482,12 @@ def _play(
     ``settings.answers_journal`` is set, the transcript is read and validated here
     -- ``run`` pre-reads it so it can print its own refusal, and ``demo`` (which has
     no ``--answers`` flag but honours the environment) reaches this branch.
+
+    ``render_mode`` is the display choice the ``live`` command will pass down to
+    the emulator; ``run`` and ``demo`` pass nothing and stay headless. It changes
+    only what is drawn, never what is recorded: the emulator draws the real
+    timeline and nothing else, so the mode is no evidence and no caller that did
+    not ask for a window sees one.
 
     The header is written from ``settings``, never from the ``loop_settings``
     below: a fed run with no credential still records ``jev_available: false`` and
@@ -493,7 +508,14 @@ def _play(
     try:
         emulator = None
         try:
-            emulator = _build_emulator(settings)
+            # Only a caller that asked for a window passes the mode, so the
+            # default path builds the emulator with the exact call it always
+            # made -- same keyword set, same seam every test double replaces.
+            emulator = (
+                _build_emulator(settings)
+                if render_mode is None
+                else _build_emulator(settings, render_mode=render_mode)
+            )
             loop_settings = settings
             if fed is None:
                 client = _build_client(settings)

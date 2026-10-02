@@ -7,6 +7,7 @@ become true again.
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
 
 from mario_jev.emulator import (
@@ -273,6 +274,107 @@ def test_the_emulator_is_a_context_manager_and_closes(emulator_factory) -> None:
 
     with pytest.raises(RuntimeError, match="closed"):
         emulator.step(1)
+
+
+# -- rendering -------------------------------------------------------------------
+
+
+class _FakeNes:
+    """A recordable stand-in for the nes-py environment ``MarioEmulator`` wraps.
+
+    The render rule is only observable through the inner env's ``render()``, and
+    a real ``human`` render would open a pyglet window in this process, so the
+    window itself is faked here. The frame is a shape-correct zero buffer -- the
+    emulator copies it and none of these tests read it -- and no ROM is loaded.
+    """
+
+    #: Every instance built, in order, so a test can reach the one it wrapped.
+    built: list["_FakeNes"] = []
+
+    def __init__(
+        self, *, target: object = None, render_mode: str | None = None
+    ) -> None:
+        self.render_mode = render_mode
+        self.render_calls = 0
+        self.closed = False
+        self._screen = np.zeros(SCREEN_SHAPE, dtype=np.uint8)
+        _FakeNes.built.append(self)
+
+    def reset(self, seed: int | None = None) -> tuple[np.ndarray, dict[str, object]]:
+        return self._screen, {}
+
+    def step(
+        self, bits: int
+    ) -> tuple[np.ndarray, float, bool, bool, dict[str, object]]:
+        return self._screen, 0.0, False, False, {}
+
+    def render(self) -> None:
+        self.render_calls += 1
+
+    def close(self) -> None:
+        self.closed = True
+
+
+@pytest.fixture
+def fake_nes(monkeypatch: pytest.MonkeyPatch) -> type[_FakeNes]:
+    """Make ``MarioEmulator`` wrap the fake inner env, never a real one.
+
+    ``human`` mode therefore reaches only the fake's counter: the real package
+    is not constructed and no window can open in the test process.
+    """
+    import gym_super_mario_bros.smb_env as smb_env
+
+    _FakeNes.built.clear()
+    monkeypatch.setattr(smb_env, "SuperMarioBrosEnv", _FakeNes)
+    return _FakeNes
+
+
+def test_human_mode_draws_the_reset_and_every_real_timeline_step(
+    fake_nes: type[_FakeNes], emulator_factory
+) -> None:
+    emulator = emulator_factory(render_mode="human")
+    inner = fake_nes.built[-1]
+
+    emulator.reset(seed=0)
+    assert inner.render_calls == 1
+
+    emulator.step(1)
+    emulator.step(0)
+
+    assert inner.render_calls == 3
+
+
+def test_a_suspended_step_draws_nothing_and_the_next_real_step_draws_again(
+    fake_nes: type[_FakeNes], emulator_factory
+) -> None:
+    # The sweep rolls simulated futures on this same emulator: drawing them would
+    # show hundreds of futures per decision tick instead of the game, so the
+    # pacer's own suspension flag is what the window follows.
+    emulator = emulator_factory(render_mode="human")
+    inner = fake_nes.built[-1]
+    emulator.reset(seed=0)
+
+    with emulator.pacer.suspended():
+        emulator.step(1)
+
+    assert inner.render_calls == 1
+
+    emulator.step(1)
+
+    assert inner.render_calls == 2
+
+
+def test_the_default_render_mode_draws_nothing(
+    fake_nes: type[_FakeNes], emulator_factory
+) -> None:
+    emulator = emulator_factory()
+    inner = fake_nes.built[-1]
+
+    emulator.reset(seed=0)
+    emulator.step(1)
+
+    assert inner.render_mode is None
+    assert inner.render_calls == 0
 
 
 # -- pacing ----------------------------------------------------------------------
@@ -704,6 +806,26 @@ def test_enabled_stays_a_read_only_property() -> None:
 
     with pytest.raises(AttributeError):
         pacer.enabled = False  # type: ignore[misc]
+
+
+def test_is_suspended_tracks_the_nesting_depth() -> None:
+    pacer = FramePacer(60.0, enabled=True)
+
+    assert pacer.is_suspended is False
+    with pacer.suspended():
+        assert pacer.is_suspended is True
+        with pacer.suspended():
+            assert pacer.is_suspended is True
+        # The inner exit leaves the outer suspension in force.
+        assert pacer.is_suspended is True
+    assert pacer.is_suspended is False
+
+
+def test_is_suspended_stays_a_read_only_property() -> None:
+    pacer = FramePacer(60.0, enabled=True)
+
+    with pytest.raises(AttributeError):
+        pacer.is_suspended = True  # type: ignore[misc]
 
 
 def test_reset_still_clears_the_schedule_and_the_lag(clock: VirtualClock) -> None:
