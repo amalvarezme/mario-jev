@@ -79,8 +79,11 @@ one question: what is the agent doing right now, and why? One page holding:
   chosen one marked, and its `confidence`; score answers with their `score` and `legend`; the recorded
   note where the answer was `noul`. A tick that fired no call says so, and absent data reads
   `not recorded`;
-- **the rollout candidates**: `dx`, `outcome`, `risk` and `final_x` per candidate name, with the chosen
-  one marked;
+- **the rollout candidates**: `dx`, `outcome`, `risk` and `final_x` per candidate name, with the row
+  of the applied action (`decision.action`) marked `(applied)` and Jev's picked row marked `(chosen)`.
+  When the two are the same row it is marked once, `(applied, chosen)`, never two marks a reader has to
+  reconcile. Jev's pick is a claim about the answer and the applied action is a claim about what ran,
+  and the page never lets the first be read as the second;
 - **the decision**: action, source, confidence, risk and `reason`.
 It refreshes itself with a `<meta http-equiv="refresh">` and links to the full report at `/`. No
 JavaScript and no streaming: every refresh is a snapshot, and the page says in its own words that this
